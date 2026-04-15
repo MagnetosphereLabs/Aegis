@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="aegisvault"
 APP_DIR="/opt/aegisvault"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
-REPO_SLUG="${REPO_SLUG:-YOUR_GITHUB_USERNAME/aegisvault}"
+REPO_SLUG="${REPO_SLUG:-MagnetosphereLabs/Aegis}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO_SLUG}/${BRANCH}}"
 ACTION="${1:-install}"
@@ -105,6 +105,7 @@ do_install() {
   echo "Command: ${BIN_PATH}"
   echo "Service: systemctl status aegisvault"
   echo "Desktop launcher installed."
+  echo "Recovery USB builder available from the Restore tab or: aegisvault create-recovery-usb --device /dev/sdX"
   echo
   echo "IMPORTANT: move the recovery key file from /var/lib/aegisvault somewhere safe."
   echo "If the desktop app cannot connect right away, log out and back in so the aegisvault group applies to your session."
