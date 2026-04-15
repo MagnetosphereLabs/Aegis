@@ -92,6 +92,7 @@ class PeerTarget:
 @dataclass
 class Settings:
     version: int = 1
+    onboarding_complete: bool = False
     machine_id: str = ""
     machine_label: str = ""
     repo_path: str = DEFAULT_REPO
@@ -449,6 +450,7 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
     peers_data = data.get("peers") or []
     settings = Settings(
         version=int(data.get("version", 1)),
+        onboarding_complete=bool(data["onboarding_complete"]) if "onboarding_complete" in data else True,
         machine_id=str(data.get("machine_id") or machine_id()),
         machine_label=str(data.get("machine_label") or hostname()),
         repo_path=str(data.get("repo_path") or DEFAULT_REPO),
@@ -507,6 +509,7 @@ def persistent_state_to_dict(state: PersistentState) -> Dict[str, Any]:
 def load_settings() -> Settings:
     if not CONFIG_PATH.exists():
         settings = Settings(
+            onboarding_complete=False,
             machine_id=machine_id(),
             machine_label=hostname(),
             repo_path=DEFAULT_REPO,
@@ -1037,6 +1040,56 @@ def find_snapshot_manifest(repo: Path, snapshot_id: str) -> SnapshotManifest:
             return snapshot_from_dict(data)
     raise AegisError(f"Snapshot not found: {snapshot_id}")
 
+def find_snapshot_manifest_with_path(repo: Path, snapshot_id: str) -> Tuple[SnapshotManifest, Path]:
+    machines_root = repo / "machines"
+    if not machines_root.exists():
+        raise AegisError(f"Snapshot not found: {snapshot_id}")
+    for machine_dir in sorted(machines_root.iterdir()):
+        candidate = machine_dir / "snapshots" / f"{snapshot_id}.json"
+        if candidate.exists():
+            data = load_json(candidate)
+            return snapshot_from_dict(data), candidate
+    raise AegisError(f"Snapshot not found: {snapshot_id}")
+
+
+def prune_empty_dirs(path: Path, stop_at: Path) -> None:
+    current = path
+    while current != stop_at:
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        current = current.parent
+
+
+def delete_snapshot_from_repo(settings: Settings, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
+    repo = Path(settings.repo_path)
+    with file_lock(LOCK_PATH):
+        manifest, manifest_file = find_snapshot_manifest_with_path(repo, snapshot_id)
+        candidate_hashes = {ref.hash for ref in manifest.archive_refs}
+
+        manifest_file.unlink(missing_ok=True)
+
+        remaining_hashes: Set[str] = set()
+        snapshots_dir = repo_machine_dir(repo, manifest.machine_id) / "snapshots"
+        if snapshots_dir.exists():
+            for path in snapshots_dir.glob("*.json"):
+                try:
+                    other = snapshot_from_dict(load_json(path))
+                    remaining_hashes.update(ref.hash for ref in other.archive_refs)
+                except Exception:
+                    continue
+
+        removed_objects = 0
+        machine_objects_root = repo / "objects" / manifest.machine_id
+        for hash_hex in sorted(candidate_hashes - remaining_hashes):
+            obj = object_path(repo, manifest.machine_id, hash_hex)
+            if obj.exists():
+                obj.unlink()
+                removed_objects += 1
+                prune_empty_dirs(obj.parent, machine_objects_root)
+
+        return manifest, removed_objects
 
 def snapshot_from_dict(data: Dict[str, Any]) -> SnapshotManifest:
     return SnapshotManifest(
@@ -1832,6 +1885,18 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise AegisError("Provide bundle_path or bundle_url.")
         return {"ok": True, "message": "Bundle restore started."}
+    if action == "delete_snapshot":
+        snapshot_id = str(request.get("snapshot") or "").strip()
+        if not snapshot_id:
+            raise AegisError("Choose a snapshot first.")
+        with RUNTIME.lock:
+            if RUNTIME.current_job is not None:
+                raise AegisError("Wait for the current job to finish before deleting a snapshot.")
+        manifest, removed_objects = delete_snapshot_from_repo(load_settings(), snapshot_id)
+        return {
+            "ok": True,
+            "message": f"{kind_label(manifest.kind)} snapshot {snapshot_id} deleted. Removed {removed_objects} unreferenced data chunk(s).",
+        }
     if action == "set_repo_path":
         repo_path = str(request.get("repo_path") or "").strip()
         if not repo_path:
@@ -2056,6 +2121,7 @@ def init_command(repo: Optional[str], label: Optional[str], encryption: bool) ->
     if label:
         settings.machine_label = label
     settings.encryption_enabled = encryption
+    settings.onboarding_complete = True
     if not settings.machine_id:
         settings.machine_id = machine_id()
     if not settings.machine_label:
@@ -2315,6 +2381,7 @@ def gui_main() -> int:
             self.dashboard_payload: Dict[str, Any] = {}
             self.settings_loaded = False
             self.recovery_mode = is_recovery_environment()
+            self.ui_configured_state: Optional[bool] = None
             self.repo_candidates: List[str] = []
             self.usb_choice_map: Dict[str, str] = {}
             self.guided_disk_map: Dict[str, str] = {}
@@ -2332,23 +2399,27 @@ def gui_main() -> int:
             self.notebook = ttk.Notebook(outer)
             self.notebook.pack(fill="both", expand=True)
 
+            self.setup_tab = ttk.Frame(self.notebook, padding=16)
             self.overview_tab = ttk.Frame(self.notebook, padding=16)
             self.backup_tab = ttk.Frame(self.notebook, padding=16)
             self.restore_tab = ttk.Frame(self.notebook, padding=16)
             self.constellation_tab = ttk.Frame(self.notebook, padding=16)
             self.settings_tab = ttk.Frame(self.notebook, padding=16)
 
+            self.notebook.add(self.setup_tab, text="Setup")
             self.notebook.add(self.overview_tab, text="Overview")
             self.notebook.add(self.backup_tab, text="Backup")
             self.notebook.add(self.restore_tab, text="Restore")
             self.notebook.add(self.constellation_tab, text="Constellation")
             self.notebook.add(self.settings_tab, text="Settings")
 
+            self.build_setup_tab()
             self.build_overview_tab()
             self.build_backup_tab()
             self.build_restore_tab()
             self.build_constellation_tab()
             self.build_settings_tab()
+            self.apply_configuration_state(False)
 
             footer = ttk.Frame(outer)
             footer.pack(fill="x", pady=(12, 0))
@@ -2364,9 +2435,8 @@ def gui_main() -> int:
                 except Exception:
                     self.recovery_mounts = []
             self.refresh_local_device_lists()
-            self.scan_repository_candidates(auto_use=True)
+            self.scan_repository_candidates(auto_use=False)
             if self.recovery_mode:
-                self.notebook.select(self.restore_tab)
                 hint = "Recovery mode: use Guided Full Restore for the easiest same-machine disaster restore."
                 if self.recovery_mounts:
                     hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
@@ -2471,6 +2541,75 @@ def gui_main() -> int:
                 gripcount=0,
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
+
+        def build_setup_tab(self) -> None:
+            frame = ttk.Frame(self.setup_tab)
+            frame.pack(fill="both", expand=True)
+            frame.grid_columnconfigure(1, weight=1)
+
+            ttk.Label(frame, text="Initial setup", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Label(
+                frame,
+                text="Finish the core configuration once before exposing backup, restore, peer sync, and advanced settings. You can fine-tune excludes and peer sync later.",
+                wraplength=1020,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+            ttk.Label(frame, text="Machine label").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(18, 0))
+            ttk.Entry(frame, textvariable=self.machine_label_var, width=42).grid(row=2, column=1, sticky="w", pady=(18, 0))
+
+            ttk.Label(frame, text="Repository path").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.repo_path_var, width=54).grid(row=3, column=1, sticky="ew", pady=(12, 0))
+            ttk.Button(frame, text="Browse", command=lambda: self.browse_directory(self.repo_path_var)).grid(row=3, column=2, padx=(8, 0), pady=(12, 0))
+
+            ttk.Checkbutton(frame, text="Encrypt repository storage", variable=self.encryption_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(14, 0))
+            ttk.Checkbutton(frame, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Backup schedule").grid(row=6, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Combobox(
+                frame,
+                textvariable=self.schedule_preset_var,
+                values=["manual", "hourly", "daily", "weekly", "custom"],
+                width=18,
+                state="readonly",
+            ).grid(row=6, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Custom minutes").grid(row=7, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.schedule_custom_var, width=12).grid(row=7, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="I/O yield milliseconds per chunk").grid(row=8, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=8, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Checkbutton(
+                frame,
+                text="Apply package list after portable restore to /",
+                variable=self.apply_packages_var,
+            ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+            buttons = ttk.Frame(frame)
+            buttons.grid(row=10, column=0, columnspan=3, sticky="w", pady=(22, 0))
+            ttk.Button(buttons, text="Save Setup and Open App", command=self.complete_onboarding).pack(side="left")
+
+        def apply_configuration_state(self, configured: bool) -> None:
+            if self.ui_configured_state == configured:
+                return
+            self.ui_configured_state = configured
+
+            self.notebook.tab(self.setup_tab, state="hidden" if configured else "normal")
+            self.notebook.tab(self.overview_tab, state="normal" if configured else "hidden")
+            self.notebook.tab(self.backup_tab, state="normal" if configured else "hidden")
+            self.notebook.tab(self.restore_tab, state="normal" if configured else "hidden")
+            self.notebook.tab(self.constellation_tab, state="normal" if configured else "hidden")
+            self.notebook.tab(self.settings_tab, state="normal" if configured else "hidden")
+
+            if configured:
+                self.notebook.select(self.restore_tab if self.recovery_mode else self.overview_tab)
+            else:
+                self.notebook.select(self.setup_tab)
+                self.message_var.set("Finish setup to unlock the rest of AegisVault.")
+
+        def complete_onboarding(self) -> None:
+            self.save_settings()
         
         def build_overview_tab(self) -> None:
             summary = ttk.Frame(self.overview_tab)
@@ -2585,7 +2724,7 @@ def gui_main() -> int:
         def build_backup_tab(self) -> None:
             controls = ttk.Frame(self.backup_tab)
             controls.pack(fill="x")
-            ttk.Label(controls, text="Create snapshots", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(controls, text="Create snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
             ttk.Button(controls, text="Back Up Both", command=lambda: self.start_backup("both")).grid(row=1, column=0, padx=(0, 8), pady=(10, 0), sticky="w")
             ttk.Button(controls, text="Back Up Full Recovery", command=lambda: self.start_backup("full_recovery")).grid(row=1, column=1, padx=(0, 8), pady=(10, 0), sticky="w")
             ttk.Button(controls, text="Back Up Portable System State", command=lambda: self.start_backup("portable_state")).grid(row=1, column=2, padx=(0, 8), pady=(10, 0), sticky="w")
@@ -2596,14 +2735,22 @@ def gui_main() -> int:
             self.backup_tree = self.build_snapshot_table(snaps)
             self.backup_tree.pack(fill="both", expand=True, pady=(8, 0))
 
+            snap_actions = ttk.Frame(snaps)
+            snap_actions.pack(fill="x", pady=(10, 0))
+            ttk.Button(snap_actions, text="Delete Selected Snapshot", command=self.delete_selected_snapshot).pack(side="left")
+            ttk.Button(snap_actions, text="Refresh List", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
+
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
-            ttk.Label(export, text="Export selected snapshot to encrypted single file", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(export, text="Bundle password").grid(row=1, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(export, text="Recovery key for foreign machine snapshot (optional)").grid(row=2, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(export, textvariable=self.export_recovery_key_var, width=34).grid(row=2, column=1, sticky="w", pady=(10, 0))
-            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=2, column=2, padx=(12, 0), pady=(10, 0), sticky="w")
+            ttk.Label(export, text="Export selected snapshot to encrypted single file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+
+            ttk.Label(export, text="Bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(export, text="Recovery key for foreign machine snapshot (optional)").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(export, textvariable=self.export_recovery_key_var, width=34).grid(row=2, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=3, column=1, sticky="w", pady=(14, 0))
 
         def build_restore_tab(self) -> None:
             intro = ttk.Frame(self.restore_tab)
@@ -2657,14 +2804,22 @@ def gui_main() -> int:
             repo_section.grid_columnconfigure(0, weight=1)
             repo_section.grid_rowconfigure(1, weight=1)
 
-            ttk.Label(repo_section, text="Target path").grid(row=2, column=0, sticky="w", pady=(12, 0))
+            ttk.Label(repo_section, text="Target path").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_restore_target_var, width=46).grid(row=2, column=1, sticky="w", pady=(12, 0))
             ttk.Button(repo_section, text="Browse", command=lambda: self.browse_directory(self.repo_restore_target_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
-            ttk.Label(repo_section, text="Selective path inside snapshot").grid(row=3, column=0, sticky="w", pady=(12, 0))
+
+            ttk.Label(repo_section, text="Selective path inside snapshot").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
-            ttk.Label(repo_section, text="Recovery key (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", pady=(12, 0))
+
+            ttk.Label(repo_section, text="Recovery key (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_recovery_key_var, width=46).grid(row=4, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(repo_section, text="Restore Selected Snapshot", command=self.restore_repo_snapshot).grid(row=4, column=2, padx=(8, 0), pady=(12, 0))
+
+            ttk.Button(
+                repo_section,
+                text="Restore Selected\nSnapshot",
+                width=20,
+                command=self.restore_repo_snapshot,
+            ).grid(row=5, column=1, sticky="w", pady=(14, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
@@ -2726,12 +2881,16 @@ def gui_main() -> int:
 
             general = ttk.Frame(left)
             general.pack(fill="x")
+            general.grid_columnconfigure(1, weight=1)
+
             ttk.Label(general, text="General", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(general, text="Machine label").grid(row=1, column=0, sticky="w", pady=(10, 0))
+            ttk.Label(general, text="Machine label").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
             ttk.Entry(general, textvariable=self.machine_label_var, width=40).grid(row=1, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(general, text="Repository path").grid(row=2, column=0, sticky="w", pady=(10, 0))
+
+            ttk.Label(general, text="Repository path").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
             ttk.Entry(general, textvariable=self.repo_path_var, width=40).grid(row=2, column=1, sticky="w", pady=(10, 0))
             ttk.Button(general, text="Browse", command=lambda: self.browse_directory(self.repo_path_var)).grid(row=2, column=2, padx=(8, 0), pady=(10, 0))
+
             ttk.Checkbutton(general, text="Encrypt repository storage", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
             ttk.Checkbutton(general, text="Apply package list after portable restore to /", variable=self.apply_packages_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
@@ -2960,6 +3119,8 @@ def gui_main() -> int:
             warnings = payload.get("warnings", [])
             logs = payload.get("logs", [])
 
+            self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
+
             self.status_var.set(
                 f"{'Busy: ' + current_job['name'] + ' — ' + current_job['stage'] if current_job else 'Idle'}"
             )
@@ -3078,6 +3239,28 @@ def gui_main() -> int:
             except Exception as exc:
                 self.message_var.set(str(exc))
 
+        def delete_selected_snapshot(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            if not self.confirm_dangerous_action(
+                "Delete Snapshot",
+                f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs.",
+            ):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "delete_snapshot",
+                    "snapshot": self.selected_snapshot_id,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.selected_snapshot_id = ""
+                self.message_var.set(response.get("message", "Snapshot deleted."))
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+        
         def restore_repo_snapshot(self) -> None:
             if not self.selected_snapshot_id:
                 self.message_var.set("Select a snapshot first.")
@@ -3202,6 +3385,7 @@ def gui_main() -> int:
                     })
                 payload = {
                     "version": 1,
+                    "onboarding_complete": True,
                     "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
                     "machine_label": self.machine_label_var.get().strip() or hostname(),
                     "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
