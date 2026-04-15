@@ -125,16 +125,28 @@ do_uninstall() {
   rm -f /usr/share/applications/aegisvault.desktop
   rm -f "${BIN_PATH}"
   rm -rf "${APP_DIR}"
+  rm -rf /run/aegisvault
   systemctl daemon-reload
-  echo "AegisVault removed. Data under /var/lib/aegisvault and /var/backups/aegisvault was left in place."
+  systemctl reset-failed aegisvault.service >/dev/null 2>&1 || true
+  echo "AegisVault app files removed. Data under /var/lib/aegisvault and /var/backups/aegisvault was left in place."
+}
+
+do_purge() {
+  require_root
+  do_uninstall
+  rm -rf /var/lib/aegisvault
+  rm -rf /var/backups/aegisvault
+  groupdel aegisvault >/dev/null 2>&1 || true
+  echo "AegisVault fully purged, including settings, keys, state, and backup repository data."
 }
 
 case "${ACTION}" in
   install) do_install ;;
   update) do_update ;;
   uninstall) do_uninstall ;;
+  purge) do_purge ;;
   *)
-    echo "Usage: curl ... | sudo bash -s -- {install|update|uninstall}" >&2
+    echo "Usage: curl ... | sudo bash -s -- {install|update|uninstall|purge}" >&2
     exit 1
     ;;
 esac
