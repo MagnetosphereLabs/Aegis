@@ -2495,7 +2495,7 @@ def gui_main() -> int:
             except Exception:
                 pass
 
-        def build_ui(self) -> None:
+        def build_overview_tab(self) -> None:
             summary = ttk.Frame(self.overview_tab)
             summary.pack(fill="x")
             self.summary_labels: Dict[str, ttk.Label] = {}
