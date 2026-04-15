@@ -1,2 +1,1 @@
-# Aegis
-It's like Apple Time Machine, but for Debain systems :P
+This software is in pre-alpha v1 and is not ready to install on your device. Coming soon ™️
