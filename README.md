@@ -1,12 +1,12 @@
 This software is in pre-alpha v1 and is not ready to install on your device. Coming soon ™️
 
-# AegisVault
+# Aegis
 
-AegisVault is a compact backup product for Debian-based Linux systems such as Pop!_OS, Ubuntu, Linux Mint, and Debian.
+Aegis is a compact backup product for Debian-based Linux systems such as Pop!_OS, Ubuntu, Linux Mint, and Debian.
 
 ## What it does
 
-AegisVault gives you:
+Aegis gives you:
 
 - **two snapshot kinds from one workflow**
   - **Full Recovery** for same-machine disaster recovery
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/Aegis/main/instal
 
 ### Repository backups
 
-AegisVault stores snapshots in an encrypted, chunked repository:
+Aegis stores snapshots in an encrypted, chunked repository:
 
 - manifests live under `machines/<machine-id>/snapshots`
 - encrypted chunk objects live under `objects/<machine-id>/<prefix>`
