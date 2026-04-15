@@ -2435,33 +2435,39 @@ def gui_main() -> int:
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
-        def build_ui(self) -> None:
-            top = ttk.Frame(self.root, padding=16)
-            top.pack(fill="x")
-            ttk.Label(top, text=APP_NAME, style="Header.TLabel").pack(anchor="w")
-            ttk.Label(top, textvariable=self.status_var, style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
-            ttk.Label(top, textvariable=self.message_var, style="Muted.TLabel", wraplength=1120).pack(anchor="w", pady=(8, 0))
+        def build_overview_tab(self) -> None:
+            summary = ttk.Frame(self.overview_tab)
+            summary.pack(fill="x")
+            self.summary_labels: Dict[str, ttk.Label] = {}
+            grid_items = [
+                ("machine", "Machine"),
+                ("repo", "Repository"),
+                ("last_good", "Last good backup"),
+                ("last_run", "Last attempted backup"),
+                ("last_sync", "Last peer sync"),
+                ("recovery_key", "Recovery key file"),
+            ]
+            for idx, (key, label) in enumerate(grid_items):
+                row = idx // 2
+                col = (idx % 2) * 2
+                ttk.Label(summary, text=f"{label}:", style="Header.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=6)
+                value_label = ttk.Label(summary, text="—", wraplength=420)
+                value_label.grid(row=row, column=col + 1, sticky="w", padx=(0, 28), pady=6)
+                self.summary_labels[key] = value_label
 
-            notebook = ttk.Notebook(self.root)
-            notebook.pack(fill="both", expand=True, padx=16, pady=(0, 16))
-            self.notebook = notebook
+            warnings_frame = ttk.Frame(self.overview_tab)
+            warnings_frame.pack(fill="x", pady=(18, 0))
+            ttk.Label(warnings_frame, text="Warnings", style="Header.TLabel").pack(anchor="w")
+            self.warnings_text = ScrolledText(warnings_frame, height=5, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+            self.warnings_text.pack(fill="x", pady=(8, 0))
+            self.style_scrolled_text(self.warnings_text)
 
-            self.overview_tab = ttk.Frame(notebook, padding=16)
-            self.backup_tab = ttk.Frame(notebook, padding=16)
-            self.restore_tab = ttk.Frame(notebook, padding=16)
-            self.constellation_tab = ttk.Frame(notebook, padding=16)
-            self.settings_tab = ttk.Frame(notebook, padding=16)
-            notebook.add(self.overview_tab, text="Overview")
-            notebook.add(self.backup_tab, text="Back Up")
-            notebook.add(self.restore_tab, text="Restore")
-            notebook.add(self.constellation_tab, text="Constellation")
-            notebook.add(self.settings_tab, text="Settings")
-
-            self.build_overview_tab()
-            self.build_backup_tab()
-            self.build_restore_tab()
-            self.build_constellation_tab()
-            self.build_settings_tab()
+            logs_frame = ttk.Frame(self.overview_tab)
+            logs_frame.pack(fill="both", expand=True, pady=(18, 0))
+            ttk.Label(logs_frame, text="Recent activity", style="Header.TLabel").pack(anchor="w")
+            self.logs_text = ScrolledText(logs_frame, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+            self.logs_text.pack(fill="both", expand=True, pady=(8, 0))
+            self.style_scrolled_text(self.logs_text)
 
         def style_scrolled_text(self, widget: ScrolledText) -> None:
             widget.configure(
