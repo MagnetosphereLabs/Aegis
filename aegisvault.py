@@ -2435,6 +2435,46 @@ def gui_main() -> int:
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
+        def build_ui(self) -> None:
+            outer = ttk.Frame(self.root, padding=16)
+            outer.pack(fill="both", expand=True)
+
+            header = ttk.Frame(outer)
+            header.pack(fill="x", pady=(0, 12))
+
+            ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(side="left")
+            ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
+
+            self.notebook = ttk.Notebook(outer)
+            self.notebook.pack(fill="both", expand=True)
+
+            self.overview_tab = ttk.Frame(self.notebook, padding=16)
+            self.backup_tab = ttk.Frame(self.notebook, padding=16)
+            self.restore_tab = ttk.Frame(self.notebook, padding=16)
+            self.constellation_tab = ttk.Frame(self.notebook, padding=16)
+            self.settings_tab = ttk.Frame(self.notebook, padding=16)
+
+            self.notebook.add(self.overview_tab, text="Overview")
+            self.notebook.add(self.backup_tab, text="Backup")
+            self.notebook.add(self.restore_tab, text="Restore")
+            self.notebook.add(self.constellation_tab, text="Constellation")
+            self.notebook.add(self.settings_tab, text="Settings")
+
+            self.build_overview_tab()
+            self.build_backup_tab()
+            self.build_restore_tab()
+            self.build_constellation_tab()
+            self.build_settings_tab()
+
+            footer = ttk.Frame(outer)
+            footer.pack(fill="x", pady=(12, 0))
+
+            ttk.Label(
+                footer,
+                textvariable=self.message_var,
+                wraplength=1100,
+            ).pack(side="left", fill="x", expand=True)
+        
         def build_overview_tab(self) -> None:
             summary = ttk.Frame(self.overview_tab)
             summary.pack(fill="x")
