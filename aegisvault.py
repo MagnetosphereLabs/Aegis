@@ -26,10 +26,11 @@ import threading
 import time
 import traceback
 import urllib.request
+import textwrap
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
@@ -48,6 +49,13 @@ DEFAULT_REPO = "/var/backups/aegisvault"
 DEFAULT_CHUNK_MIB = 4
 BUFFER_SIZE = 1024 * 1024
 LOG_LIMIT = 250
+RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
+RECOVERY_MOUNT_ROOT = Path("/mnt/aegisvault-recovery")
+AUTO_MOUNT_ROOT = Path("/media/aegisvault")
+DEFAULT_RECOVERY_SUITE = "bookworm"
+DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
+DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
+MIN_RECOVERY_USB_BYTES = 8 * 1024 * 1024 * 1024
 
 
 @dataclass
@@ -121,6 +129,7 @@ class SnapshotMetadata:
     root_fs: str = ""
     dpkg_query: str = ""
     manual_packages: List[str] = field(default_factory=list)
+    portable_manual_packages: List[str] = field(default_factory=list)
     flatpak_packages: List[str] = field(default_factory=list)
     snap_packages: List[str] = field(default_factory=list)
     apt_sources: str = ""
@@ -131,6 +140,11 @@ class SnapshotMetadata:
     machine_id_file: str = ""
     mount_table: str = ""
     partition_table: str = ""
+    block_devices_json: str = ""
+    root_source: str = ""
+    boot_source: str = ""
+    efi_source: str = ""
+    firmware_mode: str = ""
     notes: List[str] = field(default_factory=list)
 
 
@@ -270,6 +284,53 @@ def hostname() -> str:
     return socket.gethostname()
 
 
+def human_bytes(value: int) -> str:
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(max(0, value))
+    for unit in units:
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} {unit}"
+        size /= 1024.0
+    return f"{value} B"
+
+
+def is_recovery_environment() -> bool:
+    return RECOVERY_MARKER.exists() or os.environ.get("AEGISVAULT_RECOVERY") == "1"
+
+
+def firmware_mode() -> str:
+    return "uefi" if Path("/sys/firmware/efi").exists() else "bios"
+
+
+PORTABLE_PACKAGE_EXCLUDE_PATTERNS = [
+    "linux-image*",
+    "linux-headers*",
+    "linux-modules*",
+    "linux-tools*",
+    "linux-cloud-tools*",
+    "linux-generic*",
+    "linux-oem*",
+    "linux-firmware*",
+    "nvidia*",
+    "*-dkms",
+    "broadcom-sta*",
+    "virtualbox-dkms*",
+    "zfs-dkms*",
+    "grub-*",
+    "shim-signed",
+    "systemd-boot*",
+]
+
+
+def filter_portable_manual_packages(packages: List[str]) -> List[str]:
+    filtered: List[str] = []
+    for package in packages:
+        if any(fnmatch.fnmatch(package, pattern) for pattern in PORTABLE_PACKAGE_EXCLUDE_PATTERNS):
+            continue
+        filtered.append(package)
+    return filtered
+
+
 def ensure_root() -> None:
     if os.geteuid() != 0:
         raise AegisError("This operation must be run as root.")
@@ -277,6 +338,17 @@ def ensure_root() -> None:
 
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    hasher = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(BUFFER_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def local_key_path(machine: str) -> Path:
@@ -507,6 +579,185 @@ def safe_read_text(path: str) -> str:
         return ""
 
 
+def blkid_value(device: str, field: str) -> str:
+    return run_command_optional(["blkid", "-s", field, "-o", "value", device]).strip()
+
+
+def disk_partition_path(device: str, number: int) -> str:
+    base = Path(device).name
+    suffix = f"p{number}" if base[-1:].isdigit() else str(number)
+    return f"{device}{suffix}"
+
+
+def current_root_source() -> str:
+    return run_command_optional(["findmnt", "-nro", "SOURCE", "/"]).strip()
+
+
+def device_parent_disk(device: str) -> str:
+    device = device.strip()
+    if not device:
+        return ""
+    dev_type = run_command_optional(["lsblk", "-ndo", "TYPE", device]).strip()
+    if dev_type == "disk":
+        return device
+    parent = run_command_optional(["lsblk", "-ndo", "PKNAME", device]).strip()
+    if parent:
+        return f"/dev/{parent}"
+    return device
+
+
+def current_root_disk() -> str:
+    return device_parent_disk(current_root_source())
+
+
+def list_block_devices() -> List[Dict[str, Any]]:
+    raw = run_command_optional([
+        "lsblk", "-J", "-b",
+        "-o",
+        "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,MOUNTPOINTS",
+    ])
+    if not raw:
+        return []
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    def walk(node: Dict[str, Any]) -> None:
+        mountpoints = [mp for mp in (node.get("mountpoints") or []) if mp]
+        entry = {
+            "name": node.get("name", ""),
+            "path": node.get("path", ""),
+            "type": node.get("type", ""),
+            "size": int(node.get("size") or 0),
+            "removable": bool(node.get("rm", False)),
+            "read_only": bool(node.get("ro", False)),
+            "transport": node.get("tran") or "",
+            "model": (node.get("model") or "").strip(),
+            "serial": (node.get("serial") or "").strip(),
+            "fstype": node.get("fstype") or "",
+            "label": node.get("label") or "",
+            "uuid": node.get("uuid") or "",
+            "partuuid": node.get("partuuid") or "",
+            "pkname": node.get("pkname") or "",
+            "mountpoints": mountpoints,
+        }
+        out.append(entry)
+        for child in node.get("children") or []:
+            walk(child)
+
+    for node in payload.get("blockdevices") or []:
+        walk(node)
+    return out
+
+
+def list_disk_choices(exclude_paths: Optional[Set[str]] = None, removable_only: bool = False) -> List[Dict[str, Any]]:
+    exclude_paths = exclude_paths or set()
+    items: List[Dict[str, Any]] = []
+    for entry in list_block_devices():
+        if entry.get("type") != "disk":
+            continue
+        if entry.get("path") in exclude_paths:
+            continue
+        if removable_only and not (entry.get("removable") or entry.get("transport") == "usb"):
+            continue
+        label = entry.get("model") or entry.get("serial") or entry.get("name")
+        items.append({
+            **entry,
+            "display": f"{entry.get('path')}  |  {label}  |  {human_bytes(int(entry.get('size') or 0))}",
+        })
+    return items
+
+
+def discover_repo_candidates() -> List[str]:
+    candidates: List[str] = []
+    seen: Set[str] = set()
+    search_roots = [Path("/media"), Path("/mnt"), Path("/run/media")]
+    current = Path(load_settings().repo_path)
+    if current.exists():
+        search_roots.insert(0, current)
+    for root in search_roots:
+        if not root.exists():
+            continue
+        roots_to_scan = [root] if root.is_dir() else []
+        for base in roots_to_scan:
+            for candidate in [base] + [p for p in base.glob("*") if p.is_dir()] + [p for p in base.glob("*/*") if p.is_dir()]:
+                if candidate in seen:
+                    continue
+                seen.add(str(candidate))
+                if (candidate / "machines").is_dir() and (candidate / "objects").is_dir():
+                    candidates.append(str(candidate))
+    return dedupe(candidates)
+
+
+def unmount_device_tree(device: str) -> None:
+    paths = []
+    for entry in list_block_devices():
+        if entry.get("path") == device or device_parent_disk(entry.get("path", "")) == device:
+            paths.extend(entry.get("mountpoints") or [])
+    for mount_path in sorted({p for p in paths if p}, key=len, reverse=True):
+        subprocess.run(["umount", "-lf", mount_path], check=False, capture_output=True)
+
+
+def auto_mount_recovery_sources() -> List[str]:
+    if not is_recovery_environment():
+        return []
+    mounted: List[str] = []
+    root_disk = current_root_disk()
+    AUTO_MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+    for entry in list_block_devices():
+        if entry.get("type") != "part":
+            continue
+        if entry.get("mountpoints"):
+            continue
+        parent = device_parent_disk(entry.get("path", ""))
+        if parent == root_disk:
+            continue
+        fstype = entry.get("fstype") or ""
+        if not fstype or fstype in {"swap", "crypto_LUKS", "LVM2_member"}:
+            continue
+        mountpoint = AUTO_MOUNT_ROOT / entry.get("name", "disk")
+        mountpoint.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(["mount", "-o", "ro", entry["path"], str(mountpoint)], capture_output=True, text=True)
+        if result.returncode == 0:
+            mounted.append(str(mountpoint))
+    return mounted
+
+
+def ensure_host_packages(packages: List[str]) -> None:
+    missing: List[str] = []
+    for package in packages:
+        status = subprocess.run(["dpkg", "-s", package], capture_output=True, text=True)
+        if status.returncode != 0:
+            missing.append(package)
+    if not missing:
+        return
+    update_stage("Installing required host packages")
+    run_command(["apt-get", "update"], check=True, capture=True)
+    run_command(["apt-get", "install", "-y", *missing], check=True, capture=True)
+
+
+def ensure_recovery_builder_prereqs() -> None:
+    ensure_host_packages([
+        "debootstrap",
+        "parted",
+        "dosfstools",
+        "gdisk",
+        "grub-pc-bin",
+        "grub-efi-amd64-bin",
+        "ca-certificates",
+    ])
+
+
+def assert_safe_target_disk(device: str) -> None:
+    if run_command_optional(["lsblk", "-ndo", "TYPE", device]).strip() != "disk":
+        raise AegisError(f"Choose a whole-disk device like /dev/sdb, not {device}.")
+    if device == current_root_disk():
+        raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
+
+
 def recovery_key_normalized(key: str) -> str:
     return "".join(ch for ch in key.upper() if ch.isalnum())
 
@@ -727,12 +978,21 @@ def collect_snapshot_metadata(kind: str) -> SnapshotMetadata:
     else:
         notes.append("Portable System State is intended for migration to different hardware.")
         notes.append("Hardware-bound kernel modules and host identity files are excluded by default.")
+    manual_packages = [line.strip() for line in run_command_optional(["apt-mark", "showmanual"]).splitlines() if line.strip()]
+    root_source_value = run_command_optional(["findmnt", "-nro", "SOURCE", "/"])
+    boot_source_value = run_command_optional(["findmnt", "-nro", "SOURCE", "/boot"])
+    efi_source_value = run_command_optional(["findmnt", "-nro", "SOURCE", "/boot/efi"])
+    block_devices_json = run_command_optional([
+        "lsblk", "-J", "-b",
+        "-o", "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,MOUNTPOINTS"
+    ])
     return SnapshotMetadata(
         os_release=safe_read_text("/etc/os-release"),
         kernel_release=run_command_optional(["uname", "-r"]),
         root_fs=run_command_optional(["findmnt", "-nro", "FSTYPE", "/"]),
         dpkg_query=run_command_optional(["dpkg-query", "-W", "-f=${Package}\t${Version}\n"]),
-        manual_packages=[line.strip() for line in run_command_optional(["apt-mark", "showmanual"]).splitlines() if line.strip()],
+        manual_packages=manual_packages,
+        portable_manual_packages=filter_portable_manual_packages(manual_packages),
         flatpak_packages=flatpak_packages,
         snap_packages=snap_packages,
         apt_sources="\n".join(sources_chunks),
@@ -743,6 +1003,11 @@ def collect_snapshot_metadata(kind: str) -> SnapshotMetadata:
         machine_id_file=safe_read_text("/etc/machine-id"),
         mount_table=run_command_optional(["findmnt", "-A"]),
         partition_table=partition_text,
+        block_devices_json=block_devices_json,
+        root_source=root_source_value,
+        boot_source=boot_source_value,
+        efi_source=efi_source_value,
+        firmware_mode=firmware_mode(),
         notes=notes,
     )
 
@@ -953,17 +1218,7 @@ def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Pat
     if manifest.kind == "full_recovery" and target.resolve() == Path("/"):
         raise AegisError("Full Recovery restore must target an offline-mounted root, not /.")
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
-    target.mkdir(parents=True, exist_ok=True)
-    proc = build_tar_restore_command(target, member)
-    assert proc.stdin is not None
-    digest = stream_archive_from_repo(Path(settings.repo_path), manifest, key, proc.stdin)
-    proc.stdin.close()
-    stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
-    returncode = proc.wait()
-    if returncode != 0:
-        raise AegisError(f"tar extraction failed: {stderr_data.strip() or returncode}")
-    if digest != manifest.archive_sha256:
-        raise AegisError("Archive integrity mismatch during restore.")
+    extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, target, member)
     after_restore_actions(target, manifest, apply_packages)
 
 
@@ -977,15 +1232,21 @@ def after_restore_actions(target: Path, manifest: SnapshotManifest, apply_packag
 def apply_portable_post_restore(target: Path, metadata: SnapshotMetadata) -> None:
     if target.resolve() != Path("/"):
         return
-    if metadata.manual_packages:
+    package_list = metadata.portable_manual_packages or filter_portable_manual_packages(metadata.manual_packages)
+    if package_list:
         run_command(["apt-get", "update"], check=False, capture=True)
         chunk_size = 64
-        for i in range(0, len(metadata.manual_packages), chunk_size):
-            group = metadata.manual_packages[i:i+chunk_size]
+        for i in range(0, len(package_list), chunk_size):
+            group = package_list[i:i+chunk_size]
             run_command(["apt-get", "install", "-y", *group], check=False, capture=True)
     if metadata.flatpak_packages and shutil.which("flatpak"):
         for app in metadata.flatpak_packages:
             run_command(["flatpak", "install", "-y", "flathub", app], check=False, capture=True)
+    if metadata.snap_packages and shutil.which("snap"):
+        for app in metadata.snap_packages:
+            if app == "core":
+                continue
+            run_command(["snap", "install", app], check=False, capture=True)
 
 
 @contextmanager
@@ -1003,18 +1264,277 @@ def mounted_chroot_bindings(target: Path):
             subprocess.run(["umount", "-lf", mount_path], check=False, capture_output=True)
 
 
-def run_chroot(target: Path, args: List[str]) -> None:
-    subprocess.run(["chroot", str(target), *args], check=False, capture_output=True)
+def run_chroot(target: Path, args: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(["chroot", str(target), *args], check=False, capture_output=True, text=True)
 
 
-def best_effort_full_restore_post_actions(target: Path) -> None:
+def run_chroot_checked(target: Path, args: List[str], label: Optional[str] = None) -> subprocess.CompletedProcess:
+    result = run_chroot(target, args)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        raise AegisError(f"{label or ' '.join(args)} failed: {detail}")
+    return result
+
+
+def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[str] = None) -> None:
     with mounted_chroot_bindings(target):
         if (target / "usr/sbin/update-initramfs").exists():
             run_chroot(target, ["/usr/sbin/update-initramfs", "-u", "-k", "all"])
+        if target_disk and (target / "usr/sbin/grub-install").exists():
+            if (target / "boot/efi").exists():
+                run_chroot(target, ["/usr/sbin/grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=AegisVault", "--recheck", "--no-nvram"])
+            run_chroot(target, ["/usr/sbin/grub-install", target_disk])
         if (target / "usr/sbin/update-grub").exists():
             run_chroot(target, ["/usr/sbin/update-grub"])
         if (target / "usr/bin/bootctl").exists() and (target / "boot/efi").exists():
             run_chroot(target, ["/usr/bin/bootctl", "install"])
+
+
+def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], target: Path, member: Optional[str]) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    proc = build_tar_restore_command(target, member)
+    assert proc.stdin is not None
+    digest = stream_archive_from_repo(repo, manifest, key, proc.stdin)
+    proc.stdin.close()
+    stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+    returncode = proc.wait()
+    if returncode != 0:
+        raise AegisError(f"tar extraction failed: {stderr_data.strip() or returncode}")
+    if digest != manifest.archive_sha256:
+        raise AegisError("Archive integrity mismatch during restore.")
+
+
+def extract_archive_file_to_target(archive_file: Path, target: Path, member: Optional[str]) -> None:
+    target.mkdir(parents=True, exist_ok=True)
+    cmd = ["tar", "--xattrs", "--acls", "--numeric-owner", "-xpf", str(archive_file), "-C", str(target)]
+    if member:
+        cmd.append(normalize_member_path(member))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise AegisError(f"tar extraction failed: {result.stderr.strip() or result.returncode}")
+
+
+def write_guided_restore_fstab(target: Path, root_partition: str, efi_partition: str) -> None:
+    root_uuid = blkid_value(root_partition, "UUID")
+    efi_uuid = blkid_value(efi_partition, "UUID")
+    fstab_path = target / "etc/fstab"
+    if fstab_path.exists():
+        shutil.copy2(fstab_path, target / "etc/fstab.aegisvault-original")
+    content = textwrap.dedent(
+        f"""
+        # /etc/fstab generated by {APP_NAME} guided full restore
+        UUID={root_uuid} / ext4 defaults,noatime 0 1
+        UUID={efi_uuid} /boot/efi vfat umask=0077 0 1
+        """
+    ).strip() + "\n"
+    atomic_write(fstab_path, content.encode("utf-8"), mode=0o644)
+
+def wait_for_partition_device(path: str, timeout_seconds: int = 20) -> None:
+    end = time.time() + timeout_seconds
+    while time.time() < end:
+        if Path(path).exists():
+            return
+        time.sleep(0.5)
+    raise AegisError(f"Partition device did not appear: {path}")
+
+
+def guided_partition_disk(device: str) -> Dict[str, str]:
+    assert_safe_target_disk(device)
+    ensure_recovery_builder_prereqs()
+    unmount_device_tree(device)
+    subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
+    run_command(["sgdisk", "--zap-all", device], check=False, capture=True)
+    run_command(["wipefs", "-a", device], check=False, capture=True)
+    run_command(["parted", "-s", device, "mklabel", "gpt"], check=True, capture=True)
+    run_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], check=True, capture=True)
+    run_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], check=True, capture=True)
+    run_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], check=True, capture=True)
+    run_command(["parted", "-s", device, "set", "2", "esp", "on"], check=True, capture=True)
+    run_command(["parted", "-s", device, "mkpart", "root", "ext4", "1027MiB", "100%"], check=True, capture=True)
+    subprocess.run(["partprobe", device], check=False, capture_output=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+    bios_partition = disk_partition_path(device, 1)
+    efi_partition = disk_partition_path(device, 2)
+    root_partition = disk_partition_path(device, 3)
+    wait_for_partition_device(efi_partition)
+    wait_for_partition_device(root_partition)
+    run_command(["mkfs.vfat", "-F", "32", "-n", "AEGIS-EFI", efi_partition], check=True, capture=True)
+    run_command(["mkfs.ext4", "-F", "-L", "AegisSystem", root_partition], check=True, capture=True)
+    return {"disk": device, "bios": bios_partition, "efi": efi_partition, "root": root_partition}
+
+
+@contextmanager
+def mounted_guided_target(device: str):
+    layout = guided_partition_disk(device)
+    mount_root = Path(tempfile.mkdtemp(prefix="aegisvault-target-"))
+    try:
+        run_command(["mount", layout["root"], str(mount_root)], check=True, capture=True)
+        (mount_root / "boot/efi").mkdir(parents=True, exist_ok=True)
+        run_command(["mount", layout["efi"], str(mount_root / "boot/efi")], check=True, capture=True)
+        yield layout, mount_root
+    finally:
+        subprocess.run(["umount", "-lf", str(mount_root / "boot/efi")], check=False, capture_output=True)
+        subprocess.run(["umount", "-lf", str(mount_root)], check=False, capture_output=True)
+        shutil.rmtree(mount_root, ignore_errors=True)
+
+
+def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_key: Optional[str]) -> None:
+    manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
+    if manifest.kind != "full_recovery":
+        raise AegisError("Guided full restore only works with Full Recovery snapshots.")
+    key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
+    with mounted_guided_target(target_disk) as (layout, mount_root):
+        update_stage(f"Restoring {snapshot_id} to {target_disk}")
+        extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, mount_root, None)
+        write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
+        best_effort_full_restore_post_actions(mount_root, layout["disk"])
+
+
+def bundle_manifest_and_archive(bundle_path: Path, password: str) -> Tuple[SnapshotManifest, Path, tempfile.TemporaryDirectory]:
+    if not password.strip():
+        raise AegisError("Bundle password is required.")
+    plain_bundle = tempfile.NamedTemporaryFile(delete=False)
+    plain_bundle_path = Path(plain_bundle.name)
+    plain_bundle.close()
+    try:
+        with bundle_path.open("rb") as src, plain_bundle_path.open("wb") as dst:
+            decrypt_bundle_to_stream(src, password, dst)
+        td = tempfile.TemporaryDirectory()
+        temp_dir = Path(td.name)
+        subprocess.run(["tar", "-xpf", str(plain_bundle_path), "-C", str(temp_dir)], check=True, capture_output=True)
+        manifest = snapshot_from_dict(json.loads((temp_dir / "snapshot.json").read_text(encoding="utf-8")))
+        return manifest, temp_dir / "archive.tar", td
+    finally:
+        plain_bundle_path.unlink(missing_ok=True)
+
+
+def guided_full_restore_from_bundle(bundle_path: Path, password: str, target_disk: str) -> None:
+    manifest, archive_path, td = bundle_manifest_and_archive(bundle_path, password)
+    try:
+        if manifest.kind != "full_recovery":
+            raise AegisError("Guided full restore only works with Full Recovery bundles.")
+        with mounted_guided_target(target_disk) as (layout, mount_root):
+            update_stage(f"Restoring bundle to {target_disk}")
+            extract_archive_file_to_target(archive_path, mount_root, None)
+            write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
+            best_effort_full_restore_post_actions(mount_root, layout["disk"])
+    finally:
+        td.cleanup()
+
+
+def guided_full_restore_from_bundle_url(url: str, password: str, target_disk: str) -> None:
+    temp = download_to_temp(url)
+    try:
+        guided_full_restore_from_bundle(temp, password, target_disk)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def create_recovery_usb(device: str) -> None:
+    ensure_root()
+    assert_safe_target_disk(device)
+    disks = {d["path"]: d for d in list_disk_choices()}
+    size = int(disks.get(device, {}).get("size") or 0)
+    if size and size < MIN_RECOVERY_USB_BYTES:
+        raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
+    ensure_recovery_builder_prereqs()
+    update_stage("Preparing recovery USB partitions")
+    with mounted_guided_target(device) as (layout, mount_root):
+        update_stage("Bootstrapping Debian recovery environment")
+        run_command(["debootstrap", "--arch=amd64", DEFAULT_RECOVERY_SUITE, str(mount_root), DEFAULT_RECOVERY_MIRROR], check=True, capture=True)
+        (mount_root / "etc/apt").mkdir(parents=True, exist_ok=True)
+        atomic_write(
+            mount_root / "etc/apt/sources.list",
+            f"deb {DEFAULT_RECOVERY_MIRROR} {DEFAULT_RECOVERY_SUITE} main contrib non-free non-free-firmware\n".encode("utf-8"),
+            mode=0o644,
+        )
+        if Path("/etc/resolv.conf").exists():
+            shutil.copy2("/etc/resolv.conf", mount_root / "etc/resolv.conf")
+        (mount_root / "var/lib/aegisvault/keys").mkdir(parents=True, exist_ok=True)
+        with mounted_chroot_bindings(mount_root):
+            update_stage("Installing recovery environment packages")
+            run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"], "apt-get update in recovery media")
+            packages = [
+                "linux-image-amd64", "systemd-sysv", "grub-pc", "grub-efi-amd64",
+                "python3", "python3-tk", "python3-cryptography",
+                "xorg", "xinit", "openbox", "xterm", "dbus-x11",
+                "network-manager", "ca-certificates", "curl", "rsync", "openssh-client", "tar",
+                "parted", "dosfstools", "e2fsprogs", "btrfs-progs", "xfsprogs", "ntfs-3g", "exfatprogs",
+                "util-linux", "sudo"
+            ]
+            run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", *packages], "package install in recovery media")
+
+            update_stage("Configuring recovery environment")
+            (mount_root / "opt/aegisvault").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(__file__), mount_root / "opt/aegisvault/aegisvault.py")
+            wrapper = '#!/usr/bin/env bash\nexec python3 /opt/aegisvault/aegisvault.py "$@"\n'
+            atomic_write(mount_root / "usr/local/bin/aegisvault", wrapper.encode("utf-8"), mode=0o755)
+
+            service_text = textwrap.dedent("""
+                [Unit]
+                Description=AegisVault backup daemon
+                After=network-online.target
+                Wants=network-online.target
+
+                [Service]
+                Type=simple
+                ExecStartPre=/bin/mkdir -p /run/aegisvault
+                ExecStart=/usr/local/bin/aegisvault daemon
+                Restart=on-failure
+                RestartSec=5
+                WorkingDirectory=/var/lib/aegisvault
+                UMask=0077
+
+                [Install]
+                WantedBy=multi-user.target
+            """).strip() + "\n"
+            atomic_write(mount_root / "etc/systemd/system/aegisvault.service", service_text.encode("utf-8"), mode=0o644)
+
+            override_dir = mount_root / "etc/systemd/system/getty@tty1.service.d"
+            override_dir.mkdir(parents=True, exist_ok=True)
+            getty_override = textwrap.dedent("""
+                [Service]
+                ExecStart=
+                ExecStart=-/sbin/agetty --autologin root --noclear %I $TERM
+            """).strip() + "\n"
+            atomic_write(override_dir / "override.conf", getty_override.encode("utf-8"), mode=0o644)
+
+            root_dir = mount_root / "root"
+            root_dir.mkdir(parents=True, exist_ok=True)
+            bash_profile = 'if [ -z "${DISPLAY:-}" ] && [ "$(tty)" = "/dev/tty1" ]; then\n  export AEGISVAULT_RECOVERY=1\n  startx\nfi\n'
+            xinitrc = textwrap.dedent("""
+                #!/usr/bin/env bash
+                export AEGISVAULT_RECOVERY=1
+                xsetroot -solid '#0e1116'
+                /usr/bin/openbox-session &
+                exec python3 /opt/aegisvault/aegisvault.py gui
+            """).strip() + "\n"
+            atomic_write(root_dir / ".bash_profile", bash_profile.encode("utf-8"), mode=0o644)
+            atomic_write(root_dir / ".xinitrc", xinitrc.encode("utf-8"), mode=0o755)
+
+            recovery_notice = textwrap.dedent("""
+                AegisVault Recovery Media
+
+                This environment boots directly into AegisVault so you can restore Full Recovery
+                snapshots onto an internal disk. Use Guided Full Restore for the easiest path.
+            """).strip() + "\n"
+            atomic_write(mount_root / "etc/aegisvault-recovery", recovery_notice.encode("utf-8"), mode=0o644)
+            atomic_write(mount_root / "etc/hostname", b"aegis-recovery\n", mode=0o644)
+            atomic_write(mount_root / "etc/hosts", b"127.0.0.1 localhost\n127.0.1.1 aegis-recovery\n", mode=0o644)
+            fstab_text = textwrap.dedent(f"""
+                UUID={blkid_value(layout['root'], 'UUID')} / ext4 defaults,noatime 0 1
+                UUID={blkid_value(layout['efi'], 'UUID')} /boot/efi vfat umask=0077 0 1
+            """).strip() + "\n"
+            atomic_write(mount_root / "etc/fstab", fstab_text.encode("utf-8"), mode=0o644)
+
+            run_chroot_checked(mount_root, ["/bin/systemctl", "enable", "aegisvault.service"], "enable aegisvault.service")
+            run_chroot_checked(mount_root, ["/bin/systemctl", "enable", "NetworkManager.service"], "enable NetworkManager.service")
+            run_chroot_checked(mount_root, ["/usr/sbin/update-initramfs", "-u", "-k", "all"], "update-initramfs in recovery media")
+            run_chroot_checked(mount_root, ["/usr/sbin/grub-install", "--target=i386-pc", layout["disk"]], "BIOS grub-install for recovery media")
+            run_chroot_checked(mount_root, ["/usr/sbin/grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=AegisVaultRecovery", "--removable", "--recheck", "--no-nvram"], "UEFI grub-install for recovery media")
+            run_chroot_checked(mount_root, ["/usr/sbin/update-grub"], "update-grub in recovery media")
+
+    update_stage(f"Recovery USB is ready on {device}")
 
 
 def encrypt_stream_to_bundle(source, dest, password: str) -> None:
@@ -1040,7 +1560,6 @@ def encrypt_stream_to_bundle(source, dest, password: str) -> None:
         dest.write(nonce)
         dest.write(ciphertext)
     dest.write((0).to_bytes(4, "big"))
-
 
 def decrypt_bundle_to_stream(source, password: str, dest) -> None:
     magic = source.read(len(BUNDLE_MAGIC))
@@ -1098,31 +1617,18 @@ def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, 
 def restore_plain_archive_file(archive_file: Path, manifest: SnapshotManifest, target: Path, member: Optional[str], apply_packages: bool) -> None:
     if manifest.kind == "full_recovery" and target.resolve() == Path("/"):
         raise AegisError("Full Recovery restore must target an offline-mounted root, not /.")
-    target.mkdir(parents=True, exist_ok=True)
-    cmd = ["tar", "--xattrs", "--acls", "--numeric-owner", "-xpf", str(archive_file), "-C", str(target)]
-    if member:
-        cmd.append(normalize_member_path(member))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise AegisError(f"tar extraction failed: {result.stderr.strip() or result.returncode}")
+    if manifest.archive_sha256 and sha256_file(archive_file) != manifest.archive_sha256:
+        raise AegisError("Bundle archive integrity mismatch.")
+    extract_archive_file_to_target(archive_file, target, member)
     after_restore_actions(target, manifest, apply_packages)
 
 
 def restore_from_bundle_file(bundle_path: Path, password: str, target: Path, member: Optional[str], apply_packages: bool) -> None:
-    if not password.strip():
-        raise AegisError("Bundle password is required.")
-    with tempfile.NamedTemporaryFile(delete=False) as plain_bundle:
-        plain_bundle_path = Path(plain_bundle.name)
+    manifest, archive_path, td = bundle_manifest_and_archive(bundle_path, password)
     try:
-        with bundle_path.open("rb") as src, plain_bundle_path.open("wb") as dst:
-            decrypt_bundle_to_stream(src, password, dst)
-        with tempfile.TemporaryDirectory() as td:
-            temp_dir = Path(td)
-            subprocess.run(["tar", "-xpf", str(plain_bundle_path), "-C", str(temp_dir)], check=True, capture_output=True)
-            manifest = snapshot_from_dict(json.loads((temp_dir / "snapshot.json").read_text(encoding="utf-8")))
-            restore_plain_archive_file(temp_dir / "archive.tar", manifest, target, member, apply_packages)
+        restore_plain_archive_file(archive_path, manifest, target, member, apply_packages)
     finally:
-        plain_bundle_path.unlink(missing_ok=True)
+        td.cleanup()
 
 
 def download_to_temp(url: str) -> Path:
@@ -1326,6 +1832,44 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise AegisError("Provide bundle_path or bundle_url.")
         return {"ok": True, "message": "Bundle restore started."}
+    if action == "set_repo_path":
+        repo_path = str(request.get("repo_path") or "").strip()
+        if not repo_path:
+            raise AegisError("Repository path is required.")
+        settings = load_settings()
+        settings.repo_path = repo_path
+        if not settings.full_excludes:
+            settings.full_excludes = default_full_excludes(settings.repo_path)
+        save_settings(settings)
+        return {"ok": True, "message": f"Repository path set to {repo_path}."}
+    if action == "run_create_recovery_usb":
+        device = str(request.get("device") or "").strip()
+        if not device:
+            raise AegisError("Choose a target USB disk first.")
+        run_job(f"Create recovery USB on {device}", lambda: create_recovery_usb(device))
+        return {"ok": True, "message": "Recovery USB creation started."}
+    if action == "run_guided_restore_repo":
+        device = str(request.get("target_disk") or "").strip()
+        snapshot_id = str(request.get("snapshot") or "").strip()
+        recovery_key = request.get("recovery_key") or None
+        if not snapshot_id or not device:
+            raise AegisError("Snapshot and target disk are required.")
+        run_job(f"Guided restore {snapshot_id} to {device}", lambda: guided_full_restore_from_repo(load_settings(), snapshot_id, device, recovery_key))
+        return {"ok": True, "message": "Guided full restore started."}
+    if action == "run_guided_restore_bundle":
+        device = str(request.get("target_disk") or "").strip()
+        bundle_path = str(request.get("bundle_path") or "").strip()
+        bundle_url = str(request.get("bundle_url") or "").strip()
+        password = str(request.get("password") or "")
+        if not device:
+            raise AegisError("Target disk is required.")
+        if bundle_path:
+            run_job(f"Guided restore bundle to {device}", lambda: guided_full_restore_from_bundle(Path(bundle_path), password, device))
+        elif bundle_url:
+            run_job(f"Guided restore URL bundle to {device}", lambda: guided_full_restore_from_bundle_url(bundle_url, password, device))
+        else:
+            raise AegisError("Provide a bundle file or URL.")
+        return {"ok": True, "message": "Guided full restore started."}
     if action == "sync_peers":
         run_job("Peer sync", lambda: sync_peers(load_settings()))
         return {"ok": True, "message": "Peer sync started."}
@@ -1496,9 +2040,27 @@ def export_bundle_command(snapshot: str, output: str, password: str, recovery_ke
 
 def restore_command(args) -> int:
     try:
+        guided = bool(getattr(args, "guided", False))
+        target_disk = getattr(args, "target_disk", "") or ""
         if not args.direct:
             try:
-                if args.snapshot:
+                if guided:
+                    if args.snapshot:
+                        payload = {
+                            "action": "run_guided_restore_repo",
+                            "snapshot": args.snapshot,
+                            "target_disk": target_disk,
+                            "recovery_key": args.recovery_key or "",
+                        }
+                    else:
+                        payload = {
+                            "action": "run_guided_restore_bundle",
+                            "bundle_path": args.bundle or "",
+                            "bundle_url": args.url or "",
+                            "password": args.bundle_password or "",
+                            "target_disk": target_disk,
+                        }
+                elif args.snapshot:
                     payload = {
                         "action": "run_restore_repo",
                         "snapshot": args.snapshot,
@@ -1527,16 +2089,59 @@ def restore_command(args) -> int:
 
         ensure_root()
         settings = load_settings()
-        target = Path(args.target)
-        if args.snapshot:
-            restore_snapshot_from_repo(settings, args.snapshot, target, args.path, bool(args.apply_packages), args.recovery_key)
-        elif args.bundle:
-            restore_from_bundle_file(Path(args.bundle), args.bundle_password or "", target, args.path, bool(args.apply_packages))
-        elif args.url:
-            restore_from_bundle_url(args.url, args.bundle_password or "", target, args.path, bool(args.apply_packages))
+        if guided:
+            if not target_disk:
+                raise AegisError("Guided restore requires --target-disk /dev/sdX.")
+            if args.snapshot:
+                guided_full_restore_from_repo(settings, args.snapshot, target_disk, args.recovery_key)
+            elif args.bundle:
+                guided_full_restore_from_bundle(Path(args.bundle), args.bundle_password or "", target_disk)
+            elif args.url:
+                guided_full_restore_from_bundle_url(args.url, args.bundle_password or "", target_disk)
+            else:
+                raise AegisError("Provide --snapshot, --bundle, or --url.")
         else:
-            raise AegisError("Provide --snapshot, --bundle, or --url.")
+            target = Path(args.target)
+            if args.snapshot:
+                restore_snapshot_from_repo(settings, args.snapshot, target, args.path, bool(args.apply_packages), args.recovery_key)
+            elif args.bundle:
+                restore_from_bundle_file(Path(args.bundle), args.bundle_password or "", target, args.path, bool(args.apply_packages))
+            elif args.url:
+                restore_from_bundle_url(args.url, args.bundle_password or "", target, args.path, bool(args.apply_packages))
+            else:
+                raise AegisError("Provide --snapshot, --bundle, or --url.")
         print("Restore finished.")
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def list_disks_command() -> int:
+    try:
+        disks = list_disk_choices()
+        for disk in disks:
+            print(f"{disk['path']}	{disk['display']}")
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def create_recovery_usb_command(device: str, direct: bool) -> int:
+    try:
+        if not direct:
+            try:
+                response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                print(response["message"])
+                return 0
+            except Exception:
+                pass
+        ensure_root()
+        create_recovery_usb(device)
+        print(f"Recovery USB created on {device}")
         return 0
     except Exception as exc:
         print(str(exc), file=sys.stderr)
@@ -1602,6 +2207,10 @@ def gui_main() -> int:
             self.bundle_password_var = tk.StringVar(value="")
             self.bundle_file_var = tk.StringVar(value="")
             self.bundle_url_var = tk.StringVar(value="")
+            self.repo_source_var = tk.StringVar(value="")
+            self.repo_candidate_var = tk.StringVar(value="")
+            self.recovery_usb_device_var = tk.StringVar(value="")
+            self.guided_target_disk_var = tk.StringVar(value="")
 
             self.peer_label_var = tk.StringVar()
             self.peer_target_var = tk.StringVar()
@@ -1611,10 +2220,28 @@ def gui_main() -> int:
             self.selected_snapshot_id = ""
             self.dashboard_payload: Dict[str, Any] = {}
             self.settings_loaded = False
+            self.recovery_mode = is_recovery_environment()
+            self.repo_candidates: List[str] = []
+            self.usb_choice_map: Dict[str, str] = {}
+            self.guided_disk_map: Dict[str, str] = {}
+            self.recovery_mounts: List[str] = []
 
             self.build_ui()
+            if self.recovery_mode and os.geteuid() == 0:
+                try:
+                    self.recovery_mounts = auto_mount_recovery_sources()
+                except Exception:
+                    self.recovery_mounts = []
+            self.refresh_local_device_lists()
+            self.scan_repository_candidates(auto_use=True)
+            if self.recovery_mode:
+                self.notebook.select(self.restore_tab)
+                hint = "Recovery mode: use Guided Full Restore for the easiest same-machine disaster restore."
+                if self.recovery_mounts:
+                    hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
+                self.message_var.set(hint)
             self.refresh_dashboard()
-            self.root.after(2000, self.periodic_refresh)
+            self.root.after(2500, self.periodic_refresh)
 
         def configure_theme(self) -> None:
             self.root.configure(bg="#0e1116")
@@ -1739,9 +2366,52 @@ def gui_main() -> int:
             ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=2, column=2, padx=(12, 0), pady=(10, 0), sticky="w")
 
         def build_restore_tab(self) -> None:
+            intro = ttk.Frame(self.restore_tab)
+            intro.pack(fill="x")
+            ttk.Label(intro, text="Restore and recovery", style="Header.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
+            intro_text = (
+                "Use Portable restore inside a running Linux install, or use Guided Full Restore from recovery media "
+                "to wipe a disk and put a Full Recovery snapshot back exactly. "
+                "You can also restore from an encrypted bundle file or a hosted bundle URL."
+            )
+            ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+            ttk.Label(intro, text="Backup repository source").grid(row=2, column=0, sticky="w", pady=(12, 0))
+            ttk.Entry(intro, textvariable=self.repo_source_var, width=58).grid(row=2, column=1, sticky="w", pady=(12, 0))
+            ttk.Button(intro, text="Browse", command=lambda: self.browse_directory(self.repo_source_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
+            ttk.Button(intro, text="Use This Repo", command=self.use_repo_source_path).grid(row=2, column=3, padx=(8, 0), pady=(12, 0))
+            ttk.Button(intro, text="Scan Mounted Disks", command=lambda: self.scan_repository_candidates(auto_use=False)).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
+            ttk.Label(intro, text="Discovered repos").grid(row=3, column=0, sticky="w", pady=(10, 0))
+            self.repo_candidate_combo = ttk.Combobox(intro, textvariable=self.repo_candidate_var, width=56, state="readonly")
+            self.repo_candidate_combo.grid(row=3, column=1, sticky="w", pady=(10, 0))
+            ttk.Button(intro, text="Use Selected", command=self.use_selected_repo_candidate).grid(row=3, column=2, padx=(8, 0), pady=(10, 0))
+
+            ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
+
+            helper = ttk.Frame(self.restore_tab)
+            helper.pack(fill="x")
+            if self.recovery_mode:
+                ttk.Label(helper, text="Guided Full Restore (recommended)", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+                ttk.Label(helper, text="Select the destination disk. AegisVault will wipe it, recreate a bootable layout, restore the Full Recovery snapshot, refresh initramfs, and reinstall the bootloader.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                ttk.Label(helper, text="Target disk").grid(row=2, column=0, sticky="w", pady=(12, 0))
+                self.guided_disk_combo = ttk.Combobox(helper, textvariable=self.guided_target_disk_var, width=70, state="readonly")
+                self.guided_disk_combo.grid(row=2, column=1, sticky="w", pady=(12, 0))
+                ttk.Button(helper, text="Refresh Drives", command=self.refresh_local_device_lists).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
+                ttk.Button(helper, text="Restore Selected Snapshot to Disk", command=self.guided_restore_repo).grid(row=3, column=1, sticky="w", pady=(12, 0))
+                ttk.Button(helper, text="Restore Bundle or URL to Disk", command=self.guided_restore_bundle).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
+            else:
+                ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+                ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. AegisVault will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                ttk.Label(helper, text="Recovery USB device").grid(row=2, column=0, sticky="w", pady=(12, 0))
+                self.recovery_usb_combo = ttk.Combobox(helper, textvariable=self.recovery_usb_device_var, width=70, state="readonly")
+                self.recovery_usb_combo.grid(row=2, column=1, sticky="w", pady=(12, 0))
+                ttk.Button(helper, text="Refresh Drives", command=self.refresh_local_device_lists).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
+                ttk.Button(helper, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).grid(row=3, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
+
             repo_section = ttk.Frame(self.restore_tab)
             repo_section.pack(fill="x")
-            ttk.Label(repo_section, text="Restore from repository snapshot", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            ttk.Label(repo_section, text="Manual restore from repository snapshot", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
             self.restore_tree = self.build_snapshot_table(repo_section)
             self.restore_tree.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
             repo_section.grid_columnconfigure(0, weight=1)
@@ -1774,6 +2444,8 @@ def gui_main() -> int:
             ttk.Label(bundle_section, text="Selective path inside snapshot").grid(row=5, column=0, sticky="w", pady=(12, 0))
             ttk.Entry(bundle_section, textvariable=self.bundle_restore_path_var, width=42).grid(row=5, column=1, sticky="w", pady=(12, 0))
             ttk.Button(bundle_section, text="Restore Bundle", command=self.restore_bundle).grid(row=5, column=2, padx=(8, 0), pady=(12, 0))
+            if self.recovery_mode:
+                ttk.Button(bundle_section, text="Guided Full Restore Bundle to Disk", command=self.guided_restore_bundle).grid(row=5, column=3, padx=(8, 0), pady=(12, 0))
 
         def build_constellation_tab(self) -> None:
             info = ttk.Frame(self.constellation_tab)
@@ -1893,6 +2565,132 @@ def gui_main() -> int:
             if value:
                 variable.set(value)
 
+        def refresh_local_device_lists(self) -> None:
+            try:
+                usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
+                guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
+                self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
+                self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
+                if hasattr(self, "recovery_usb_combo"):
+                    self.recovery_usb_combo.configure(values=list(self.usb_choice_map.keys()))
+                if hasattr(self, "guided_disk_combo"):
+                    self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
+                if not self.recovery_usb_device_var.get() and usb_choices:
+                    self.recovery_usb_device_var.set(usb_choices[0]["display"])
+                if not self.guided_target_disk_var.get() and guided_choices:
+                    self.guided_target_disk_var.set(guided_choices[0]["display"])
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def scan_repository_candidates(self, auto_use: bool = False) -> None:
+            try:
+                self.repo_candidates = discover_repo_candidates()
+                if hasattr(self, "repo_candidate_combo"):
+                    self.repo_candidate_combo.configure(values=self.repo_candidates)
+                if self.repo_candidates and not self.repo_candidate_var.get():
+                    self.repo_candidate_var.set(self.repo_candidates[0])
+                if auto_use and self.repo_candidates and not Path(self.repo_source_var.get() or "").exists():
+                    self.repo_source_var.set(self.repo_candidates[0])
+                    self.use_repo_source_path()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def use_selected_repo_candidate(self) -> None:
+            if self.repo_candidate_var.get().strip():
+                self.repo_source_var.set(self.repo_candidate_var.get().strip())
+                self.use_repo_source_path()
+
+        def use_repo_source_path(self) -> None:
+            repo_path = self.repo_source_var.get().strip()
+            if not repo_path:
+                self.message_var.set("Choose a backup repository path first.")
+                return
+            try:
+                response = send_daemon_request({"action": "set_repo_path", "repo_path": repo_path})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.repo_path_var.set(repo_path)
+                self.message_var.set(response.get("message", "Repository path updated."))
+                self.settings_loaded = False
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def resolve_disk_path(self, raw_value: str, mapping: Dict[str, str]) -> str:
+            value = raw_value.strip()
+            return mapping.get(value, value)
+
+        def confirm_dangerous_action(self, title: str, message: str) -> bool:
+            return messagebox.askyesno(title, message, icon="warning")
+
+        def create_recovery_usb_from_gui(self) -> None:
+            device = self.resolve_disk_path(self.recovery_usb_device_var.get(), self.usb_choice_map)
+            if not device:
+                self.message_var.set("Choose a recovery USB device first.")
+                return
+            if not self.confirm_dangerous_action("Create Recovery USB", f"This will erase everything on {device}. Continue?"):
+                return
+            try:
+                response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Recovery USB creation started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def guided_restore_repo(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
+            if not device:
+                self.message_var.set("Choose a target disk first.")
+                return
+            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery snapshot. Continue?"):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_guided_restore_repo",
+                    "snapshot": self.selected_snapshot_id,
+                    "target_disk": device,
+                    "recovery_key": self.repo_recovery_key_var.get().strip(),
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Guided full restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def guided_restore_bundle(self) -> None:
+            device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
+            if not device:
+                self.message_var.set("Choose a target disk first.")
+                return
+            bundle_path = self.bundle_file_var.get().strip()
+            bundle_url = self.bundle_url_var.get().strip()
+            password = self.bundle_password_var.get().strip()
+            if not bundle_path and not bundle_url:
+                self.message_var.set("Choose a bundle file or enter a hosted URL first.")
+                return
+            if not password:
+                self.message_var.set("Bundle password is required.")
+                return
+            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery bundle. Continue?"):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_guided_restore_bundle",
+                    "bundle_path": bundle_path,
+                    "bundle_url": bundle_url,
+                    "password": password,
+                    "target_disk": device,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Guided full restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
         def daemon_dashboard(self) -> Dict[str, Any]:
             response = send_daemon_request({"action": "dashboard"})
             if not response.get("ok"):
@@ -1904,7 +2702,6 @@ def gui_main() -> int:
                 payload = self.daemon_dashboard()
                 self.dashboard_payload = payload
                 self.populate_dashboard(payload)
-                self.message_var.set("")
             except Exception as exc:
                 self.message_var.set(str(exc))
 
@@ -1941,6 +2738,7 @@ def gui_main() -> int:
                 self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
                 self.machine_label_var.set(settings.get("machine_label", ""))
                 self.repo_path_var.set(settings.get("repo_path", ""))
+                self.repo_source_var.set(settings.get("repo_path", ""))
                 self.encryption_var.set(bool(settings.get("encryption_enabled", True)))
                 schedule = settings.get("schedule", {})
                 self.schedule_enabled_var.set(bool(schedule.get("enabled", False)))
@@ -2100,8 +2898,8 @@ def gui_main() -> int:
                     "ssh_target": values[1],
                     "repo_path": values[2],
                     "port": int(values[3] or 22),
-                    "enabled": values[4] == "yes",
-                    "identity_file": "",
+                    "enabled": values[5] == "yes",
+                    "identity_file": values[4],
                 })
             return peers
 
@@ -2219,6 +3017,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sub.add_parser("status")
     sub.add_parser("dashboard")
     sub.add_parser("list-snapshots")
+    sub.add_parser("list-disks")
 
     backup = sub.add_parser("backup-now")
     backup.add_argument("--profile", choices=["full_recovery", "portable_state", "both"], default="both")
@@ -2236,11 +3035,17 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     restore.add_argument("--bundle")
     restore.add_argument("--url")
     restore.add_argument("--target", default="/")
+    restore.add_argument("--target-disk")
+    restore.add_argument("--guided", action="store_true")
     restore.add_argument("--path")
     restore.add_argument("--apply-packages", action="store_true")
     restore.add_argument("--recovery-key")
     restore.add_argument("--bundle-password")
     restore.add_argument("--direct", action="store_true")
+
+    recovery = sub.add_parser("create-recovery-usb")
+    recovery.add_argument("--device", required=True)
+    recovery.add_argument("--direct", action="store_true")
 
     sync = sub.add_parser("sync-peers")
     sync.add_argument("--direct", action="store_true")
@@ -2262,12 +3067,16 @@ def main(argv: List[str]) -> int:
             return print_status_json()
         if cmd == "list-snapshots":
             return list_snapshots_command()
+        if cmd == "list-disks":
+            return list_disks_command()
         if cmd == "backup-now":
             return backup_now_command(args.profile, args.direct)
         if cmd == "export-bundle":
             return export_bundle_command(args.snapshot, args.output, args.password, args.recovery_key, args.direct)
         if cmd == "restore":
             return restore_command(args)
+        if cmd == "create-recovery-usb":
+            return create_recovery_usb_command(args.device, args.direct)
         if cmd == "sync-peers":
             return sync_peers_command(args.direct)
         raise AegisError(f"Unknown command: {cmd}")
