@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import base64
 import dataclasses
+import errno
 import fnmatch
 import grp
 import hashlib
@@ -245,9 +246,8 @@ class Runtime:
         self.current_job: Optional[JobState] = None
         self.logs: List[str] = []
 
-
 RUNTIME = Runtime()
-
+_SOCKET_AUTH_FAILED = False
 
 def now_rfc3339() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1936,7 +1936,7 @@ def serve_connection(conn: socket.socket) -> None:
         conn.close()
 
 
-def send_daemon_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+def send_daemon_request_raw(payload: Dict[str, Any]) -> Dict[str, Any]:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.connect(SOCKET_PATH)
     client.sendall(json.dumps(payload).encode("utf-8"))
@@ -1951,6 +1951,100 @@ def send_daemon_request(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not data:
         raise AegisError("Daemon returned no data.")
     return json.loads(data.decode("utf-8"))
+
+
+def _pkexec_env_prefix() -> List[str]:
+    forwarded = []
+    for name in (
+        "DISPLAY",
+        "XAUTHORITY",
+        "XDG_RUNTIME_DIR",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "XDG_CURRENT_DESKTOP",
+        "DESKTOP_SESSION",
+    ):
+        value = os.environ.get(name)
+        if value:
+            forwarded.append(f"{name}={value}")
+    return forwarded
+
+
+def authorize_socket_access_for_user() -> None:
+    global _SOCKET_AUTH_FAILED
+
+    if os.geteuid() == 0:
+        return
+    if _SOCKET_AUTH_FAILED:
+        raise AegisError("Administrator authentication was canceled or failed.")
+
+    pkexec = shutil.which("pkexec")
+    if not pkexec:
+        raise AegisError("pkexec is required to authorize AegisVault for this desktop session.")
+
+    user_name = pwd.getpwuid(os.getuid()).pw_name
+    cmd = [
+        pkexec,
+        "env",
+        *_pkexec_env_prefix(),
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "authorize-socket",
+        "--user",
+        user_name,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        _SOCKET_AUTH_FAILED = True
+        detail = result.stderr.strip() or result.stdout.strip() or "Administrator authentication was canceled or failed."
+        raise AegisError(detail)
+
+
+def send_daemon_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return send_daemon_request_raw(payload)
+    except PermissionError:
+        authorize_socket_access_for_user()
+        return send_daemon_request_raw(payload)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM, errno.ENOENT, errno.ECONNREFUSED):
+            authorize_socket_access_for_user()
+            return send_daemon_request_raw(payload)
+        raise
+
+def authorize_socket_command(user: str) -> int:
+    try:
+        ensure_root()
+        Path("/run/aegisvault").mkdir(parents=True, exist_ok=True)
+
+        subprocess.run(["systemctl", "start", "aegisvault.service"], check=False, capture_output=True)
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if Path(SOCKET_PATH).exists():
+                break
+            time.sleep(0.2)
+
+        if not Path(SOCKET_PATH).exists():
+            raise AegisError("AegisVault daemon socket was not created.")
+
+        if shutil.which("setfacl"):
+            result = subprocess.run(
+                ["setfacl", "-m", f"user:{user}:rw", SOCKET_PATH],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                os.chmod(SOCKET_PATH, 0o666)
+        else:
+            os.chmod(SOCKET_PATH, 0o666)
+
+        os.chmod("/run/aegisvault", 0o755)
+        print("Socket access granted.")
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 def init_command(repo: Optional[str], label: Optional[str], encryption: bool) -> int:
@@ -2245,26 +2339,101 @@ def gui_main() -> int:
 
         def configure_theme(self) -> None:
             self.root.configure(bg="#0e1116")
+
+            self.root.option_add("*TCombobox*Listbox*Background", "#151b23")
+            self.root.option_add("*TCombobox*Listbox*Foreground", "#e6edf3")
+            self.root.option_add("*TCombobox*Listbox*selectBackground", "#1a2330")
+            self.root.option_add("*TCombobox*Listbox*selectForeground", "#ffffff")
+            self.root.option_add("*Listbox*Background", "#151b23")
+            self.root.option_add("*Listbox*Foreground", "#e6edf3")
+            self.root.option_add("*Listbox*selectBackground", "#1a2330")
+            self.root.option_add("*Listbox*selectForeground", "#ffffff")
+
             style = ttk.Style()
             try:
                 style.theme_use("clam")
             except Exception:
                 pass
+
             style.configure(".", background="#0e1116", foreground="#e6edf3", fieldbackground="#151b23")
             style.configure("TFrame", background="#0e1116")
             style.configure("TLabel", background="#0e1116", foreground="#e6edf3")
             style.configure("Header.TLabel", background="#0e1116", foreground="#e6edf3", font=("TkDefaultFont", 11, "bold"))
             style.configure("Muted.TLabel", background="#0e1116", foreground="#9fb3c8")
-            style.configure("TButton", background="#1f6feb", foreground="#ffffff", relief="flat")
-            style.map("TButton", background=[("active", "#2a7fff")])
+
+            style.configure(
+                "TButton",
+                background="#165dcb",
+                foreground="#ffffff",
+                padding=(12, 8),
+                relief="flat",
+                borderwidth=0,
+                focusthickness=0,
+            )
+            style.map(
+                "TButton",
+                background=[("pressed", "#114da7"), ("active", "#1a69df"), ("disabled", "#2b3138")],
+                foreground=[("disabled", "#93a4b7")],
+                relief=[("pressed", "flat"), ("active", "flat")],
+            )
+
             style.configure("TCheckbutton", background="#0e1116", foreground="#e6edf3")
             style.configure("TRadiobutton", background="#0e1116", foreground="#e6edf3")
             style.configure("TEntry", fieldbackground="#151b23", foreground="#e6edf3", insertcolor="#e6edf3")
-            style.configure("Treeview", background="#151b23", fieldbackground="#151b23", foreground="#e6edf3", rowheight=24)
-            style.configure("Treeview.Heading", background="#11161d", foreground="#e6edf3")
-            style.configure("TNotebook", background="#0e1116", borderwidth=0)
-            style.configure("TNotebook.Tab", background="#11161d", foreground="#e6edf3", padding=(14, 8))
-            style.map("TNotebook.Tab", background=[("selected", "#1b2430")], foreground=[("selected", "#ffffff")])
+
+            style.configure(
+                "TCombobox",
+                fieldbackground="#151b23",
+                background="#151b23",
+                foreground="#e6edf3",
+                arrowcolor="#9fb3c8",
+                bordercolor="#243041",
+                lightcolor="#151b23",
+                darkcolor="#151b23",
+                insertcolor="#e6edf3",
+                selectbackground="#1a2330",
+                selectforeground="#ffffff",
+            )
+            style.map(
+                "TCombobox",
+                fieldbackground=[("readonly", "#151b23"), ("!disabled", "#151b23")],
+                background=[("readonly", "#151b23"), ("active", "#151b23")],
+                foreground=[("readonly", "#e6edf3"), ("!disabled", "#e6edf3")],
+                arrowcolor=[("active", "#ffffff"), ("!disabled", "#9fb3c8")],
+            )
+
+            style.configure(
+                "Treeview",
+                background="#151b23",
+                fieldbackground="#151b23",
+                foreground="#e6edf3",
+                rowheight=24,
+                borderwidth=0,
+            )
+            style.map("Treeview", background=[("selected", "#1a2330")], foreground=[("selected", "#ffffff")])
+            style.configure("Treeview.Heading", background="#11161d", foreground="#e6edf3", borderwidth=0)
+
+            style.configure("TNotebook", background="#0e1116", borderwidth=0, tabmargins=(0, 0, 0, 0))
+            style.configure("TNotebook.Tab", background="#11161d", foreground="#d7e0ea", padding=(16, 10), borderwidth=0)
+            style.map(
+                "TNotebook.Tab",
+                background=[("selected", "#1a2330"), ("active", "#141b24"), ("!selected", "#11161d")],
+                foreground=[("selected", "#ffffff"), ("!selected", "#d7e0ea")],
+                padding=[("selected", (16, 10)), ("!selected", (16, 10))],
+                expand=[("selected", (0, 0, 0, 0)), ("!selected", (0, 0, 0, 0))],
+            )
+
+            style.configure(
+                "Vertical.TScrollbar",
+                background="#11161d",
+                troughcolor="#0e1116",
+                bordercolor="#0e1116",
+                lightcolor="#11161d",
+                darkcolor="#11161d",
+                arrowcolor="#9fb3c8",
+                gripcount=0,
+            )
+            style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
         def build_ui(self) -> None:
             top = ttk.Frame(self.root, padding=16)
@@ -2294,7 +2463,33 @@ def gui_main() -> int:
             self.build_constellation_tab()
             self.build_settings_tab()
 
-        def build_overview_tab(self) -> None:
+        def style_scrolled_text(self, widget: ScrolledText) -> None:
+            widget.configure(
+                bg="#151b23",
+                fg="#e6edf3",
+                insertbackground="#e6edf3",
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#243041",
+                highlightcolor="#165dcb",
+                padx=8,
+                pady=8,
+            )
+            try:
+                widget.vbar.configure(
+                    bg="#11161d",
+                    activebackground="#1a2330",
+                    troughcolor="#0e1116",
+                    relief="flat",
+                    bd=0,
+                    highlightthickness=0,
+                    width=12,
+                )
+            except Exception:
+                pass
+
+        def build_ui(self) -> None:
             summary = ttk.Frame(self.overview_tab)
             summary.pack(fill="x")
             self.summary_labels: Dict[str, ttk.Label] = {}
@@ -2319,12 +2514,14 @@ def gui_main() -> int:
             ttk.Label(warnings_frame, text="Warnings", style="Header.TLabel").pack(anchor="w")
             self.warnings_text = ScrolledText(warnings_frame, height=5, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.warnings_text.pack(fill="x", pady=(8, 0))
+            self.style_scrolled_text(self.warnings_text)
 
             logs_frame = ttk.Frame(self.overview_tab)
             logs_frame.pack(fill="both", expand=True, pady=(18, 0))
             ttk.Label(logs_frame, text="Recent activity", style="Header.TLabel").pack(anchor="w")
             self.logs_text = ScrolledText(logs_frame, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.logs_text.pack(fill="both", expand=True, pady=(8, 0))
+            self.style_scrolled_text(self.logs_text)
 
         def build_snapshot_table(self, parent: ttk.Frame) -> ttk.Treeview:
             columns = ("created_at", "machine_label", "kind", "bytes", "id")
@@ -2511,12 +2708,15 @@ def gui_main() -> int:
             ttk.Label(excludes, text="Full Recovery excludes", style="Header.TLabel").pack(anchor="w")
             self.full_excludes_text = ScrolledText(excludes, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.full_excludes_text.pack(fill="both", expand=True, pady=(8, 0))
+            self.style_scrolled_text(self.full_excludes_text)
             ttk.Label(excludes, text="Portable includes", style="Header.TLabel").pack(anchor="w", pady=(18, 0))
             self.portable_includes_text = ScrolledText(excludes, height=6, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.portable_includes_text.pack(fill="both", expand=True, pady=(8, 0))
+            self.style_scrolled_text(self.portable_includes_text)
             ttk.Label(excludes, text="Portable excludes", style="Header.TLabel").pack(anchor="w", pady=(18, 0))
             self.portable_excludes_text = ScrolledText(excludes, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.portable_excludes_text.pack(fill="both", expand=True, pady=(8, 0))
+            self.style_scrolled_text(self.portable_excludes_text)
 
             peers = ttk.Frame(right)
             peers.pack(fill="both", expand=True)
@@ -3047,6 +3247,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     recovery.add_argument("--device", required=True)
     recovery.add_argument("--direct", action="store_true")
 
+    auth = sub.add_parser("authorize-socket")
+    auth.add_argument("--user", required=True)
+
     sync = sub.add_parser("sync-peers")
     sync.add_argument("--direct", action="store_true")
 
@@ -3077,6 +3280,8 @@ def main(argv: List[str]) -> int:
             return restore_command(args)
         if cmd == "create-recovery-usb":
             return create_recovery_usb_command(args.device, args.direct)
+        if cmd == "authorize-socket":
+            return authorize_socket_command(args.user)
         if cmd == "sync-peers":
             return sync_peers_command(args.direct)
         raise AegisError(f"Unknown command: {cmd}")
