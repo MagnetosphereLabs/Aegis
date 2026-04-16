@@ -2925,7 +2925,7 @@ def gui_main() -> int:
                 if self.recovery_mounts:
                     hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
                 self.message_var.set(hint)
-            self.refresh_dashboard()
+            self.root.after(150, self.refresh_dashboard)
             self.root.after(2500, self.periodic_refresh)
 
         def configure_theme(self) -> None:
