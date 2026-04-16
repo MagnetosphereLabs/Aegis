@@ -4,6 +4,8 @@ set -euo pipefail
 APP_NAME="aegisvault"
 APP_DIR="/opt/aegisvault"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
+CREDSTORE_DIR="/etc/credstore.encrypted"
+CRED_NAME_PREFIX="aegisvault-machine-key-"
 REPO_SLUG="${REPO_SLUG:-MagnetosphereLabs/Aegis}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO_SLUG}/${BRANCH}}"
@@ -45,7 +47,7 @@ EOF
 install_support_files() {
   groupadd -f aegisvault || true
   install -d -m 0750 /var/lib/aegisvault
-  install -d -m 0750 /var/lib/aegisvault/keys
+  install -d -m 0700 "${CREDSTORE_DIR}"
   install -d -m 0750 /var/backups/aegisvault
   install -d -m 0755 /usr/share/applications
 
@@ -128,7 +130,7 @@ prompt_uninstall_mode() {
 
   echo >/dev/tty
   echo "Choose uninstall level:" >/dev/tty
-  echo "  1) Remove app files only (keep settings, keys, and backups)" >/dev/tty
+  echo "  1) Remove app files only (keep settings, encrypted credentials, and backups)" >/dev/tty
   echo "  2) Remove app files and purge all local AegisVault data" >/dev/tty
   echo "  3) Cancel" >/dev/tty
   printf "Selection [1-3]: " >/dev/tty
@@ -162,7 +164,7 @@ do_install() {
   echo "Desktop launcher installed."
   echo "Recovery USB builder available from the Restore tab or: aegisvault create-recovery-usb --device /dev/sdX"
   echo
-  echo "IMPORTANT: move the recovery key file from /var/lib/aegisvault somewhere safe."
+  echo "IMPORTANT: write down the recovery key when it is shown. It is not written to disk."
   echo "If the desktop app cannot connect right away, log out and back in so the aegisvault group applies to your session."
 }
 
@@ -189,10 +191,15 @@ do_uninstall() {
   if [ "${UNINSTALL_MODE}" = "purge" ]; then
     rm -rf /var/lib/aegisvault
     rm -rf /var/backups/aegisvault
+
+    if [ -d "${CREDSTORE_DIR}" ]; then
+      find "${CREDSTORE_DIR}" -maxdepth 1 -type f -name "${CRED_NAME_PREFIX}*.cred" -delete
+    fi
+
     groupdel aegisvault >/dev/null 2>&1 || true
-    echo "AegisVault fully removed, including settings, keys, state, and local backup repository data."
+    echo "AegisVault fully removed, including settings, encrypted local unlock credentials, state, and local backup repository data."
   else
-    echo "AegisVault app files removed. Data under /var/lib/aegisvault and /var/backups/aegisvault was left in place."
+    echo "AegisVault app files removed. Data under /var/lib/aegisvault, /var/backups/aegisvault, and ${CREDSTORE_DIR} was left in place."
   fi
 }
 
