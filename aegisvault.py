@@ -302,8 +302,10 @@ def discover_backup_location_choices() -> List[Dict[str, str]]:
     choices: List[Dict[str, str]] = []
     seen: Set[str] = set()
     root_disk = current_root_disk()
+    entries = list_block_devices()
+    entries_by_path = {entry.get("path", ""): entry for entry in entries}
 
-    for entry in list_block_devices():
+    for entry in entries:
         if entry.get("type") != "part":
             continue
 
@@ -311,17 +313,23 @@ def discover_backup_location_choices() -> List[Dict[str, str]]:
         if not mountpoints:
             continue
 
-        if device_parent_disk(entry.get("path", "")) == root_disk:
+        part_path = entry.get("path", "")
+        parent_disk = device_parent_disk(part_path)
+        if parent_disk == root_disk:
             continue
 
-        if not (
-            entry.get("removable")
+        parent_entry = entries_by_path.get(parent_disk, {})
+        is_external = (
+            bool(entry.get("removable"))
             or entry.get("transport") == "usb"
+            or bool(parent_entry.get("removable"))
+            or parent_entry.get("transport") == "usb"
             or any(mp.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES) for mp in mountpoints)
-        ):
+        )
+        if not is_external:
             continue
 
-        label = entry.get("label") or entry.get("model") or Path(entry.get("path", "")).name
+        label = entry.get("label") or parent_entry.get("model") or parent_entry.get("serial") or Path(part_path).name
         fs_name = entry.get("fstype") or "unknown fs"
         size_text = human_bytes(int(entry.get("size") or 0))
 
@@ -3468,61 +3476,154 @@ def gui_main() -> int:
             dialog.configure(bg="#0e1116")
             dialog.transient(self.root)
             dialog.grab_set()
-        
-            current_path_var = tk.StringVar(value=os.path.abspath(start_path if os.path.isdir(start_path) else "/"))
+
+            initial_path = start_path if os.path.isdir(start_path) else "/"
+            current_path_var = tk.StringVar(value=os.path.abspath(initial_path))
             result: Dict[str, Optional[str]] = {"path": None}
             root_items: List[Tuple[str, str]] = []
             child_items: List[str] = []
-        
+
+            header = ttk.Frame(dialog, padding=16)
+            header.pack(fill="x")
+            ttk.Label(header, text="Choose where backups live", style="Header.TLabel").pack(anchor="w")
+            ttk.Label(
+                header,
+                text="Drives are listed on the left. Open a drive, then choose its root folder or drill into a subfolder.",
+                wraplength=900,
+                style="Muted.TLabel",
+            ).pack(anchor="w", pady=(6, 0))
+
+            body = ttk.Frame(dialog, padding=(16, 0, 16, 16))
+            body.pack(fill="both", expand=True)
+            body.grid_columnconfigure(0, weight=1)
+            body.grid_columnconfigure(1, weight=2)
+            body.grid_rowconfigure(1, weight=1)
+
+            ttk.Label(body, text="Drives and mount points").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(body, text="Folders in current location").grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 8))
+
+            roots_frame = ttk.Frame(body)
+            roots_frame.grid(row=1, column=0, sticky="nsew")
+            children_frame = ttk.Frame(body)
+            children_frame.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
+
+            roots_list = tk.Listbox(
+                roots_frame,
+                bg="#0b0f14",
+                fg="#ffffff",
+                selectbackground="#1a2330",
+                selectforeground="#ffffff",
+                activestyle="none",
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#243041",
+                highlightcolor="#165dcb",
+            )
+            roots_scroll = ttk.Scrollbar(roots_frame, orient="vertical", command=roots_list.yview)
+            roots_list.configure(yscrollcommand=roots_scroll.set)
+            roots_list.pack(side="left", fill="both", expand=True)
+            roots_scroll.pack(side="right", fill="y")
+
+            children_list = tk.Listbox(
+                children_frame,
+                bg="#0b0f14",
+                fg="#ffffff",
+                selectbackground="#1a2330",
+                selectforeground="#ffffff",
+                activestyle="none",
+                relief="flat",
+                bd=0,
+                highlightthickness=1,
+                highlightbackground="#243041",
+                highlightcolor="#165dcb",
+            )
+            children_scroll = ttk.Scrollbar(children_frame, orient="vertical", command=children_list.yview)
+            children_list.configure(yscrollcommand=children_scroll.set)
+            children_list.pack(side="left", fill="both", expand=True)
+            children_scroll.pack(side="right", fill="y")
+
+            current_bar = ttk.Frame(dialog, padding=(16, 0, 16, 10))
+            current_bar.pack(fill="x")
+            ttk.Label(current_bar, text="Current folder").pack(side="left")
+            current_entry = tk.Entry(
+                current_bar,
+                textvariable=current_path_var,
+                bg="#0b0f14",
+                fg="#ffffff",
+                insertbackground="#ffffff",
+                readonlybackground="#0b0f14",
+                relief="flat",
+                bd=0,
+            )
+            current_entry.configure(state="readonly")
+            current_entry.pack(side="left", fill="x", expand=True, padx=(12, 0))
+
             def available_roots() -> List[Tuple[str, str]]:
                 rows: List[Tuple[str, str]] = []
                 seen: Set[str] = set()
                 root_disk = current_root_disk()
-        
-                for entry in list_block_devices():
+                entries = list_block_devices()
+                entries_by_path = {entry.get("path", ""): entry for entry in entries}
+
+                for entry in entries:
                     if entry.get("type") != "part":
                         continue
-        
+
                     mountpoints = [os.path.abspath(mp) for mp in (entry.get("mountpoints") or []) if mp]
                     if not mountpoints:
                         continue
-        
-                    label = entry.get("label") or entry.get("model") or Path(entry.get("path", "")).name
-                    fs_name = entry.get("fstype") or "unknown fs"
-                    size_text = human_bytes(int(entry.get("size") or 0))
+
+                    part_path = entry.get("path", "")
+                    parent_disk = device_parent_disk(part_path)
+                    if parent_disk == root_disk:
+                        continue
+
+                    parent_entry = entries_by_path.get(parent_disk, {})
                     is_external = (
-                        entry.get("removable")
+                        bool(entry.get("removable"))
                         or entry.get("transport") == "usb"
+                        or bool(parent_entry.get("removable"))
+                        or parent_entry.get("transport") == "usb"
                         or any(mp.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES) for mp in mountpoints)
                     )
-                    if device_parent_disk(entry.get("path", "")) == root_disk:
-                        is_external = False
-        
-                    prefix = "Drive" if is_external else "Mounted folder"
-        
+                    if not is_external:
+                        continue
+
+                    label = entry.get("label") or parent_entry.get("model") or Path(part_path).name
+                    fs_name = entry.get("fstype") or "unknown fs"
+                    size_text = human_bytes(int(entry.get("size") or 0))
+
                     for mountpoint in mountpoints:
                         if mountpoint in seen:
                             continue
                         seen.add(mountpoint)
-                        rows.append((f"{prefix}: {label} | {fs_name} | {size_text} | {mountpoint}", mountpoint))
-        
-                for fallback in [os.path.abspath(start_path), "/", "/media", "/mnt", "/run/media", str(Path.home())]:
+                        rows.append((f"Drive: {label} | {fs_name} | {size_text} | {mountpoint}", mountpoint))
+
+                for fallback in [os.path.abspath(initial_path), "/", "/media", "/mnt", "/run/media", str(Path.home())]:
                     if os.path.isdir(fallback) and fallback not in seen:
                         seen.add(fallback)
                         rows.append((f"Folder: {fallback}", fallback))
-        
+
                 rows.sort(key=lambda item: (0 if item[1].startswith(("/media", "/mnt", "/run/media")) else 1, item[0].lower()))
                 return rows
-        
+
+            def refresh_roots() -> None:
+                roots_list.delete(0, "end")
+                root_items.clear()
+                root_items.extend(available_roots())
+                for label, _path in root_items:
+                    roots_list.insert("end", label)
+
             def set_current_path(path: str) -> None:
                 path = os.path.abspath(path)
                 if not os.path.isdir(path):
                     return
-        
+
                 current_path_var.set(path)
                 children_list.delete(0, "end")
                 child_items.clear()
-        
+
                 try:
                     names = sorted(
                         [name for name in os.listdir(path) if os.path.isdir(os.path.join(path, name))],
@@ -3530,134 +3631,51 @@ def gui_main() -> int:
                     )
                 except (PermissionError, FileNotFoundError, NotADirectoryError):
                     names = []
-        
+
                 for name in names:
                     full = os.path.join(path, name)
                     child_items.append(full)
                     children_list.insert("end", name)
-        
-                def refresh_roots() -> None:
-                    roots_list.delete(0, "end")
-                    root_items.clear()
-                    root_items.extend(available_roots())
-                    for label, _path in root_items:
-                        roots_list.insert("end", label)
-            
-                def open_selected_root(event=None) -> None:
-                    selection = roots_list.curselection()
-                    if not selection:
-                        return
-                    set_current_path(root_items[selection[0]][1])
-            
-                def open_selected_child(event=None) -> None:
-                    selection = children_list.curselection()
-                    if not selection:
-                        return
-                    set_current_path(child_items[selection[0]])
-            
-                def go_up() -> None:
-                    current = current_path_var.get().strip() or "/"
-                    parent = os.path.dirname(current.rstrip("/")) or "/"
-                    set_current_path(parent)
-            
-                def choose_current() -> None:
-                    current = current_path_var.get().strip()
-                    if current:
-                        result["path"] = current
-                        dialog.destroy()
-            
-                header = ttk.Frame(dialog, padding=16)
-                header.pack(fill="x")
-                ttk.Label(header, text="Choose where backups live", style="Header.TLabel").pack(anchor="w")
-                ttk.Label(
-                    header,
-                    text="Drives are listed on the left. Open a drive, then choose its root folder or drill into a subfolder.",
-                    wraplength=900,
-                    style="Muted.TLabel",
-                ).pack(anchor="w", pady=(6, 0))
-            
-                body = ttk.Frame(dialog, padding=(16, 0, 16, 16))
-                body.pack(fill="both", expand=True)
-                body.grid_columnconfigure(0, weight=1)
-                body.grid_columnconfigure(1, weight=2)
-                body.grid_rowconfigure(1, weight=1)
-            
-                ttk.Label(body, text="Drives and mount points").grid(row=0, column=0, sticky="w", pady=(0, 8))
-                ttk.Label(body, text="Folders in current location").grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 8))
-            
-                roots_frame = ttk.Frame(body)
-                roots_frame.grid(row=1, column=0, sticky="nsew")
-                children_frame = ttk.Frame(body)
-                children_frame.grid(row=1, column=1, sticky="nsew", padx=(12, 0))
-            
-                roots_list = tk.Listbox(
-                    roots_frame,
-                    bg="#0b0f14",
-                    fg="#ffffff",
-                    selectbackground="#1a2330",
-                    selectforeground="#ffffff",
-                    activestyle="none",
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=1,
-                    highlightbackground="#243041",
-                    highlightcolor="#165dcb",
-                )
-                roots_scroll = ttk.Scrollbar(roots_frame, orient="vertical", command=roots_list.yview)
-                roots_list.configure(yscrollcommand=roots_scroll.set)
-                roots_list.pack(side="left", fill="both", expand=True)
-                roots_scroll.pack(side="right", fill="y")
-            
-                children_list = tk.Listbox(
-                    children_frame,
-                    bg="#0b0f14",
-                    fg="#ffffff",
-                    selectbackground="#1a2330",
-                    selectforeground="#ffffff",
-                    activestyle="none",
-                    relief="flat",
-                    bd=0,
-                    highlightthickness=1,
-                    highlightbackground="#243041",
-                    highlightcolor="#165dcb",
-                )
-                children_scroll = ttk.Scrollbar(children_frame, orient="vertical", command=children_list.yview)
-                children_list.configure(yscrollcommand=children_scroll.set)
-                children_list.pack(side="left", fill="both", expand=True)
-                children_scroll.pack(side="right", fill="y")
-            
-                roots_list.bind("<Double-Button-1>", open_selected_root)
-                children_list.bind("<Double-Button-1>", open_selected_child)
-            
-                current_bar = ttk.Frame(dialog, padding=(16, 0, 16, 10))
-                current_bar.pack(fill="x")
-                ttk.Label(current_bar, text="Current folder").pack(side="left")
-                current_entry = tk.Entry(
-                    current_bar,
-                    textvariable=current_path_var,
-                    bg="#0b0f14",
-                    fg="#ffffff",
-                    insertbackground="#ffffff",
-                    readonlybackground="#0b0f14",
-                    relief="flat",
-                    bd=0,
-                )
-                current_entry.configure(state="readonly")
-                current_entry.pack(side="left", fill="x", expand=True, padx=(12, 0))
-            
-                buttons = ttk.Frame(dialog, padding=(16, 0, 16, 16))
-                buttons.pack(fill="x")
-                ttk.Button(buttons, text="Open Selected Drive", command=open_selected_root).pack(side="left")
-                ttk.Button(buttons, text="Open Selected Folder", command=open_selected_child).pack(side="left", padx=(8, 0))
-                ttk.Button(buttons, text="Up", command=go_up).pack(side="left", padx=(8, 0))
-                ttk.Button(buttons, text="Refresh", command=refresh_roots).pack(side="left", padx=(8, 0))
-                ttk.Button(buttons, text="Choose This Folder", command=choose_current).pack(side="right")
-                ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
-            
-                refresh_roots()
-                set_current_path(current_path_var.get())
-                dialog.wait_window()
-                return result["path"]
+
+            def open_selected_root(event=None) -> None:
+                selection = roots_list.curselection()
+                if not selection:
+                    return
+                set_current_path(root_items[selection[0]][1])
+
+            def open_selected_child(event=None) -> None:
+                selection = children_list.curselection()
+                if not selection:
+                    return
+                set_current_path(child_items[selection[0]])
+
+            def go_up() -> None:
+                current = current_path_var.get().strip() or "/"
+                parent = os.path.dirname(current.rstrip("/")) or "/"
+                set_current_path(parent)
+
+            def choose_current() -> None:
+                current = current_path_var.get().strip()
+                if current:
+                    result["path"] = current
+                    dialog.destroy()
+
+            roots_list.bind("<Double-Button-1>", open_selected_root)
+            children_list.bind("<Double-Button-1>", open_selected_child)
+
+            buttons = ttk.Frame(dialog, padding=(16, 0, 16, 16))
+            buttons.pack(fill="x")
+            ttk.Button(buttons, text="Open Selected Drive", command=open_selected_root).pack(side="left")
+            ttk.Button(buttons, text="Open Selected Folder", command=open_selected_child).pack(side="left", padx=(8, 0))
+            ttk.Button(buttons, text="Up", command=go_up).pack(side="left", padx=(8, 0))
+            ttk.Button(buttons, text="Refresh", command=refresh_roots).pack(side="left", padx=(8, 0))
+            ttk.Button(buttons, text="Choose This Folder", command=choose_current).pack(side="right")
+            ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
+
+            refresh_roots()
+            set_current_path(current_path_var.get())
+            dialog.wait_window()
+            return result["path"]
         
         def browse_file(self, variable: tk.StringVar) -> None:
             value = filedialog.askopenfilename()
@@ -3689,14 +3707,55 @@ def gui_main() -> int:
                 choices = discover_backup_location_choices()
                 self.storage_choice_map = {item["label"]: item["path"] for item in choices}
                 self.storage_choices = list(self.storage_choice_map.keys())
-        
+
                 if hasattr(self, "storage_choice_combo"):
                     self.storage_choice_combo.configure(values=self.storage_choices)
-        
-                if self.storage_choices and self.storage_choice_var.get() not in self.storage_choice_map:
-                    self.storage_choice_var.set(self.storage_choices[0])
-        
-                if not self.storage_choices:
+
+                if self.storage_choices:
+                    if self.storage_choice_var.get() not in self.storage_choice_map:
+                        self.storage_choice_var.set(self.storage_choices[0])
+                    return
+
+                entries = list_block_devices()
+                entries_by_path = {entry.get("path", ""): entry for entry in entries}
+                root_disk = current_root_disk()
+                unmounted_external_parts: List[str] = []
+
+                for entry in entries:
+                    if entry.get("type") != "part":
+                        continue
+                    if entry.get("mountpoints"):
+                        continue
+
+                    part_path = entry.get("path", "")
+                    parent_disk = device_parent_disk(part_path)
+                    if parent_disk == root_disk:
+                        continue
+
+                    parent_entry = entries_by_path.get(parent_disk, {})
+                    is_external = (
+                        bool(entry.get("removable"))
+                        or entry.get("transport") == "usb"
+                        or bool(parent_entry.get("removable"))
+                        or parent_entry.get("transport") == "usb"
+                    )
+                    if not is_external:
+                        continue
+
+                    label = entry.get("label") or parent_entry.get("model") or Path(part_path).name
+                    fs_name = entry.get("fstype") or "unknown fs"
+                    size_text = human_bytes(int(entry.get("size") or 0))
+                    unmounted_external_parts.append(f"{part_path} | {label} | {fs_name} | {size_text}")
+
+                if unmounted_external_parts:
+                    self.storage_choice_var.set("")
+                    self.message_var.set(
+                        "External drive detected, but it is not mounted yet: "
+                        + "; ".join(unmounted_external_parts[:3])
+                        + ". Open it in Files or mount it in Disks, then click Refresh Drives."
+                    )
+                else:
+                    self.storage_choice_var.set("")
                     self.message_var.set(
                         "No mounted backup drives were detected yet. Plug in the drive, wait for Linux to mount it, then click Refresh Drives or Choose Drive or Folder."
                     )
