@@ -1817,9 +1817,19 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     ensure_recovery_builder_prereqs()
     unmount_device_tree(device)
     subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
-    run_command(["sgdisk", "--zap-all", device], check=True, capture=True)
+    sgdisk_result = subprocess.run(
+        ["sgdisk", "--zap-all", device],
+        capture_output=True,
+        text=True,
+    )
+    if sgdisk_result.returncode not in (0, 2, 3):
+        detail = sgdisk_result.stderr.strip() or sgdisk_result.stdout.strip() or f"exit status {sgdisk_result.returncode}"
+        raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
+    
     run_command(["wipefs", "-af", device], check=True, capture=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
     run_command(["parted", "-s", device, "mklabel", "gpt"], check=True, capture=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
     run_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], check=True, capture=True)
     run_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], check=True, capture=True)
     run_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], check=True, capture=True)
