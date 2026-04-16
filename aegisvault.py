@@ -3659,513 +3659,513 @@ def gui_main() -> int:
                 dialog.wait_window()
                 return result["path"]
         
-                def browse_file(self, variable: tk.StringVar) -> None:
-                    value = filedialog.askopenfilename()
-                    if value:
-                        variable.set(value)
+        def browse_file(self, variable: tk.StringVar) -> None:
+            value = filedialog.askopenfilename()
+            if value:
+                variable.set(value)
+
+        def refresh_local_device_lists(self) -> None:
+            try:
+                usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
+                guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
+
+                self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
+                self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
+
+                if hasattr(self, "recovery_usb_combo"):
+                    self.recovery_usb_combo.configure(values=list(self.usb_choice_map.keys()))
+                if hasattr(self, "guided_disk_combo"):
+                    self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
+
+                if usb_choices and self.recovery_usb_device_var.get() not in self.usb_choice_map:
+                    self.recovery_usb_device_var.set(usb_choices[0]["display"])
+                if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
+                    self.guided_target_disk_var.set(guided_choices[0]["display"])
+            except Exception as exc:
+                self.message_var.set(str(exc))
         
-                def refresh_local_device_lists(self) -> None:
-                    try:
-                        usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
-                        guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
+        def refresh_backup_location_suggestions(self) -> None:
+            try:
+                choices = discover_backup_location_choices()
+                self.storage_choice_map = {item["label"]: item["path"] for item in choices}
+                self.storage_choices = list(self.storage_choice_map.keys())
         
-                        self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
-                        self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
+                if hasattr(self, "storage_choice_combo"):
+                    self.storage_choice_combo.configure(values=self.storage_choices)
         
-                        if hasattr(self, "recovery_usb_combo"):
-                            self.recovery_usb_combo.configure(values=list(self.usb_choice_map.keys()))
-                        if hasattr(self, "guided_disk_combo"):
-                            self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
+                if self.storage_choices and self.storage_choice_var.get() not in self.storage_choice_map:
+                    self.storage_choice_var.set(self.storage_choices[0])
         
-                        if usb_choices and self.recovery_usb_device_var.get() not in self.usb_choice_map:
-                            self.recovery_usb_device_var.set(usb_choices[0]["display"])
-                        if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
-                            self.guided_target_disk_var.set(guided_choices[0]["display"])
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-                
-                def refresh_backup_location_suggestions(self) -> None:
-                    try:
-                        choices = discover_backup_location_choices()
-                        self.storage_choice_map = {item["label"]: item["path"] for item in choices}
-                        self.storage_choices = list(self.storage_choice_map.keys())
-                
-                        if hasattr(self, "storage_choice_combo"):
-                            self.storage_choice_combo.configure(values=self.storage_choices)
-                
-                        if self.storage_choices and self.storage_choice_var.get() not in self.storage_choice_map:
-                            self.storage_choice_var.set(self.storage_choices[0])
-                
-                        if not self.storage_choices:
-                            self.message_var.set(
-                                "No mounted backup drives were detected yet. Plug in the drive, wait for Linux to mount it, then click Refresh Drives or Choose Drive or Folder."
-                            )
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def apply_suggested_backup_location(self) -> None:
-                    chosen = self.storage_choice_map.get(self.storage_choice_var.get().strip(), "").strip()
-                    if not chosen:
-                        self.message_var.set("Choose a detected backup drive first, or use Choose Drive or Folder.")
-                        return
-                    self.repo_path_var.set(chosen)
-                    self.message_var.set(f"Backup location set to {chosen}")
-        
-                def scan_repository_candidates(self, auto_use: bool = False) -> None:
-                    try:
-                        self.repo_candidates = discover_repo_candidates()
-                        if hasattr(self, "repo_candidate_combo"):
-                            self.repo_candidate_combo.configure(values=self.repo_candidates)
-                        if self.repo_candidates and not self.repo_candidate_var.get():
-                            self.repo_candidate_var.set(self.repo_candidates[0])
-                        if auto_use and self.repo_candidates and not Path(self.repo_source_var.get() or "").exists():
-                            self.repo_source_var.set(self.repo_candidates[0])
-                            self.use_repo_source_path()
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def use_selected_repo_candidate(self) -> None:
-                    if self.repo_candidate_var.get().strip():
-                        self.repo_source_var.set(self.repo_candidate_var.get().strip())
-                        self.use_repo_source_path()
-        
-                def use_repo_source_path(self) -> None:
-                    repo_path = self.repo_source_var.get().strip()
-                    if not repo_path:
-                        self.message_var.set("Choose a backup repository path first.")
-                        return
-                    try:
-                        response = send_daemon_request({"action": "set_repo_path", "repo_path": repo_path})
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.repo_path_var.set(repo_path)
-                        self.message_var.set(response.get("message", "Backup location updated."))
-                        self.settings_loaded = False
-                        self.refresh_dashboard()
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def resolve_disk_path(self, raw_value: str, mapping: Dict[str, str]) -> str:
-                    value = raw_value.strip()
-                    return mapping.get(value, value)
-        
-                def confirm_dangerous_action(self, title: str, message: str) -> bool:
-                    return messagebox.askyesno(title, message, icon="warning")
-        
-                def create_recovery_usb_from_gui(self) -> None:
-                    device = self.resolve_disk_path(self.recovery_usb_device_var.get(), self.usb_choice_map)
-                    if not device:
-                        self.message_var.set("Choose a recovery USB device first.")
-                        return
-                    if not self.confirm_dangerous_action("Create Recovery USB", f"This will erase everything on {device}. Continue?"):
-                        return
-                    try:
-                        response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Recovery USB creation started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def guided_restore_repo(self) -> None:
-                    if not self.selected_snapshot_id:
-                        self.message_var.set("Select a snapshot first.")
-                        return
-                    device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
-                    if not device:
-                        self.message_var.set("Choose a target disk first.")
-                        return
-                    if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery snapshot. Continue?"):
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "run_guided_restore_repo",
-                            "snapshot": self.selected_snapshot_id,
-                            "target_disk": device,
-                            "recovery_password": self.repo_recovery_key_var.get().strip(),
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Guided full restore started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def guided_restore_bundle(self) -> None:
-                    device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
-                    if not device:
-                        self.message_var.set("Choose a target disk first.")
-                        return
-                    bundle_path = self.bundle_file_var.get().strip()
-                    bundle_url = self.bundle_url_var.get().strip()
-                    password = self.bundle_password_var.get().strip()
-                    if not bundle_path and not bundle_url:
-                        self.message_var.set("Choose a bundle file or enter a hosted URL first.")
-                        return
-                    if not password:
-                        self.message_var.set("Bundle password is required.")
-                        return
-                    if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery bundle. Continue?"):
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "run_guided_restore_bundle",
-                            "bundle_path": bundle_path,
-                            "bundle_url": bundle_url,
-                            "password": password,
-                            "target_disk": device,
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Guided full restore started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def daemon_dashboard(self) -> Dict[str, Any]:
-                    response = send_daemon_request({"action": "dashboard"})
-                    if not response.get("ok"):
-                        raise AegisError(response.get("error", "Unknown daemon error"))
-                    return response["dashboard"]
-        
-                def refresh_dashboard(self) -> None:
-                    try:
-                        payload = self.daemon_dashboard()
-                        self.dashboard_payload = payload
-                        self.populate_dashboard(payload)
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def periodic_refresh(self) -> None:
-                    self.refresh_dashboard()
-                    self.root.after(2000, self.periodic_refresh)
-        
-                def populate_dashboard(self, payload: Dict[str, Any]) -> None:
-                    settings = payload["settings"]
-                    state = payload["persistent"]
-                    current_job = payload.get("current_job")
-                    snapshots = payload.get("snapshots", [])
-                    warnings = payload.get("warnings", [])
-                    logs = payload.get("logs", [])
-        
-                    self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
-        
-                    self.status_var.set(
-                        f"{'Busy: ' + current_job['name'] + ' — ' + current_job['stage'] if current_job else 'Idle'}"
+                if not self.storage_choices:
+                    self.message_var.set(
+                        "No mounted backup drives were detected yet. Plug in the drive, wait for Linux to mount it, then click Refresh Drives or Choose Drive or Folder."
                     )
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def apply_suggested_backup_location(self) -> None:
+            chosen = self.storage_choice_map.get(self.storage_choice_var.get().strip(), "").strip()
+            if not chosen:
+                self.message_var.set("Choose a detected backup drive first, or use Choose Drive or Folder.")
+                return
+            self.repo_path_var.set(chosen)
+            self.message_var.set(f"Backup location set to {chosen}")
+
+        def scan_repository_candidates(self, auto_use: bool = False) -> None:
+            try:
+                self.repo_candidates = discover_repo_candidates()
+                if hasattr(self, "repo_candidate_combo"):
+                    self.repo_candidate_combo.configure(values=self.repo_candidates)
+                if self.repo_candidates and not self.repo_candidate_var.get():
+                    self.repo_candidate_var.set(self.repo_candidates[0])
+                if auto_use and self.repo_candidates and not Path(self.repo_source_var.get() or "").exists():
+                    self.repo_source_var.set(self.repo_candidates[0])
+                    self.use_repo_source_path()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def use_selected_repo_candidate(self) -> None:
+            if self.repo_candidate_var.get().strip():
+                self.repo_source_var.set(self.repo_candidate_var.get().strip())
+                self.use_repo_source_path()
+
+        def use_repo_source_path(self) -> None:
+            repo_path = self.repo_source_var.get().strip()
+            if not repo_path:
+                self.message_var.set("Choose a backup repository path first.")
+                return
+            try:
+                response = send_daemon_request({"action": "set_repo_path", "repo_path": repo_path})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.repo_path_var.set(repo_path)
+                self.message_var.set(response.get("message", "Backup location updated."))
+                self.settings_loaded = False
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def resolve_disk_path(self, raw_value: str, mapping: Dict[str, str]) -> str:
+            value = raw_value.strip()
+            return mapping.get(value, value)
+
+        def confirm_dangerous_action(self, title: str, message: str) -> bool:
+            return messagebox.askyesno(title, message, icon="warning")
+
+        def create_recovery_usb_from_gui(self) -> None:
+            device = self.resolve_disk_path(self.recovery_usb_device_var.get(), self.usb_choice_map)
+            if not device:
+                self.message_var.set("Choose a recovery USB device first.")
+                return
+            if not self.confirm_dangerous_action("Create Recovery USB", f"This will erase everything on {device}. Continue?"):
+                return
+            try:
+                response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Recovery USB creation started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def guided_restore_repo(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
+            if not device:
+                self.message_var.set("Choose a target disk first.")
+                return
+            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery snapshot. Continue?"):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_guided_restore_repo",
+                    "snapshot": self.selected_snapshot_id,
+                    "target_disk": device,
+                    "recovery_password": self.repo_recovery_key_var.get().strip(),
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Guided full restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def guided_restore_bundle(self) -> None:
+            device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
+            if not device:
+                self.message_var.set("Choose a target disk first.")
+                return
+            bundle_path = self.bundle_file_var.get().strip()
+            bundle_url = self.bundle_url_var.get().strip()
+            password = self.bundle_password_var.get().strip()
+            if not bundle_path and not bundle_url:
+                self.message_var.set("Choose a bundle file or enter a hosted URL first.")
+                return
+            if not password:
+                self.message_var.set("Bundle password is required.")
+                return
+            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery bundle. Continue?"):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_guided_restore_bundle",
+                    "bundle_path": bundle_path,
+                    "bundle_url": bundle_url,
+                    "password": password,
+                    "target_disk": device,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Guided full restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def daemon_dashboard(self) -> Dict[str, Any]:
+            response = send_daemon_request({"action": "dashboard"})
+            if not response.get("ok"):
+                raise AegisError(response.get("error", "Unknown daemon error"))
+            return response["dashboard"]
+
+        def refresh_dashboard(self) -> None:
+            try:
+                payload = self.daemon_dashboard()
+                self.dashboard_payload = payload
+                self.populate_dashboard(payload)
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def periodic_refresh(self) -> None:
+            self.refresh_dashboard()
+            self.root.after(2000, self.periodic_refresh)
+
+        def populate_dashboard(self, payload: Dict[str, Any]) -> None:
+            settings = payload["settings"]
+            state = payload["persistent"]
+            current_job = payload.get("current_job")
+            snapshots = payload.get("snapshots", [])
+            warnings = payload.get("warnings", [])
+            logs = payload.get("logs", [])
+
+            self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
+
+            self.status_var.set(
+                f"{'Busy: ' + current_job['name'] + ' — ' + current_job['stage'] if current_job else 'Idle'}"
+            )
+
+            if current_job:
+                if not self.activity_bar_running:
+                    self.activity_bar.start(10)
+                    self.activity_bar_running = True
+            else:
+                if self.activity_bar_running:
+                    self.activity_bar.stop()
+                    self.activity_bar_running = False
+
+            self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
+            self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
+            self.summary_labels["last_good"].configure(text=state.get("last_success_at") or "—")
+            self.summary_labels["last_run"].configure(text=state.get("last_run_at") or "—")
+            self.summary_labels["last_sync"].configure(text=state.get("last_sync_at") or "—")
+            self.summary_labels["recovery_key"].configure(
+                text=state.get("recovery_key_path") or "Chosen during encrypted setup; not written to disk."
+            )
+
+            self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
+            self.fill_text(self.logs_text, "\n".join(logs[-100:]) if logs else "No activity yet.")
+            self.fill_snapshot_tree(self.backup_tree, snapshots)
+            self.fill_snapshot_tree(self.restore_tree, snapshots)
+            self.fill_peers_tree(self.peers_tree, settings.get("peers", []))
+
+            if not self.settings_loaded:
+                self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
+                self.machine_label_var.set(settings.get("machine_label", ""))
+                self.repo_path_var.set(settings.get("repo_path", ""))
+                self.repo_source_var.set(settings.get("repo_path", ""))
+                self.encryption_var.set(bool(settings.get("encryption_enabled", True)))
+                self.notifications_enabled_var.set(bool(settings.get("notifications_enabled", True)))
+                self.default_backup_profile_var.set(settings.get("default_backup_profile", "both"))
+                schedule = settings.get("schedule", {})
+                self.schedule_enabled_var.set(bool(schedule.get("enabled", False)))
+                self.schedule_preset_var.set(schedule.get("preset", "manual"))
+                self.schedule_custom_var.set(str(schedule.get("custom_minutes", 60)))
+                self.io_yield_var.set(str(settings.get("io_yield_ms", 2)))
+                self.apply_packages_var.set(bool(settings.get("apply_packages_on_portable_restore", True)))
+                self.peers_enabled_var.set(bool(settings.get("peers_enabled", False)))
+                self.fill_text(self.full_excludes_text, "\n".join(settings.get("full_excludes", [])))
+                self.fill_text(self.portable_includes_text, "\n".join(settings.get("portable_includes", [])))
+                self.fill_text(self.portable_excludes_text, "\n".join(settings.get("portable_excludes", [])))
+                self.settings_loaded = True
+
+        def fill_snapshot_tree(self, tree: ttk.Treeview, snapshots: List[Dict[str, Any]]) -> None:
+            existing_selection = self.selected_snapshot_id
+            for item in tree.get_children():
+                tree.delete(item)
+            for snap in snapshots:
+                values = (
+                    snap.get("created_at", ""),
+                    snap.get("machine_label", ""),
+                    kind_label(snap.get("kind", "")),
+                    human_bytes(int(snap.get("archive_bytes", 0))),
+                    snap.get("id", ""),
+                )
+                item_id = tree.insert("", "end", iid=snap.get("id", ""), values=values)
+                if snap.get("id") == existing_selection:
+                    tree.selection_set(item_id)
+
+        def fill_peers_tree(self, tree: ttk.Treeview, peers: List[Dict[str, Any]], settings_mode: bool = False) -> None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for idx, peer in enumerate(peers):
+                if settings_mode:
+                    tree.insert("", "end", iid=str(idx), values=(
+                        peer.get("label", ""),
+                        peer.get("ssh_target", ""),
+                        peer.get("repo_path", ""),
+                        str(peer.get("port", 22)),
+                        peer.get("identity_file", ""),
+                        "yes" if peer.get("enabled", True) else "no",
+                    ))
+                else:
+                    tree.insert("", "end", iid=str(idx), values=(
+                        "yes" if peer.get("enabled", True) else "no",
+                        peer.get("label", ""),
+                        peer.get("ssh_target", ""),
+                        peer.get("repo_path", ""),
+                        str(peer.get("port", 22)),
+                    ))
+
+        def fill_text(self, widget: ScrolledText, text: str) -> None:
+            widget.delete("1.0", "end")
+            widget.insert("1.0", text)
+
+        def on_snapshot_select(self, event) -> None:
+            tree = event.widget
+            selection = tree.selection()
+            if selection:
+                self.selected_snapshot_id = selection[0]
+
+        def start_backup(self, profile: str) -> None:
+            try:
+                response = send_daemon_request({"action": "run_backup", "profile": profile})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Backup started."))
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def start_default_backup(self) -> None:
+            profile = self.dashboard_payload.get("settings", {}).get("default_backup_profile", "both")
+            self.start_backup(normalize_backup_profile(profile))
         
-                    if current_job:
-                        if not self.activity_bar_running:
-                            self.activity_bar.start(10)
-                            self.activity_bar_running = True
-                    else:
-                        if self.activity_bar_running:
-                            self.activity_bar.stop()
-                            self.activity_bar_running = False
+        def export_selected_bundle(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            password = self.export_password_var.get().strip()
+            if not password:
+                self.message_var.set("Enter a bundle password first.")
+                return
+            output = filedialog.asksaveasfilename(defaultextension=".avb", filetypes=[("AegisVault bundle", "*.avb"), ("All files", "*.*")])
+            if not output:
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_export",
+                    "snapshot": self.selected_snapshot_id,
+                    "output": output,
+                    "password": password,
+                    "recovery_password": self.export_recovery_key_var.get().strip(),
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Bundle export started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def delete_selected_snapshot(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            if not self.confirm_dangerous_action(
+                "Delete Snapshot",
+                f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs.",
+            ):
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "delete_snapshot",
+                    "snapshot": self.selected_snapshot_id,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.selected_snapshot_id = ""
+                self.message_var.set(response.get("message", "Snapshot deleted."))
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
         
-                    self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
-                    self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
-                    self.summary_labels["last_good"].configure(text=state.get("last_success_at") or "—")
-                    self.summary_labels["last_run"].configure(text=state.get("last_run_at") or "—")
-                    self.summary_labels["last_sync"].configure(text=state.get("last_sync_at") or "—")
-                    self.summary_labels["recovery_key"].configure(
-                        text=state.get("recovery_key_path") or "Chosen during encrypted setup; not written to disk."
-                    )
+        def restore_repo_snapshot(self) -> None:
+            if not self.selected_snapshot_id:
+                self.message_var.set("Select a snapshot first.")
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_restore_repo",
+                    "snapshot": self.selected_snapshot_id,
+                    "target": self.repo_restore_target_var.get().strip() or "/",
+                    "member": self.repo_restore_path_var.get().strip(),
+                    "apply_packages": bool(self.apply_packages_var.get()),
+                    "recovery_password": self.repo_recovery_key_var.get().strip(),
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def restore_bundle(self) -> None:
+            bundle_path = self.bundle_file_var.get().strip()
+            bundle_url = self.bundle_url_var.get().strip()
+            password = self.bundle_password_var.get().strip()
+            if not bundle_path and not bundle_url:
+                self.message_var.set("Choose a bundle file or enter a hosted URL.")
+                return
+            if not password:
+                self.message_var.set("Bundle password is required.")
+                return
+            try:
+                response = send_daemon_request({
+                    "action": "run_restore_bundle",
+                    "bundle_path": bundle_path,
+                    "bundle_url": bundle_url,
+                    "password": password,
+                    "target": self.bundle_restore_target_var.get().strip() or "/",
+                    "member": self.bundle_restore_path_var.get().strip(),
+                    "apply_packages": bool(self.apply_packages_var.get()),
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Bundle restore started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def sync_peers_now(self) -> None:
+            try:
+                response = send_daemon_request({"action": "sync_peers"})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Peer sync started."))
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def gather_peer_list(self) -> List[Dict[str, Any]]:
+            peers = []
+            for iid in self.settings_peers_tree.get_children():
+                values = self.settings_peers_tree.item(iid, "values")
+                peers.append({
+                    "label": values[0],
+                    "ssh_target": values[1],
+                    "repo_path": values[2],
+                    "port": int(values[3] or 22),
+                    "enabled": values[5] == "yes",
+                    "identity_file": values[4],
+                })
+            return peers
+
+        def add_peer_from_form(self) -> None:
+            label = self.peer_label_var.get().strip()
+            target = self.peer_target_var.get().strip()
+            repo_path = self.peer_repo_var.get().strip() or DEFAULT_REPO
+            port = self.peer_port_var.get().strip() or "22"
+            identity = self.peer_identity_var.get().strip()
+            if not target:
+                self.message_var.set("Peer SSH target is required.")
+                return
+            selected = self.settings_peers_tree.selection()
+            values = (label, target, repo_path, port, identity, "yes")
+            if selected:
+                self.settings_peers_tree.item(selected[0], values=values)
+            else:
+                self.settings_peers_tree.insert("", "end", values=values)
+            self.peer_label_var.set("")
+            self.peer_target_var.set("")
+            self.peer_repo_var.set(DEFAULT_REPO)
+            self.peer_port_var.set("22")
+            self.peer_identity_var.set(identity)
+            self.message_var.set("Peer staged. Save settings to persist it.")
+
+        def remove_selected_peer(self) -> None:
+            for item in self.settings_peers_tree.selection():
+                self.settings_peers_tree.delete(item)
+            self.message_var.set("Selected peer removed from staged settings. Save settings to persist.")
+
+        def on_peer_select(self, event) -> None:
+            selection = self.settings_peers_tree.selection()
+            if not selection:
+                return
+            values = self.settings_peers_tree.item(selection[0], "values")
+            self.peer_label_var.set(values[0])
+            self.peer_target_var.set(values[1])
+            self.peer_repo_var.set(values[2])
+            self.peer_port_var.set(values[3])
+            self.peer_identity_var.set(values[4])
+
+        def build_settings_payload(self, onboarding_complete: bool = True) -> Dict[str, Any]:
+            full_excludes = split_lines(self.full_excludes_text.get("1.0", "end"))
+            portable_includes = split_lines(self.portable_includes_text.get("1.0", "end"))
+            portable_excludes = split_lines(self.portable_excludes_text.get("1.0", "end"))
+
+            peers = []
+            for iid in self.settings_peers_tree.get_children():
+                values = self.settings_peers_tree.item(iid, "values")
+                peers.append({
+                    "enabled": values[5] == "yes",
+                    "label": values[0],
+                    "ssh_target": values[1],
+                    "repo_path": values[2],
+                    "port": int(values[3] or 22),
+                    "identity_file": values[4],
+                })
+
+            schedule_enabled = bool(self.schedule_enabled_var.get())
+            schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
+            if not schedule_enabled:
+                schedule_preset = "manual"
+
+            return {
+                "version": 2,
+                "onboarding_complete": onboarding_complete,
+                "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
+                "machine_label": self.machine_label_var.get().strip() or hostname(),
+                "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
+                "encryption_enabled": bool(self.encryption_var.get()),
+                "notifications_enabled": bool(self.notifications_enabled_var.get()),
+                "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
+                "schedule": {
+                    "enabled": schedule_enabled,
+                    "preset": schedule_preset,
+                    "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
+                },
+                "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
+                "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
+                "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
+                "full_excludes": full_excludes,
+                "portable_includes": portable_includes,
+                "portable_excludes": portable_excludes,
+                "peers_enabled": bool(self.peers_enabled_var.get()),
+                "peers": peers,
+            }
         
-                    self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
-                    self.fill_text(self.logs_text, "\n".join(logs[-100:]) if logs else "No activity yet.")
-                    self.fill_snapshot_tree(self.backup_tree, snapshots)
-                    self.fill_snapshot_tree(self.restore_tree, snapshots)
-                    self.fill_peers_tree(self.peers_tree, settings.get("peers", []))
-        
-                    if not self.settings_loaded:
-                        self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
-                        self.machine_label_var.set(settings.get("machine_label", ""))
-                        self.repo_path_var.set(settings.get("repo_path", ""))
-                        self.repo_source_var.set(settings.get("repo_path", ""))
-                        self.encryption_var.set(bool(settings.get("encryption_enabled", True)))
-                        self.notifications_enabled_var.set(bool(settings.get("notifications_enabled", True)))
-                        self.default_backup_profile_var.set(settings.get("default_backup_profile", "both"))
-                        schedule = settings.get("schedule", {})
-                        self.schedule_enabled_var.set(bool(schedule.get("enabled", False)))
-                        self.schedule_preset_var.set(schedule.get("preset", "manual"))
-                        self.schedule_custom_var.set(str(schedule.get("custom_minutes", 60)))
-                        self.io_yield_var.set(str(settings.get("io_yield_ms", 2)))
-                        self.apply_packages_var.set(bool(settings.get("apply_packages_on_portable_restore", True)))
-                        self.peers_enabled_var.set(bool(settings.get("peers_enabled", False)))
-                        self.fill_text(self.full_excludes_text, "\n".join(settings.get("full_excludes", [])))
-                        self.fill_text(self.portable_includes_text, "\n".join(settings.get("portable_includes", [])))
-                        self.fill_text(self.portable_excludes_text, "\n".join(settings.get("portable_excludes", [])))
-                        self.settings_loaded = True
-        
-                def fill_snapshot_tree(self, tree: ttk.Treeview, snapshots: List[Dict[str, Any]]) -> None:
-                    existing_selection = self.selected_snapshot_id
-                    for item in tree.get_children():
-                        tree.delete(item)
-                    for snap in snapshots:
-                        values = (
-                            snap.get("created_at", ""),
-                            snap.get("machine_label", ""),
-                            kind_label(snap.get("kind", "")),
-                            human_bytes(int(snap.get("archive_bytes", 0))),
-                            snap.get("id", ""),
-                        )
-                        item_id = tree.insert("", "end", iid=snap.get("id", ""), values=values)
-                        if snap.get("id") == existing_selection:
-                            tree.selection_set(item_id)
-        
-                def fill_peers_tree(self, tree: ttk.Treeview, peers: List[Dict[str, Any]], settings_mode: bool = False) -> None:
-                    for item in tree.get_children():
-                        tree.delete(item)
-                    for idx, peer in enumerate(peers):
-                        if settings_mode:
-                            tree.insert("", "end", iid=str(idx), values=(
-                                peer.get("label", ""),
-                                peer.get("ssh_target", ""),
-                                peer.get("repo_path", ""),
-                                str(peer.get("port", 22)),
-                                peer.get("identity_file", ""),
-                                "yes" if peer.get("enabled", True) else "no",
-                            ))
-                        else:
-                            tree.insert("", "end", iid=str(idx), values=(
-                                "yes" if peer.get("enabled", True) else "no",
-                                peer.get("label", ""),
-                                peer.get("ssh_target", ""),
-                                peer.get("repo_path", ""),
-                                str(peer.get("port", 22)),
-                            ))
-        
-                def fill_text(self, widget: ScrolledText, text: str) -> None:
-                    widget.delete("1.0", "end")
-                    widget.insert("1.0", text)
-        
-                def on_snapshot_select(self, event) -> None:
-                    tree = event.widget
-                    selection = tree.selection()
-                    if selection:
-                        self.selected_snapshot_id = selection[0]
-        
-                def start_backup(self, profile: str) -> None:
-                    try:
-                        response = send_daemon_request({"action": "run_backup", "profile": profile})
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Backup started."))
-                        self.refresh_dashboard()
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def start_default_backup(self) -> None:
-                    profile = self.dashboard_payload.get("settings", {}).get("default_backup_profile", "both")
-                    self.start_backup(normalize_backup_profile(profile))
-                
-                def export_selected_bundle(self) -> None:
-                    if not self.selected_snapshot_id:
-                        self.message_var.set("Select a snapshot first.")
-                        return
-                    password = self.export_password_var.get().strip()
-                    if not password:
-                        self.message_var.set("Enter a bundle password first.")
-                        return
-                    output = filedialog.asksaveasfilename(defaultextension=".avb", filetypes=[("AegisVault bundle", "*.avb"), ("All files", "*.*")])
-                    if not output:
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "run_export",
-                            "snapshot": self.selected_snapshot_id,
-                            "output": output,
-                            "password": password,
-                            "recovery_password": self.export_recovery_key_var.get().strip(),
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Bundle export started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def delete_selected_snapshot(self) -> None:
-                    if not self.selected_snapshot_id:
-                        self.message_var.set("Select a snapshot first.")
-                        return
-                    if not self.confirm_dangerous_action(
-                        "Delete Snapshot",
-                        f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs.",
-                    ):
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "delete_snapshot",
-                            "snapshot": self.selected_snapshot_id,
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.selected_snapshot_id = ""
-                        self.message_var.set(response.get("message", "Snapshot deleted."))
-                        self.refresh_dashboard()
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-                
-                def restore_repo_snapshot(self) -> None:
-                    if not self.selected_snapshot_id:
-                        self.message_var.set("Select a snapshot first.")
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "run_restore_repo",
-                            "snapshot": self.selected_snapshot_id,
-                            "target": self.repo_restore_target_var.get().strip() or "/",
-                            "member": self.repo_restore_path_var.get().strip(),
-                            "apply_packages": bool(self.apply_packages_var.get()),
-                            "recovery_password": self.repo_recovery_key_var.get().strip(),
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Restore started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def restore_bundle(self) -> None:
-                    bundle_path = self.bundle_file_var.get().strip()
-                    bundle_url = self.bundle_url_var.get().strip()
-                    password = self.bundle_password_var.get().strip()
-                    if not bundle_path and not bundle_url:
-                        self.message_var.set("Choose a bundle file or enter a hosted URL.")
-                        return
-                    if not password:
-                        self.message_var.set("Bundle password is required.")
-                        return
-                    try:
-                        response = send_daemon_request({
-                            "action": "run_restore_bundle",
-                            "bundle_path": bundle_path,
-                            "bundle_url": bundle_url,
-                            "password": password,
-                            "target": self.bundle_restore_target_var.get().strip() or "/",
-                            "member": self.bundle_restore_path_var.get().strip(),
-                            "apply_packages": bool(self.apply_packages_var.get()),
-                        })
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Bundle restore started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def sync_peers_now(self) -> None:
-                    try:
-                        response = send_daemon_request({"action": "sync_peers"})
-                        if not response.get("ok"):
-                            raise AegisError(response.get("error", "Unknown daemon error"))
-                        self.message_var.set(response.get("message", "Peer sync started."))
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
-        
-                def gather_peer_list(self) -> List[Dict[str, Any]]:
-                    peers = []
-                    for iid in self.settings_peers_tree.get_children():
-                        values = self.settings_peers_tree.item(iid, "values")
-                        peers.append({
-                            "label": values[0],
-                            "ssh_target": values[1],
-                            "repo_path": values[2],
-                            "port": int(values[3] or 22),
-                            "enabled": values[5] == "yes",
-                            "identity_file": values[4],
-                        })
-                    return peers
-        
-                def add_peer_from_form(self) -> None:
-                    label = self.peer_label_var.get().strip()
-                    target = self.peer_target_var.get().strip()
-                    repo_path = self.peer_repo_var.get().strip() or DEFAULT_REPO
-                    port = self.peer_port_var.get().strip() or "22"
-                    identity = self.peer_identity_var.get().strip()
-                    if not target:
-                        self.message_var.set("Peer SSH target is required.")
-                        return
-                    selected = self.settings_peers_tree.selection()
-                    values = (label, target, repo_path, port, identity, "yes")
-                    if selected:
-                        self.settings_peers_tree.item(selected[0], values=values)
-                    else:
-                        self.settings_peers_tree.insert("", "end", values=values)
-                    self.peer_label_var.set("")
-                    self.peer_target_var.set("")
-                    self.peer_repo_var.set(DEFAULT_REPO)
-                    self.peer_port_var.set("22")
-                    self.peer_identity_var.set(identity)
-                    self.message_var.set("Peer staged. Save settings to persist it.")
-        
-                def remove_selected_peer(self) -> None:
-                    for item in self.settings_peers_tree.selection():
-                        self.settings_peers_tree.delete(item)
-                    self.message_var.set("Selected peer removed from staged settings. Save settings to persist.")
-        
-                def on_peer_select(self, event) -> None:
-                    selection = self.settings_peers_tree.selection()
-                    if not selection:
-                        return
-                    values = self.settings_peers_tree.item(selection[0], "values")
-                    self.peer_label_var.set(values[0])
-                    self.peer_target_var.set(values[1])
-                    self.peer_repo_var.set(values[2])
-                    self.peer_port_var.set(values[3])
-                    self.peer_identity_var.set(values[4])
-        
-                def build_settings_payload(self, onboarding_complete: bool = True) -> Dict[str, Any]:
-                    full_excludes = split_lines(self.full_excludes_text.get("1.0", "end"))
-                    portable_includes = split_lines(self.portable_includes_text.get("1.0", "end"))
-                    portable_excludes = split_lines(self.portable_excludes_text.get("1.0", "end"))
-        
-                    peers = []
-                    for iid in self.settings_peers_tree.get_children():
-                        values = self.settings_peers_tree.item(iid, "values")
-                        peers.append({
-                            "enabled": values[5] == "yes",
-                            "label": values[0],
-                            "ssh_target": values[1],
-                            "repo_path": values[2],
-                            "port": int(values[3] or 22),
-                            "identity_file": values[4],
-                        })
-        
-                    schedule_enabled = bool(self.schedule_enabled_var.get())
-                    schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
-                    if not schedule_enabled:
-                        schedule_preset = "manual"
-        
-                    return {
-                        "version": 2,
-                        "onboarding_complete": onboarding_complete,
-                        "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
-                        "machine_label": self.machine_label_var.get().strip() or hostname(),
-                        "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
-                        "encryption_enabled": bool(self.encryption_var.get()),
-                        "notifications_enabled": bool(self.notifications_enabled_var.get()),
-                        "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
-                        "schedule": {
-                            "enabled": schedule_enabled,
-                            "preset": schedule_preset,
-                            "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
-                        },
-                        "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
-                        "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
-                        "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
-                        "full_excludes": full_excludes,
-                        "portable_includes": portable_includes,
-                        "portable_excludes": portable_excludes,
-                        "peers_enabled": bool(self.peers_enabled_var.get()),
-                        "peers": peers,
-                    }
-                
-                def save_settings(self) -> None:
-                    try:
-                        payload = self.build_settings_payload(onboarding_complete=True)
-                        response = self.submit_settings_with_recovery_password_if_needed(payload)
-                        self.message_var.set(response.get("message", "Settings saved."))
-                        self.settings_loaded = False
-                        self.refresh_dashboard()
-                    except Exception as exc:
-                        self.message_var.set(str(exc))
+        def save_settings(self) -> None:
+            try:
+                payload = self.build_settings_payload(onboarding_complete=True)
+                response = self.submit_settings_with_recovery_password_if_needed(payload)
+                self.message_var.set(response.get("message", "Settings saved."))
+                self.settings_loaded = False
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
 
     root = tk.Tk()
     app = App(root)
