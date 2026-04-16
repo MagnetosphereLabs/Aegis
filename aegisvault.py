@@ -2028,14 +2028,9 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
         
 def write_recovery_gpt_layout(device: str) -> None:
     run_command(
-        ["sgdisk", "--clear", device],
-        check=True,
-        capture=True,
-    )
-
-    run_command(
         [
             "sgdisk",
+            "--clear",
             "--new=1:1M:+2M",
             "--typecode=1:ef02",
             "--change-name=1:bios_grub",
