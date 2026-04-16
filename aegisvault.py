@@ -3578,6 +3578,7 @@ def gui_main() -> int:
                 selectbackground="#1a2330",
                 selectforeground="#ffffff",
                 activestyle="none",
+                exportselection=False,
                 relief="flat",
                 bd=0,
                 highlightthickness=1,
@@ -3596,6 +3597,7 @@ def gui_main() -> int:
                 selectbackground="#1a2330",
                 selectforeground="#ffffff",
                 activestyle="none",
+                exportselection=False,
                 relief="flat",
                 bd=0,
                 highlightthickness=1,
@@ -3735,6 +3737,26 @@ def gui_main() -> int:
                 children_list.selection_clear(0, "end")
                 update_action_buttons()
 
+            def preview_selected_root(event=None) -> None:
+                update_action_buttons()
+                selection = roots_list.curselection()
+                if not selection:
+                    return
+
+                item = root_items[selection[0]]
+                if item["kind"] in {"mounted", "folder"} and item.get("path"):
+                    set_current_path(item["path"])
+
+            def preview_selected_child(event=None) -> None:
+                update_action_buttons()
+                selection = children_list.curselection()
+                if not selection:
+                    return
+
+                chosen = child_items[selection[0]]
+                if os.path.isdir(chosen):
+                    set_current_path(chosen)
+            
             def open_selected_child(event=None) -> None:
                 selection = children_list.curselection()
                 if not selection:
@@ -3824,14 +3846,15 @@ def gui_main() -> int:
 
                 child_selection = children_list.curselection()
                 if child_selection:
+                    folder_action_btn.configure(text="Open Selected Folder")
                     if not folder_action_btn.winfo_ismapped():
                         folder_action_btn.pack(side="left", padx=(8, 0))
                 else:
                     if folder_action_btn.winfo_ismapped():
                         folder_action_btn.pack_forget()
 
-            roots_list.bind("<<ListboxSelect>>", update_action_buttons)
-            children_list.bind("<<ListboxSelect>>", update_action_buttons)
+            roots_list.bind("<<ListboxSelect>>", preview_selected_root)
+            children_list.bind("<<ListboxSelect>>", preview_selected_child)
             roots_list.bind("<Double-Button-1>", act_on_selected_root)
             children_list.bind("<Double-Button-1>", open_selected_child)
 
