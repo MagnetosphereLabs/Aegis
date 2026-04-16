@@ -1056,6 +1056,24 @@ def list_block_devices() -> List[Dict[str, Any]]:
     return out
 
 
+def canonical_block_device_path(device: str) -> str:
+    value = str(device or "").strip()
+    if not value:
+        return ""
+    return os.path.realpath(value)
+
+
+def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
+    wanted = canonical_block_device_path(device)
+    if not wanted:
+        return None
+
+    for entry in list_block_devices():
+        entry_path = canonical_block_device_path(entry.get("path", ""))
+        if entry_path == wanted:
+            return entry
+    return None
+
 def list_disk_choices(exclude_paths: Optional[Set[str]] = None, removable_only: bool = False) -> List[Dict[str, Any]]:
     exclude_paths = exclude_paths or set()
     items: List[Dict[str, Any]] = []
@@ -1154,13 +1172,31 @@ def ensure_recovery_builder_prereqs() -> None:
     ])
 
 
-def assert_safe_target_disk(device: str) -> None:
-    if run_command_optional(["lsblk", "-ndo", "TYPE", device]).strip() != "disk":
-        raise AegisError(f"Choose a whole-disk device like /dev/sdb, not {device}.")
-    if run_command_optional(["lsblk", "-ndo", "RO", device]).strip() == "1":
-        raise AegisError(f"{device} is read-only. Disable any write-protect switch or choose another drive.")
+def assert_safe_target_disk(device: str) -> str:
+    device = canonical_block_device_path(device)
+    if not device:
+        raise AegisError("Choose a whole-disk device first.")
+
+    entry = find_block_device_entry(device)
+    if not entry:
+        raise AegisError(
+            f"{device} is not currently available. Reconnect it, click Refresh, and try again."
+        )
+
+    if entry.get("type") != "disk":
+        parent = device_parent_disk(device)
+        example = parent if parent and parent != device else "/dev/sdb"
+        raise AegisError(f"Choose a whole-disk device like {example}, not {device}.")
+
+    if bool(entry.get("read_only")):
+        raise AegisError(
+            f"{device} is read-only. Disable any write-protect switch or choose another drive."
+        )
+
     if device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
+
+    return device
 
 
 RECOVERY_PASSWORD_REQUIRED_ERROR = (
@@ -1854,7 +1890,7 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 3) -> None:
         raise last_error
         
 def guided_partition_disk(device: str) -> Dict[str, str]:
-    assert_safe_target_disk(device)
+    device = assert_safe_target_disk(device)
     ensure_recovery_builder_prereqs()
     unmount_device_tree(device)
     subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
@@ -1980,9 +2016,10 @@ def guided_full_restore_from_bundle_url(url: str, password: str, target_disk: st
 
 def create_recovery_usb(device: str) -> None:
     ensure_root()
-    assert_safe_target_disk(device)
-    disks = {d["path"]: d for d in list_disk_choices()}
-    size = int(disks.get(device, {}).get("size") or 0)
+    device = assert_safe_target_disk(device)
+
+    entry = find_block_device_entry(device)
+    size = int((entry or {}).get("size") or 0)
     if size and size < MIN_RECOVERY_USB_BYTES:
         raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
     ensure_recovery_builder_prereqs()
