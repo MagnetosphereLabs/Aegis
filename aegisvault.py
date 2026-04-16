@@ -91,12 +91,14 @@ class PeerTarget:
 
 @dataclass
 class Settings:
-    version: int = 1
+    version: int = 2
     onboarding_complete: bool = False
     machine_id: str = ""
     machine_label: str = ""
     repo_path: str = DEFAULT_REPO
     encryption_enabled: bool = True
+    notifications_enabled: bool = True
+    default_backup_profile: str = "both"
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     chunk_size_mib: int = DEFAULT_CHUNK_MIB
     io_yield_ms: int = 2
@@ -236,6 +238,166 @@ DEFAULT_PORTABLE_EXCLUDES = [
     "var/cache/*",
 ]
 
+BACKUP_PROFILE_LABELS = {
+    "full_recovery": "Full Machine Backup",
+    "portable_state": "Portable Backup",
+    "both": "Both backup types",
+}
+
+EXTERNAL_BACKUP_ROOT_PREFIXES = ("/media/", "/mnt/", "/run/media/")
+SYSTEMD_SERVICE_PATH = Path("/etc/systemd/system/aegisvault.service")
+
+
+def normalize_backup_profile(value: str) -> str:
+    return value if value in BACKUP_PROFILE_LABELS else "both"
+
+
+def mounted_targets() -> List[str]:
+    raw = run_command_optional(["findmnt", "-rn", "-o", "TARGET"])
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def is_external_backup_path(repo_path: str) -> bool:
+    normalized = os.path.abspath(repo_path).rstrip("/") + "/"
+    return normalized.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES)
+
+
+def external_mount_present_for_path(repo_path: str) -> bool:
+    normalized = os.path.abspath(repo_path)
+    for target in sorted(mounted_targets(), key=len, reverse=True):
+        if target == "/":
+            continue
+        cleaned = target.rstrip("/")
+        if normalized == cleaned or normalized.startswith(cleaned + "/"):
+            if cleaned.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES):
+                return True
+    return False
+
+
+def ensure_repo_path_ready(repo_path: str) -> None:
+    if is_external_backup_path(repo_path) and not external_mount_present_for_path(repo_path):
+        raise AegisError(
+            "The selected backup drive is not mounted. Reconnect it and choose the mounted folder again."
+        )
+    Path(repo_path).mkdir(parents=True, exist_ok=True)
+
+
+def discover_backup_location_choices() -> List[str]:
+    choices: List[str] = []
+    seen: Set[str] = set()
+    root_disk = current_root_disk()
+
+    for entry in list_block_devices():
+        if entry.get("type") != "part":
+            continue
+
+        mountpoints = [mp for mp in (entry.get("mountpoints") or []) if mp]
+        if not mountpoints:
+            continue
+
+        if device_parent_disk(entry.get("path", "")) == root_disk:
+            continue
+
+        if not (
+            entry.get("removable")
+            or entry.get("transport") == "usb"
+            or any(mp.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES) for mp in mountpoints)
+        ):
+            continue
+
+        for mountpoint in mountpoints:
+            suggestion = str(Path(mountpoint) / APP_NAME)
+            if suggestion not in seen:
+                seen.add(suggestion)
+                choices.append(suggestion)
+
+    return choices
+
+
+def host_service_unit_text() -> str:
+    python_bin = sys.executable
+    app_path = str(Path(__file__).resolve())
+    return textwrap.dedent(
+        f"""
+        [Unit]
+        Description=AegisVault background backup daemon
+        After=network-online.target local-fs.target
+        Wants=network-online.target
+
+        [Service]
+        Type=simple
+        ExecStartPre=/bin/mkdir -p /run/aegisvault
+        ExecStart={python_bin} {app_path} daemon
+        Restart=on-failure
+        RestartSec=5
+        WorkingDirectory=/var/lib/aegisvault
+        UMask=0077
+
+        [Install]
+        WantedBy=multi-user.target
+        """
+    ).strip() + "\n"
+
+
+def install_or_update_host_service() -> None:
+    ensure_root()
+    unit_bytes = host_service_unit_text().encode("utf-8")
+    current = SYSTEMD_SERVICE_PATH.read_bytes() if SYSTEMD_SERVICE_PATH.exists() else b""
+    if current != unit_bytes:
+        atomic_write(SYSTEMD_SERVICE_PATH, unit_bytes, mode=0o644)
+        run_command(["systemctl", "daemon-reload"], check=False, capture=True)
+
+
+def desktop_notification_recipients() -> List[Tuple[str, int]]:
+    recipients: List[Tuple[str, int]] = []
+    run_user_root = Path("/run/user")
+    if not run_user_root.exists():
+        return recipients
+
+    for child in sorted(run_user_root.iterdir(), key=lambda p: p.name):
+        if not child.name.isdigit():
+            continue
+        uid = int(child.name)
+        if uid == 0 or not (child / "bus").exists():
+            continue
+        try:
+            user_name = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            continue
+        recipients.append((user_name, uid))
+
+    return recipients
+
+
+def send_desktop_notification(title: str, body: str, urgency: str = "normal") -> None:
+    binary = shutil.which("notify-send")
+    if not binary:
+        log_line(f"Desktop notification skipped: {title} — {body}")
+        return
+
+    for user_name, uid in desktop_notification_recipients():
+        runtime_dir = f"/run/user/{uid}"
+        subprocess.run(
+            [
+                "runuser",
+                "-u",
+                user_name,
+                "--",
+                "env",
+                f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
+                f"XDG_RUNTIME_DIR={runtime_dir}",
+                binary,
+                "-a",
+                APP_NAME,
+                "-u",
+                urgency,
+                title,
+                body,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 class AegisError(Exception):
     pass
@@ -448,13 +610,16 @@ def settings_to_dict(settings: Settings) -> Dict[str, Any]:
 def settings_from_dict(data: Dict[str, Any]) -> Settings:
     schedule_data = data.get("schedule") or {}
     peers_data = data.get("peers") or []
+
     settings = Settings(
-        version=int(data.get("version", 1)),
-        onboarding_complete=bool(data["onboarding_complete"]) if "onboarding_complete" in data else True,
+        version=int(data.get("version", 2)),
+        onboarding_complete=bool(data.get("onboarding_complete", False)),
         machine_id=str(data.get("machine_id") or machine_id()),
         machine_label=str(data.get("machine_label") or hostname()),
         repo_path=str(data.get("repo_path") or DEFAULT_REPO),
         encryption_enabled=bool(data.get("encryption_enabled", True)),
+        notifications_enabled=bool(data.get("notifications_enabled", True)),
+        default_backup_profile=normalize_backup_profile(str(data.get("default_backup_profile") or "both")),
         schedule=ScheduleSettings(
             enabled=bool(schedule_data.get("enabled", False)),
             preset=str(schedule_data.get("preset", "manual")),
@@ -479,6 +644,7 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
             for peer in peers_data
         ],
     )
+
     if not settings.machine_id:
         settings.machine_id = machine_id()
     if not settings.machine_label:
@@ -489,6 +655,7 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
         settings.portable_includes = default_portable_includes()
     if not settings.portable_excludes:
         settings.portable_excludes = default_portable_excludes()
+
     return settings
 
 
@@ -801,39 +968,50 @@ def unwrap_machine_key(envelope: Dict[str, Any], recovery_key: str) -> bytes:
 
 
 def materialize_settings(settings: Settings) -> Optional[str]:
-    Path(settings.repo_path).mkdir(parents=True, exist_ok=True)
+    ensure_repo_path_ready(settings.repo_path)
     repo = Path(settings.repo_path)
+
     (repo_machine_dir(repo, settings.machine_id) / "snapshots").mkdir(parents=True, exist_ok=True)
     (repo / "objects" / settings.machine_id).mkdir(parents=True, exist_ok=True)
     VAR_DIR.mkdir(parents=True, exist_ok=True)
     KEY_DIR.mkdir(parents=True, exist_ok=True)
+
     if not settings.encryption_enabled:
         return None
+
     local_key = local_key_path(settings.machine_id)
     envelope_path = key_envelope_path(repo, settings.machine_id)
-    if local_key.exists() and envelope_path.exists():
+
+    if local_key.exists():
+        machine_key_value = local_key.read_bytes()
+    else:
+        machine_key_value = os.urandom(32)
+        atomic_write(local_key, machine_key_value, mode=0o600)
+        os.chmod(local_key, 0o600)
+
+    if envelope_path.exists():
         return None
-    machine_key_value = os.urandom(32)
-    atomic_write(local_key, machine_key_value, mode=0o600)
-    os.chmod(local_key, 0o600)
+
     recovery_key = generate_recovery_key()
     envelope = wrap_machine_key(settings.machine_id, machine_key_value, recovery_key)
     save_json(envelope_path, envelope, mode=0o600)
+
     recovery_file = VAR_DIR / f"RECOVERY-KEY-{short_machine(settings.machine_id)}.txt"
     recovery_text = "\n".join([
         f"{APP_NAME} recovery key",
         "",
         f"Machine label: {settings.machine_label}",
         f"Machine ID: {settings.machine_id}",
-        f"Repository: {settings.repo_path}",
+        f"Backup location: {settings.repo_path}",
         "",
         f"Recovery key: {recovery_key}",
         "",
-        "This key can decrypt this machine's repository encryption key on another system.",
+        "This key can decrypt this machine's backup encryption key on another system.",
         "Store it somewhere safe and separate from the machine itself.",
         "",
     ])
     atomic_write(recovery_file, recovery_text.encode("utf-8"), mode=0o600)
+
     state = load_state()
     state.recovery_key_path = str(recovery_file)
     save_state(state)
@@ -919,7 +1097,7 @@ class RepoWriter:
 
 
 def kind_label(kind: str) -> str:
-    return "Full Recovery" if kind == "full_recovery" else "Portable System State"
+    return BACKUP_PROFILE_LABELS.get(kind, kind or BACKUP_PROFILE_LABELS["both"])
 
 
 def build_include_paths(settings: Settings, kind: str) -> List[str]:
@@ -1201,6 +1379,12 @@ def file_lock(path: Path):
 
 
 def perform_backup(settings: Settings, profile: str) -> List[str]:
+    start_stamp = now_rfc3339()
+    state = load_state()
+    state.last_run_at = start_stamp
+    state.last_error = ""
+    save_state(state)
+
     materialize_settings(settings)
     created: List[str] = []
     chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
@@ -1249,7 +1433,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
             write_manifest(settings, manifest)
             created.append(manifest.id)
         state = load_state()
-        state.last_run_at = now_rfc3339()
+        state.last_run_at = start_stamp
         state.last_success_at = now_rfc3339()
         state.last_error = ""
         save_state(state)
@@ -1769,7 +1953,9 @@ def dashboard() -> Dashboard:
     state = load_state()
     warnings: List[str] = []
     if not Path(settings.repo_path).exists():
-        warnings.append(f"Repository path is not present: {settings.repo_path}")
+        warnings.append(f"Backup location is not available: {settings.repo_path}")
+    if settings.notifications_enabled and not shutil.which("notify-send"):
+        warnings.append("Desktop notifications are enabled, but notify-send is not installed. Install libnotify-bin to receive them.")
     if settings.encryption_enabled and not local_key_path(settings.machine_id).exists():
         warnings.append("Encryption is enabled but the local machine key file is missing.")
     if settings.peers_enabled and not settings.peers:
@@ -1807,22 +1993,37 @@ def run_job(name: str, func):
         RUNTIME.current_job = JobState(name=name, stage="Queued", started_at=now_rfc3339())
     log_line(f"{name} queued")
 
+    is_backup_job = "backup" in name.lower()
+    try:
+        settings = load_settings()
+    except Exception:
+        settings = Settings()
+
+    notifications_enabled = bool(getattr(settings, "notifications_enabled", True))
+
+    if is_backup_job and notifications_enabled:
+        send_desktop_notification("Backup started", f"{name} has started.", urgency="normal")
+
     def worker():
         try:
             func()
+            log_line(f"{name} finished successfully")
+            if is_backup_job and notifications_enabled:
+                send_desktop_notification("Backup finished", f"{name} completed successfully.", urgency="low")
         except Exception as exc:
             state = load_state()
             state.last_error = f"{exc}"
             save_state(state)
             log_line(f"{name} failed: {exc}")
             log_line(traceback.format_exc())
+            if is_backup_job and notifications_enabled:
+                send_desktop_notification("Backup needs attention", f"{name} failed: {exc}", urgency="critical")
         finally:
             with RUNTIME.lock:
                 RUNTIME.current_job = None
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
-
 
 def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     action = request.get("action")
@@ -1839,8 +2040,8 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
             return {"ok": True, "message": f"Settings saved. Recovery key written to {recovery_path}."}
         return {"ok": True, "message": "Settings saved."}
     if action == "run_backup":
-        profile = request.get("profile", "both")
-        run_job(f"Backup ({profile})", lambda: perform_backup(load_settings(), profile))
+        profile = normalize_backup_profile(request.get("profile", "both"))
+        run_job(f"Backup ({kind_label(profile)})", lambda: perform_backup(load_settings(), profile))
         return {"ok": True, "message": "Backup started."}
     if action == "run_export":
         snapshot_id = request["snapshot"]
@@ -1900,13 +2101,14 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "set_repo_path":
         repo_path = str(request.get("repo_path") or "").strip()
         if not repo_path:
-            raise AegisError("Repository path is required.")
+            raise AegisError("Backup location is required.")
+        ensure_repo_path_ready(repo_path)
         settings = load_settings()
         settings.repo_path = repo_path
         if not settings.full_excludes:
             settings.full_excludes = default_full_excludes(settings.repo_path)
         save_settings(settings)
-        return {"ok": True, "message": f"Repository path set to {repo_path}."}
+        return {"ok": True, "message": f"Backup location set to {repo_path}."}
     if action == "run_create_recovery_usb":
         device = str(request.get("device") or "").strip()
         if not device:
@@ -1947,12 +2149,18 @@ def scheduler_loop():
         try:
             settings = load_settings()
             state = load_state()
+
+            if not settings.onboarding_complete:
+                continue
             if not schedule_due(settings, state):
                 continue
+
             with RUNTIME.lock:
                 if RUNTIME.current_job is not None:
                     continue
-            run_job("Scheduled backup", lambda: perform_backup(load_settings(), "both"))
+
+            profile = normalize_backup_profile(settings.default_backup_profile)
+            run_job("Scheduled backup", lambda: perform_backup(load_settings(), profile))
         except Exception as exc:
             log_line(f"Scheduler error: {exc}")
 
@@ -2082,9 +2290,10 @@ def authorize_socket_command(user: str) -> int:
         ensure_root()
         Path("/run/aegisvault").mkdir(parents=True, exist_ok=True)
 
-        subprocess.run(["systemctl", "start", "aegisvault.service"], check=False, capture_output=True)
+        install_or_update_host_service()
+        subprocess.run(["systemctl", "enable", "--now", "aegisvault.service"], check=False, capture_output=True)
 
-        deadline = time.time() + 5
+        deadline = time.time() + 8
         while time.time() < deadline:
             if Path(SOCKET_PATH).exists():
                 break
@@ -2121,7 +2330,7 @@ def init_command(repo: Optional[str], label: Optional[str], encryption: bool) ->
     if label:
         settings.machine_label = label
     settings.encryption_enabled = encryption
-    settings.onboarding_complete = True
+    settings.onboarding_complete = False
     if not settings.machine_id:
         settings.machine_id = machine_id()
     if not settings.machine_label:
@@ -2350,6 +2559,9 @@ def gui_main() -> int:
             self.machine_label_var = tk.StringVar()
             self.repo_path_var = tk.StringVar()
             self.encryption_var = tk.BooleanVar(value=True)
+            self.notifications_enabled_var = tk.BooleanVar(value=True)
+            self.default_backup_profile_var = tk.StringVar(value="both")
+            self.storage_choice_var = tk.StringVar(value="")
             self.schedule_enabled_var = tk.BooleanVar(value=False)
             self.schedule_preset_var = tk.StringVar(value="manual")
             self.schedule_custom_var = tk.StringVar(value="60")
@@ -2372,6 +2584,10 @@ def gui_main() -> int:
             self.recovery_usb_device_var = tk.StringVar(value="")
             self.guided_target_disk_var = tk.StringVar(value="")
 
+            self.notifications_enabled_var = tk.BooleanVar(value=True)
+            self.default_backup_profile_var = tk.StringVar(value="both")
+            self.storage_choice_var = tk.StringVar(value="")
+
             self.peer_label_var = tk.StringVar()
             self.peer_target_var = tk.StringVar()
             self.peer_repo_var = tk.StringVar(value=DEFAULT_REPO)
@@ -2383,9 +2599,14 @@ def gui_main() -> int:
             self.recovery_mode = is_recovery_environment()
             self.ui_configured_state: Optional[bool] = None
             self.repo_candidates: List[str] = []
+            self.storage_choices: List[str] = []
             self.usb_choice_map: Dict[str, str] = {}
             self.guided_disk_map: Dict[str, str] = {}
             self.recovery_mounts: List[str] = []
+            self.activity_bar_running = False
+
+            self.storage_choices: List[str] = []
+            self.activity_bar_running = False
 
             outer = ttk.Frame(self.root, padding=16)
             outer.pack(fill="both", expand=True)
@@ -2427,14 +2648,21 @@ def gui_main() -> int:
             ttk.Label(
                 footer,
                 textvariable=self.message_var,
-                wraplength=1100,
+                wraplength=980,
             ).pack(side="left", fill="x", expand=True)
+
+            self.activity_bar = ttk.Progressbar(footer, mode="indeterminate", length=180)
+            self.activity_bar.pack(side="right")
+
+            self.activity_bar = ttk.Progressbar(footer, mode="indeterminate", length=180)
+            self.activity_bar.pack(side="right")
             if self.recovery_mode and os.geteuid() == 0:
                 try:
                     self.recovery_mounts = auto_mount_recovery_sources()
                 except Exception:
                     self.recovery_mounts = []
             self.refresh_local_device_lists()
+            self.refresh_backup_location_suggestions()
             self.scan_repository_candidates(auto_use=False)
             if self.recovery_mode:
                 hint = "Recovery mode: use Guided Full Restore for the easiest same-machine disaster restore."
@@ -2609,41 +2837,19 @@ def gui_main() -> int:
                 self.message_var.set("Finish setup to unlock the rest of AegisVault.")
 
         def complete_onboarding(self) -> None:
-            self.save_settings()
-        
-        def build_overview_tab(self) -> None:
-            summary = ttk.Frame(self.overview_tab)
-            summary.pack(fill="x")
-            self.summary_labels: Dict[str, ttk.Label] = {}
-            grid_items = [
-                ("machine", "Machine"),
-                ("repo", "Repository"),
-                ("last_good", "Last good backup"),
-                ("last_run", "Last attempted backup"),
-                ("last_sync", "Last peer sync"),
-                ("recovery_key", "Recovery key file"),
-            ]
-            for idx, (key, label) in enumerate(grid_items):
-                row = idx // 2
-                col = (idx % 2) * 2
-                ttk.Label(summary, text=f"{label}:", style="Header.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=6)
-                value_label = ttk.Label(summary, text="—", wraplength=420)
-                value_label.grid(row=row, column=col + 1, sticky="w", padx=(0, 28), pady=6)
-                self.summary_labels[key] = value_label
-
-            warnings_frame = ttk.Frame(self.overview_tab)
-            warnings_frame.pack(fill="x", pady=(18, 0))
-            ttk.Label(warnings_frame, text="Warnings", style="Header.TLabel").pack(anchor="w")
-            self.warnings_text = ScrolledText(warnings_frame, height=5, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
-            self.warnings_text.pack(fill="x", pady=(8, 0))
-            self.style_scrolled_text(self.warnings_text)
-
-            logs_frame = ttk.Frame(self.overview_tab)
-            logs_frame.pack(fill="both", expand=True, pady=(18, 0))
-            ttk.Label(logs_frame, text="Recent activity", style="Header.TLabel").pack(anchor="w")
-            self.logs_text = ScrolledText(logs_frame, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
-            self.logs_text.pack(fill="both", expand=True, pady=(8, 0))
-            self.style_scrolled_text(self.logs_text)
+            try:
+                payload = self.build_settings_payload(onboarding_complete=True)
+                response = send_daemon_request({"action": "save_settings", "settings": payload})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(
+                    response.get("message", "Setup saved.")
+                    + " AegisVault will now keep running in the background using your selected plan."
+                )
+                self.settings_loaded = False
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
 
         def style_scrolled_text(self, widget: ScrolledText) -> None:
             widget.configure(
@@ -2677,8 +2883,8 @@ def gui_main() -> int:
             self.summary_labels: Dict[str, ttk.Label] = {}
             grid_items = [
                 ("machine", "Machine"),
-                ("repo", "Repository"),
-                ("last_good", "Last good backup"),
+                ("repo", "Backup location"),
+                ("last_good", "Last successful backup"),
                 ("last_run", "Last attempted backup"),
                 ("last_sync", "Last peer sync"),
                 ("recovery_key", "Recovery key file"),
@@ -2711,8 +2917,8 @@ def gui_main() -> int:
             tree.heading("created_at", text="Created")
             tree.heading("machine_label", text="Machine")
             tree.heading("kind", text="Kind")
-            tree.heading("bytes", text="Bytes")
-            tree.heading("id", text="Snapshot ID")
+            tree.heading("bytes", text="Size")
+            tree.heading("id", text="Backup ID")
             tree.column("created_at", width=160, anchor="w")
             tree.column("machine_label", width=180, anchor="w")
             tree.column("kind", width=180, anchor="w")
@@ -2724,25 +2930,34 @@ def gui_main() -> int:
         def build_backup_tab(self) -> None:
             controls = ttk.Frame(self.backup_tab)
             controls.pack(fill="x")
-            ttk.Label(controls, text="Create snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-            ttk.Button(controls, text="Back Up Both", command=lambda: self.start_backup("both")).grid(row=1, column=0, padx=(0, 8), pady=(10, 0), sticky="w")
-            ttk.Button(controls, text="Back Up Full Recovery", command=lambda: self.start_backup("full_recovery")).grid(row=1, column=1, padx=(0, 8), pady=(10, 0), sticky="w")
-            ttk.Button(controls, text="Back Up Portable System State", command=lambda: self.start_backup("portable_state")).grid(row=1, column=2, padx=(0, 8), pady=(10, 0), sticky="w")
+
+            ttk.Label(controls, text="Create backups", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            ttk.Label(
+                controls,
+                text="Every backup restores like a full snapshot, but unchanged data chunks are reused across runs to save time and space.",
+                wraplength=980,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+            ttk.Button(controls, text="Run Default Backup", command=self.start_default_backup).grid(row=2, column=0, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Full Machine Backup", command=lambda: self.start_backup("full_recovery")).grid(row=2, column=1, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Portable Backup", command=lambda: self.start_backup("portable_state")).grid(row=2, column=2, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Both Backup Types", command=lambda: self.start_backup("both")).grid(row=2, column=3, padx=(0, 8), pady=(12, 0), sticky="w")
 
             snaps = ttk.Frame(self.backup_tab)
             snaps.pack(fill="both", expand=True, pady=(18, 0))
-            ttk.Label(snaps, text="Available snapshots", style="Header.TLabel").pack(anchor="w")
+            ttk.Label(snaps, text="Saved backups", style="Header.TLabel").pack(anchor="w")
             self.backup_tree = self.build_snapshot_table(snaps)
             self.backup_tree.pack(fill="both", expand=True, pady=(8, 0))
 
             snap_actions = ttk.Frame(snaps)
             snap_actions.pack(fill="x", pady=(10, 0))
-            ttk.Button(snap_actions, text="Delete Selected Snapshot", command=self.delete_selected_snapshot).pack(side="left")
-            ttk.Button(snap_actions, text="Refresh List", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
+            ttk.Button(snap_actions, text="Delete Selected Backup", command=self.delete_selected_snapshot).pack(side="left")
+            ttk.Button(snap_actions, text="↻ Refresh", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
 
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
-            ttk.Label(export, text="Export selected snapshot to encrypted single file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+            ttk.Label(export, text="Export selected backup as an encrypted file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
 
             ttk.Label(export, text="Bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
@@ -2762,12 +2977,12 @@ def gui_main() -> int:
                 "You can also restore from an encrypted bundle file or a hosted bundle URL."
             )
             ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
-            ttk.Label(intro, text="Backup repository source").grid(row=2, column=0, sticky="w", pady=(12, 0))
+            ttk.Label(intro, text="Backup source folder").grid(row=2, column=0, sticky="w", pady=(12, 0))
             ttk.Entry(intro, textvariable=self.repo_source_var, width=58).grid(row=2, column=1, sticky="w", pady=(12, 0))
             ttk.Button(intro, text="Browse", command=lambda: self.browse_directory(self.repo_source_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
-            ttk.Button(intro, text="Use This Repo", command=self.use_repo_source_path).grid(row=2, column=3, padx=(8, 0), pady=(12, 0))
-            ttk.Button(intro, text="Scan Mounted Disks", command=lambda: self.scan_repository_candidates(auto_use=False)).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
-            ttk.Label(intro, text="Discovered repos").grid(row=3, column=0, sticky="w", pady=(10, 0))
+            ttk.Button(intro, text="Use This Location", command=self.use_repo_source_path).grid(row=2, column=3, padx=(8, 0), pady=(12, 0))
+            ttk.Button(intro, text="Find Backup Locations", command=lambda: self.scan_repository_candidates(auto_use=False)).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
+            ttk.Label(intro, text="Detected backup locations").grid(row=3, column=0, sticky="w", pady=(10, 0))
             self.repo_candidate_combo = ttk.Combobox(intro, textvariable=self.repo_candidate_var, width=56, state="readonly")
             self.repo_candidate_combo.grid(row=3, column=1, sticky="w", pady=(10, 0))
             ttk.Button(intro, text="Use Selected", command=self.use_selected_repo_candidate).grid(row=3, column=2, padx=(8, 0), pady=(10, 0))
@@ -2779,26 +2994,33 @@ def gui_main() -> int:
             if self.recovery_mode:
                 ttk.Label(helper, text="Guided Full Restore (recommended)", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
                 ttk.Label(helper, text="Select the destination disk. AegisVault will wipe it, recreate a bootable layout, restore the Full Recovery snapshot, refresh initramfs, and reinstall the bootloader.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-                ttk.Label(helper, text="Target disk").grid(row=2, column=0, sticky="w", pady=(12, 0))
-                self.guided_disk_combo = ttk.Combobox(helper, textvariable=self.guided_target_disk_var, width=70, state="readonly")
-                self.guided_disk_combo.grid(row=2, column=1, sticky="w", pady=(12, 0))
-                ttk.Button(helper, text="Refresh Drives", command=self.refresh_local_device_lists).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
+                device_row = ttk.Frame(helper)
+                device_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+                ttk.Label(device_row, text="Target disk").pack(side="left")
+                self.guided_disk_combo = ttk.Combobox(device_row, textvariable=self.guided_target_disk_var, width=54, state="readonly")
+                self.guided_disk_combo.pack(side="left", padx=(12, 8))
+                ttk.Button(device_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
                 ttk.Button(helper, text="Restore Selected Snapshot to Disk", command=self.guided_restore_repo).grid(row=3, column=1, sticky="w", pady=(12, 0))
                 ttk.Button(helper, text="Restore Bundle or URL to Disk", command=self.guided_restore_bundle).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
             else:
                 ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
                 ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. AegisVault will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-                ttk.Label(helper, text="Recovery USB device").grid(row=2, column=0, sticky="w", pady=(12, 0))
-                self.recovery_usb_combo = ttk.Combobox(helper, textvariable=self.recovery_usb_device_var, width=70, state="readonly")
-                self.recovery_usb_combo.grid(row=2, column=1, sticky="w", pady=(12, 0))
-                ttk.Button(helper, text="Refresh Drives", command=self.refresh_local_device_lists).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
+                device_row = ttk.Frame(helper)
+                device_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+                ttk.Label(device_row, text="Recovery USB device").pack(side="left")
+                self.recovery_usb_combo = ttk.Combobox(device_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
+                self.recovery_usb_combo.pack(side="left", padx=(12, 8))
+                ttk.Button(device_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
+
                 ttk.Button(helper, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).grid(row=3, column=1, sticky="w", pady=(12, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
             repo_section = ttk.Frame(self.restore_tab)
             repo_section.pack(fill="x")
-            ttk.Label(repo_section, text="Manual restore from repository snapshot", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            ttk.Label(repo_section, text="Restore from saved backup", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
             self.restore_tree = self.build_snapshot_table(repo_section)
             self.restore_tree.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
             repo_section.grid_columnconfigure(0, weight=1)
@@ -2808,7 +3030,7 @@ def gui_main() -> int:
             ttk.Entry(repo_section, textvariable=self.repo_restore_target_var, width=46).grid(row=2, column=1, sticky="w", pady=(12, 0))
             ttk.Button(repo_section, text="Browse", command=lambda: self.browse_directory(self.repo_restore_target_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
 
-            ttk.Label(repo_section, text="Selective path inside snapshot").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Label(repo_section, text="Only restore this path (optional)").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
 
             ttk.Label(repo_section, text="Recovery key (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
@@ -2887,23 +3109,51 @@ def gui_main() -> int:
             ttk.Label(general, text="Machine label").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
             ttk.Entry(general, textvariable=self.machine_label_var, width=40).grid(row=1, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(general, text="Repository path").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
-            ttk.Entry(general, textvariable=self.repo_path_var, width=40).grid(row=2, column=1, sticky="w", pady=(10, 0))
-            ttk.Button(general, text="Browse", command=lambda: self.browse_directory(self.repo_path_var)).grid(row=2, column=2, padx=(8, 0), pady=(10, 0))
+            ttk.Label(general, text="Backup storage folder").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
+            repo_row = ttk.Frame(general)
+            repo_row.grid(row=2, column=1, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Entry(repo_row, textvariable=self.repo_path_var, width=40).pack(side="left")
+            ttk.Button(repo_row, text="Browse", command=lambda: self.browse_directory(self.repo_path_var)).pack(side="left", padx=(8, 0))
 
-            ttk.Checkbutton(general, text="Encrypt repository storage", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Checkbutton(general, text="Encrypt backups", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
             ttk.Checkbutton(general, text="Apply package list after portable restore to /", variable=self.apply_packages_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
             schedule = ttk.Frame(left)
             schedule.pack(fill="x", pady=(24, 0))
             ttk.Label(schedule, text="Scheduling and smoothing", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Checkbutton(schedule, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
             ttk.Label(schedule, text="Preset").grid(row=2, column=0, sticky="w", pady=(10, 0))
-            ttk.Combobox(schedule, textvariable=self.schedule_preset_var, values=["manual", "hourly", "daily", "weekly", "custom"], width=18, state="readonly").grid(row=2, column=1, sticky="w", pady=(10, 0))
+            ttk.Combobox(
+                schedule,
+                textvariable=self.schedule_preset_var,
+                values=["manual", "hourly", "daily", "weekly", "custom"],
+                width=18,
+                state="readonly",
+            ).grid(row=2, column=1, sticky="w", pady=(10, 0))
+
             ttk.Label(schedule, text="Custom minutes").grid(row=3, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.schedule_custom_var, width=12).grid(row=3, column=1, sticky="w", pady=(10, 0))
+
             ttk.Label(schedule, text="I/O yield milliseconds per chunk").grid(row=4, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
+
+            ttk.Label(schedule, text="Default backup plan").grid(row=5, column=0, sticky="w", pady=(10, 0))
+            profile_row = ttk.Frame(schedule)
+            profile_row.grid(row=5, column=1, sticky="w", pady=(10, 0))
+            ttk.Radiobutton(profile_row, text="Full machine", variable=self.default_backup_profile_var, value="full_recovery").pack(side="left")
+            ttk.Radiobutton(profile_row, text="Portable", variable=self.default_backup_profile_var, value="portable_state").pack(side="left", padx=(12, 0))
+            ttk.Radiobutton(profile_row, text="Both", variable=self.default_backup_profile_var, value="both").pack(side="left", padx=(12, 0))
+
+            ttk.Checkbutton(schedule, text="Show desktop notifications", variable=self.notifications_enabled_var).grid(
+                row=6, column=0, columnspan=2, sticky="w", pady=(10, 0)
+            )
+            ttk.Label(
+                schedule,
+                text="Desktop notifications warn about starts, finishes, and problems such as missing backup drives.",
+                wraplength=420,
+                style="Muted.TLabel",
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
             excludes = ttk.Frame(left)
             excludes.pack(fill="both", expand=True, pady=(24, 0))
@@ -2967,22 +3217,25 @@ def gui_main() -> int:
             if value:
                 variable.set(value)
 
-        def refresh_local_device_lists(self) -> None:
+        def refresh_backup_location_suggestions(self) -> None:
             try:
-                usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
-                guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
-                self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
-                self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
-                if hasattr(self, "recovery_usb_combo"):
-                    self.recovery_usb_combo.configure(values=list(self.usb_choice_map.keys()))
-                if hasattr(self, "guided_disk_combo"):
-                    self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
-                if not self.recovery_usb_device_var.get() and usb_choices:
-                    self.recovery_usb_device_var.set(usb_choices[0]["display"])
-                if not self.guided_target_disk_var.get() and guided_choices:
-                    self.guided_target_disk_var.set(guided_choices[0]["display"])
+                self.storage_choices = discover_backup_location_choices()
+                if hasattr(self, "storage_choice_combo"):
+                    self.storage_choice_combo.configure(values=self.storage_choices)
+                if self.storage_choices and not self.storage_choice_var.get():
+                    self.storage_choice_var.set(self.storage_choices[0])
+                if not self.storage_choices:
+                    self.message_var.set("No mounted external backup locations were detected. You can still browse to any folder you want.")
             except Exception as exc:
                 self.message_var.set(str(exc))
+
+        def apply_suggested_backup_location(self) -> None:
+            chosen = self.storage_choice_var.get().strip()
+            if not chosen:
+                self.message_var.set("Choose a suggested location first, or browse to a folder manually.")
+                return
+            self.repo_path_var.set(chosen)
+            self.message_var.set(f"Backup location set to {chosen}")
 
         def scan_repository_candidates(self, auto_use: bool = False) -> None:
             try:
@@ -3125,6 +3378,15 @@ def gui_main() -> int:
                 f"{'Busy: ' + current_job['name'] + ' — ' + current_job['stage'] if current_job else 'Idle'}"
             )
 
+            if current_job:
+                if not self.activity_bar_running:
+                    self.activity_bar.start(10)
+                    self.activity_bar_running = True
+            else:
+                if self.activity_bar_running:
+                    self.activity_bar.stop()
+                    self.activity_bar_running = False
+
             self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
             self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
             self.summary_labels["last_good"].configure(text=state.get("last_success_at") or "—")
@@ -3144,6 +3406,8 @@ def gui_main() -> int:
                 self.repo_path_var.set(settings.get("repo_path", ""))
                 self.repo_source_var.set(settings.get("repo_path", ""))
                 self.encryption_var.set(bool(settings.get("encryption_enabled", True)))
+                self.notifications_enabled_var.set(bool(settings.get("notifications_enabled", True)))
+                self.default_backup_profile_var.set(settings.get("default_backup_profile", "both"))
                 schedule = settings.get("schedule", {})
                 self.schedule_enabled_var.set(bool(schedule.get("enabled", False)))
                 self.schedule_preset_var.set(schedule.get("preset", "manual"))
@@ -3165,7 +3429,7 @@ def gui_main() -> int:
                     snap.get("created_at", ""),
                     snap.get("machine_label", ""),
                     kind_label(snap.get("kind", "")),
-                    str(snap.get("archive_bytes", 0)),
+                    human_bytes(int(snap.get("archive_bytes", 0))),
                     snap.get("id", ""),
                 )
                 item_id = tree.insert("", "end", iid=snap.get("id", ""), values=values)
@@ -3214,6 +3478,10 @@ def gui_main() -> int:
             except Exception as exc:
                 self.message_var.set(str(exc))
 
+        def start_default_backup(self) -> None:
+            profile = self.dashboard_payload.get("settings", {}).get("default_backup_profile", "both")
+            self.start_backup(normalize_backup_profile(profile))
+        
         def export_selected_bundle(self) -> None:
             if not self.selected_snapshot_id:
                 self.message_var.set("Select a snapshot first.")
@@ -3367,43 +3635,55 @@ def gui_main() -> int:
             self.peer_port_var.set(values[3])
             self.peer_identity_var.set(values[4])
 
+        def build_settings_payload(self, onboarding_complete: bool = True) -> Dict[str, Any]:
+            full_excludes = split_lines(self.full_excludes_text.get("1.0", "end"))
+            portable_includes = split_lines(self.portable_includes_text.get("1.0", "end"))
+            portable_excludes = split_lines(self.portable_excludes_text.get("1.0", "end"))
+
+            peers = []
+            for iid in self.settings_peers_tree.get_children():
+                values = self.settings_peers_tree.item(iid, "values")
+                peers.append({
+                    "enabled": values[5] == "yes",
+                    "label": values[0],
+                    "ssh_target": values[1],
+                    "repo_path": values[2],
+                    "port": int(values[3] or 22),
+                    "identity_file": values[4],
+                })
+
+            schedule_enabled = bool(self.schedule_enabled_var.get())
+            schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
+            if not schedule_enabled:
+                schedule_preset = "manual"
+
+            return {
+                "version": 2,
+                "onboarding_complete": onboarding_complete,
+                "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
+                "machine_label": self.machine_label_var.get().strip() or hostname(),
+                "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
+                "encryption_enabled": bool(self.encryption_var.get()),
+                "notifications_enabled": bool(self.notifications_enabled_var.get()),
+                "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
+                "schedule": {
+                    "enabled": schedule_enabled,
+                    "preset": schedule_preset,
+                    "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
+                },
+                "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
+                "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
+                "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
+                "full_excludes": full_excludes,
+                "portable_includes": portable_includes,
+                "portable_excludes": portable_excludes,
+                "peers_enabled": bool(self.peers_enabled_var.get()),
+                "peers": peers,
+            }
+        
         def save_settings(self) -> None:
             try:
-                full_excludes = split_lines(self.full_excludes_text.get("1.0", "end"))
-                portable_includes = split_lines(self.portable_includes_text.get("1.0", "end"))
-                portable_excludes = split_lines(self.portable_excludes_text.get("1.0", "end"))
-                peers = []
-                for iid in self.settings_peers_tree.get_children():
-                    values = self.settings_peers_tree.item(iid, "values")
-                    peers.append({
-                        "enabled": values[5] == "yes",
-                        "label": values[0],
-                        "ssh_target": values[1],
-                        "repo_path": values[2],
-                        "port": int(values[3] or 22),
-                        "identity_file": values[4],
-                    })
-                payload = {
-                    "version": 1,
-                    "onboarding_complete": True,
-                    "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
-                    "machine_label": self.machine_label_var.get().strip() or hostname(),
-                    "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
-                    "encryption_enabled": bool(self.encryption_var.get()),
-                    "schedule": {
-                        "enabled": bool(self.schedule_enabled_var.get()),
-                        "preset": self.schedule_preset_var.get().strip() or "manual",
-                        "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
-                    },
-                    "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
-                    "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
-                    "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
-                    "full_excludes": full_excludes,
-                    "portable_includes": portable_includes,
-                    "portable_excludes": portable_excludes,
-                    "peers_enabled": bool(self.peers_enabled_var.get()),
-                    "peers": peers,
-                }
+                payload = self.build_settings_payload(onboarding_complete=True)
                 response = send_daemon_request({"action": "save_settings", "settings": payload})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
