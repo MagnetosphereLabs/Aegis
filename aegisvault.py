@@ -60,7 +60,7 @@ BACKUP_BROWSE_MOUNT_ROOT = Path("/media/aegisvault-browser")
 DEFAULT_RECOVERY_SUITE = "bookworm"
 DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
 DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
-MIN_RECOVERY_USB_BYTES = 8 * 1024 * 1024 * 1024
+MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
 
 
 @dataclass
