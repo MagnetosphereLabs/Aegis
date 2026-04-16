@@ -303,6 +303,9 @@ def safe_mount_component(value: str) -> str:
     cleaned = cleaned.strip(".-")
     return cleaned or "drive"
 
+def ensure_traversable_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, 0o755)
 
 def mount_backup_browser_device(device: str) -> str:
     ensure_root()
@@ -324,7 +327,7 @@ def mount_backup_browser_device(device: str) -> str:
         raise AegisError("That drive is not a mountable filesystem.")
 
     base_name = safe_mount_component(entry.get("label") or entry.get("name") or Path(device).name)
-    BACKUP_BROWSE_MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+    ensure_traversable_directory(BACKUP_BROWSE_MOUNT_ROOT)
 
     mountpoint = BACKUP_BROWSE_MOUNT_ROOT / base_name
     suffix = 2
@@ -334,7 +337,7 @@ def mount_backup_browser_device(device: str) -> str:
         mountpoint = BACKUP_BROWSE_MOUNT_ROOT / f"{base_name}-{suffix}"
         suffix += 1
 
-    mountpoint.mkdir(parents=True, exist_ok=True)
+    ensure_traversable_directory(mountpoint)
 
     try:
         result = subprocess.run(
