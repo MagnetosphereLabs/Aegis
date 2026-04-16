@@ -42,8 +42,10 @@ SOCKET_PATH = "/run/aegisvault/daemon.sock"
 VAR_DIR = Path("/var/lib/aegisvault")
 CONFIG_PATH = VAR_DIR / "settings.json"
 STATE_PATH = VAR_DIR / "state.json"
-KEY_DIR = VAR_DIR / "keys"
+LEGACY_KEY_DIR = VAR_DIR / "keys"  # for migration from previous versions only, we will never write new keys here
 LOCK_PATH = VAR_DIR / "backup.lock"
+CREDSTORE_DIR = Path("/etc/credstore.encrypted")
+SECURE_TMP_DIR = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 BUNDLE_MAGIC = b"AGBND1"
 OBJECT_MAGIC = b"AGOBJ1"
 DEFAULT_REPO = "/var/backups/aegisvault"
@@ -331,6 +333,19 @@ def discover_backup_location_choices() -> List[Dict[str, str]]:
 def host_service_unit_text() -> str:
     python_bin = sys.executable
     app_path = str(Path(__file__).resolve())
+
+    load_cred_line = ""
+    try:
+        settings = load_settings()
+        if settings.encryption_enabled:
+            load_cred_line = (
+                f"LoadCredentialEncrypted="
+                f"{credential_name_for_machine(settings.machine_id)}:"
+                f"{local_key_credential_path(settings.machine_id)}"
+            )
+    except Exception:
+        pass
+
     return textwrap.dedent(
         f"""
         [Unit]
@@ -346,6 +361,8 @@ def host_service_unit_text() -> str:
         RestartSec=5
         WorkingDirectory=/var/lib/aegisvault
         UMask=0077
+        PrivateMounts=yes
+        {load_cred_line}
 
         [Install]
         WantedBy=multi-user.target
@@ -529,7 +546,123 @@ def sha256_file(path: Path) -> str:
 
 
 def local_key_path(machine: str) -> Path:
-    return KEY_DIR / f"{machine}.key"
+    # legacy plaintext location; read once for migration, never write new keys here
+    return LEGACY_KEY_DIR / f"{machine}.key"
+
+
+def credential_name_for_machine(machine: str) -> str:
+    return f"aegisvault-machine-key-{machine}"
+
+
+def local_key_credential_path(machine: str) -> Path:
+    return CREDSTORE_DIR / f"{credential_name_for_machine(machine)}.cred"
+
+
+def secure_temp_parent() -> Optional[str]:
+    return str(SECURE_TMP_DIR) if SECURE_TMP_DIR else None
+
+
+def secure_temp_path(prefix: str, suffix: str = "") -> Path:
+    fd, tmp_path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=secure_temp_parent())
+    os.close(fd)
+    os.chmod(tmp_path, 0o600)
+    return Path(tmp_path)
+
+
+def ensure_systemd_credential_backend() -> None:
+    binary = shutil.which("systemd-creds")
+    if not binary:
+        raise AegisError(
+            "Encrypted unattended local key storage requires systemd-creds. "
+            "Do not fall back to a plaintext key file."
+        )
+
+    CREDSTORE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CREDSTORE_DIR, 0o700)
+
+    secret_path = Path("/var/lib/systemd/credential.secret")
+    if not secret_path.exists():
+        result = subprocess.run([binary, "setup"], capture_output=True, text=True)
+        if result.returncode != 0 and not secret_path.exists():
+            detail = result.stderr.strip() or result.stdout.strip() or "systemd-creds setup failed"
+            raise AegisError(detail)
+
+
+def write_machine_key_credential(machine: str, machine_key: bytes) -> None:
+    if len(machine_key) != 32:
+        raise AegisError("Invalid machine key length.")
+
+    ensure_systemd_credential_backend()
+    plain_path = secure_temp_path(".aegisvault-key-", ".bin")
+    cred_path = local_key_credential_path(machine)
+
+    try:
+        plain_path.write_bytes(machine_key)
+        result = subprocess.run(
+            [
+                "systemd-creds",
+                "encrypt",
+                f"--name={credential_name_for_machine(machine)}",
+                str(plain_path),
+                str(cred_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "systemd-creds encrypt failed"
+            raise AegisError(detail)
+        os.chmod(cred_path, 0o600)
+    finally:
+        plain_path.unlink(missing_ok=True)
+
+
+def read_machine_key_credential(machine: str) -> bytes:
+    # Preferred path: read the service credential injected by systemd
+    service_cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if service_cred_dir:
+        service_cred = Path(service_cred_dir) / credential_name_for_machine(machine)
+        if service_cred.exists():
+            data = service_cred.read_bytes()
+            if len(data) != 32:
+                raise AegisError("Service credential returned an invalid machine key.")
+            return data
+
+    # Direct-mode fallback: decrypt the encrypted credential into tmpfs only
+    cred_path = local_key_credential_path(machine)
+    if not cred_path.exists():
+        raise AegisError(f"Encrypted local key credential is missing for {machine}.")
+
+    out_path = secure_temp_path(".aegisvault-key-", ".out")
+    try:
+        result = subprocess.run(
+            [
+                "systemd-creds",
+                "decrypt",
+                f"--name={credential_name_for_machine(machine)}",
+                str(cred_path),
+                str(out_path),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "systemd-creds decrypt failed"
+            raise AegisError(detail)
+
+        data = out_path.read_bytes()
+        if len(data) != 32:
+            raise AegisError("Decrypted machine key has an invalid length.")
+        return data
+    finally:
+        out_path.unlink(missing_ok=True)
+
+
+def has_local_machine_key(machine: str) -> bool:
+    service_cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if service_cred_dir and (Path(service_cred_dir) / credential_name_for_machine(machine)).exists():
+        return True
+    return local_key_credential_path(machine).exists() or local_key_path(machine).exists()
 
 
 def repo_machine_dir(repo: Path, machine: str) -> Path:
@@ -988,48 +1121,48 @@ def materialize_settings(settings: Settings) -> Optional[str]:
     (repo_machine_dir(repo, settings.machine_id) / "snapshots").mkdir(parents=True, exist_ok=True)
     (repo / "objects" / settings.machine_id).mkdir(parents=True, exist_ok=True)
     VAR_DIR.mkdir(parents=True, exist_ok=True)
-    KEY_DIR.mkdir(parents=True, exist_ok=True)
 
     if not settings.encryption_enabled:
         return None
 
-    local_key = local_key_path(settings.machine_id)
     envelope_path = key_envelope_path(repo, settings.machine_id)
+    legacy_key = local_key_path(settings.machine_id)
+    cred_path = local_key_credential_path(settings.machine_id)
 
-    if local_key.exists():
-        machine_key_value = local_key.read_bytes()
-    else:
-        machine_key_value = os.urandom(32)
-        atomic_write(local_key, machine_key_value, mode=0o600)
-        os.chmod(local_key, 0o600)
+    # One-time migration from the old plaintext local key file
+    if legacy_key.exists():
+        machine_key_value = legacy_key.read_bytes()
+        if len(machine_key_value) != 32:
+            raise AegisError("Legacy local key file is corrupt.")
+        write_machine_key_credential(settings.machine_id, machine_key_value)
+        legacy_key.unlink(missing_ok=True)
 
+    # First-time setup: create the local encrypted credential
+    elif not cred_path.exists():
+        if envelope_path.exists():
+            raise AegisError(
+                "The local unlock credential is missing for this machine. "
+                "Restore it with the recovery key instead of recreating encryption."
+            )
+        write_machine_key_credential(settings.machine_id, os.urandom(32))
+
+    # If the envelope already exists, local key material is ready and there is
+    # no new recovery key to show.
     if envelope_path.exists():
         return None
 
+    machine_key_value = read_local_machine_key(settings.machine_id)
+
+    # First encrypted setup only: create a recovery key, wrap the machine key,
+    # and return the recovery key to the caller so it can be shown once.
     recovery_key = generate_recovery_key()
     envelope = wrap_machine_key(settings.machine_id, machine_key_value, recovery_key)
     save_json(envelope_path, envelope, mode=0o600)
 
-    recovery_file = VAR_DIR / f"RECOVERY-KEY-{short_machine(settings.machine_id)}.txt"
-    recovery_text = "\n".join([
-        f"{APP_NAME} recovery key",
-        "",
-        f"Machine label: {settings.machine_label}",
-        f"Machine ID: {settings.machine_id}",
-        f"Backup location: {settings.repo_path}",
-        "",
-        f"Recovery key: {recovery_key}",
-        "",
-        "This key can decrypt this machine's backup encryption key on another system.",
-        "Store it somewhere safe and separate from the machine itself.",
-        "",
-    ])
-    atomic_write(recovery_file, recovery_text.encode("utf-8"), mode=0o600)
-
     state = load_state()
-    state.recovery_key_path = str(recovery_file)
+    state.recovery_key_path = ""
     save_state(state)
-    return str(recovery_file)
+    return recovery_key
 
 
 def object_encode(plaintext: bytes, key: Optional[bytes]) -> bytes:
@@ -1332,10 +1465,16 @@ def list_snapshots(settings: Settings) -> List[Dict[str, Any]]:
 
 
 def read_local_machine_key(machine: str) -> bytes:
-    key_path = local_key_path(machine)
-    if not key_path.exists():
-        raise AegisError(f"Local machine key is missing for {machine}.")
-    return key_path.read_bytes()
+    legacy = local_key_path(machine)
+    if legacy.exists():
+        data = legacy.read_bytes()
+        if len(data) != 32:
+            raise AegisError(f"Legacy local machine key is invalid for {machine}.")
+        write_machine_key_credential(machine, data)
+        legacy.unlink(missing_ok=True)
+        return data
+
+    return read_machine_key_credential(machine)
 
 
 def load_key_envelope(repo: Path, machine: str) -> Dict[str, Any]:
@@ -1350,9 +1489,8 @@ def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManif
     objects_root = repo / "objects" / manifest.machine_id
     if not objects_root.exists():
         return None
-    local_key = local_key_path(manifest.machine_id)
-    if local_key.exists():
-        return local_key.read_bytes()
+    if has_local_machine_key(manifest.machine_id):
+        return read_local_machine_key(manifest.machine_id)
     if recovery_key:
         envelope = load_key_envelope(repo, manifest.machine_id)
         return unwrap_machine_key(envelope, recovery_key)
@@ -1644,13 +1782,11 @@ def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_d
 def bundle_manifest_and_archive(bundle_path: Path, password: str) -> Tuple[SnapshotManifest, Path, tempfile.TemporaryDirectory]:
     if not password.strip():
         raise AegisError("Bundle password is required.")
-    plain_bundle = tempfile.NamedTemporaryFile(delete=False)
-    plain_bundle_path = Path(plain_bundle.name)
-    plain_bundle.close()
+    plain_bundle_path = secure_temp_path(".aegisvault-bundle-", ".tar")
     try:
         with bundle_path.open("rb") as src, plain_bundle_path.open("wb") as dst:
             decrypt_bundle_to_stream(src, password, dst)
-        td = tempfile.TemporaryDirectory()
+        td = tempfile.TemporaryDirectory(dir=secure_temp_parent())
         temp_dir = Path(td.name)
         subprocess.run(["tar", "-xpf", str(plain_bundle_path), "-C", str(temp_dir)], check=True, capture_output=True)
         manifest = snapshot_from_dict(json.loads((temp_dir / "snapshot.json").read_text(encoding="utf-8")))
@@ -1841,14 +1977,15 @@ def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, 
         raise AegisError("Bundle export requires a password.")
     manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
-    with tempfile.NamedTemporaryFile(delete=False) as archive_tmp:
-        archive_tmp_path = Path(archive_tmp.name)
+    archive_tmp_path = secure_temp_path(".aegisvault-export-archive-", ".tar")
+    with archive_tmp_path.open("wb") as archive_tmp:
         digest = stream_archive_from_repo(Path(settings.repo_path), manifest, key, archive_tmp)
+
     if digest != manifest.archive_sha256:
         archive_tmp_path.unlink(missing_ok=True)
         raise AegisError("Archive integrity mismatch while exporting bundle.")
-    with tempfile.NamedTemporaryFile(delete=False) as plain_bundle:
-        plain_bundle_path = Path(plain_bundle.name)
+
+    plain_bundle_path = secure_temp_path(".aegisvault-export-bundle-", ".tar")
     try:
         with tempfile.TemporaryDirectory() as td:
             temp_dir = Path(td)
@@ -1970,8 +2107,12 @@ def dashboard() -> Dashboard:
         warnings.append(f"Backup location is not available: {settings.repo_path}")
     if settings.notifications_enabled and not shutil.which("notify-send"):
         warnings.append("Desktop notifications are enabled, but notify-send is not installed. Install libnotify-bin to receive them.")
-    if settings.encryption_enabled and not local_key_path(settings.machine_id).exists():
-        warnings.append("Encryption is enabled but the local machine key file is missing.")
+    if settings.encryption_enabled and local_key_path(settings.machine_id).exists():
+        warnings.append(
+            "A legacy plaintext local key still exists. Open settings once to migrate it into the system credential store."
+        )
+    elif settings.encryption_enabled and not has_local_machine_key(settings.machine_id):
+        warnings.append("Encryption is enabled but the local unlock credential is missing.")
     if settings.peers_enabled and not settings.peers:
         warnings.append("Constellation mode is enabled but no peers are configured.")
     with RUNTIME.lock:
@@ -2045,13 +2186,20 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "dashboard": asdict(dashboard())}
     if action == "save_settings":
         settings = settings_from_dict(request["settings"])
-        recovery_path = materialize_settings(settings)
+        recovery_key = materialize_settings(settings)
         save_settings(settings)
+        install_or_update_host_service()
+
         state = load_state()
-        if recovery_path:
-            state.recovery_key_path = recovery_path
-            save_state(state)
-            return {"ok": True, "message": f"Settings saved. Recovery key written to {recovery_path}."}
+        state.recovery_key_path = ""
+        save_state(state)
+
+        if recovery_key:
+            return {
+                "ok": True,
+                "message": "Settings saved. Write down the recovery key now; it is not written to disk.",
+                "recovery_key": recovery_key,
+            }
         return {"ok": True, "message": "Settings saved."}
     if action == "run_backup":
         profile = normalize_backup_profile(request.get("profile", "both"))
@@ -2351,11 +2499,14 @@ def init_command(repo: Optional[str], label: Optional[str], encryption: bool) ->
         settings.machine_label = hostname()
     settings.portable_includes = settings.portable_includes or default_portable_includes()
     settings.portable_excludes = settings.portable_excludes or default_portable_excludes()
-    recovery_path = materialize_settings(settings)
+    recovery_key = materialize_settings(settings)
     save_settings(settings)
+    install_or_update_host_service()
+
     print(f"{APP_NAME} initialized at {settings.repo_path}")
-    if recovery_path:
-        print(f"Recovery key written to {recovery_path}")
+    if recovery_key:
+        print("Recovery key (shown once; not written to disk):")
+        print(recovery_key)
     return 0
 
 
@@ -2872,6 +3023,13 @@ def gui_main() -> int:
                 response = send_daemon_request({"action": "save_settings", "settings": payload})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
+                recovery_key = response.get("recovery_key", "")
+                if recovery_key:
+                    messagebox.showwarning(
+                        "Write down your recovery key now",
+                        "This key is shown only once and is not written to disk.\n\n"
+                        f"{recovery_key}"
+                    )
                 self.message_var.set(
                     response.get("message", "Setup saved.")
                     + " AegisVault will now keep running in the background using your selected plan."
@@ -2917,7 +3075,7 @@ def gui_main() -> int:
                 ("last_good", "Last successful backup"),
                 ("last_run", "Last attempted backup"),
                 ("last_sync", "Last peer sync"),
-                ("recovery_key", "Recovery key file"),
+                ("recovery_key", "Recovery key"),
             ]
             for idx, (key, label) in enumerate(grid_items):
                 row = idx // 2
@@ -3649,7 +3807,9 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
             self.summary_labels["last_good"].configure(text=state.get("last_success_at") or "—")
             self.summary_labels["last_run"].configure(text=state.get("last_run_at") or "—")
             self.summary_labels["last_sync"].configure(text=state.get("last_sync_at") or "—")
-            self.summary_labels["recovery_key"].configure(text=state.get("recovery_key_path") or "—")
+            self.summary_labels["recovery_key"].configure(
+                text=state.get("recovery_key_path") or "Not written to disk; shown once at initial encrypted setup."
+            )
 
             self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
             self.fill_text(self.logs_text, "\n".join(logs[-100:]) if logs else "No activity yet.")
@@ -3944,6 +4104,13 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
                 response = send_daemon_request({"action": "save_settings", "settings": payload})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
+                recovery_key = response.get("recovery_key", "")
+                if recovery_key:
+                    messagebox.showwarning(
+                        "Write down your recovery key now",
+                        "This key is shown only once and is not written to disk.\n\n"
+                        f"{recovery_key}"
+                    )
                 self.message_var.set(response.get("message", "Settings saved."))
                 self.settings_loaded = False
                 self.refresh_dashboard()
