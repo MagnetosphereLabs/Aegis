@@ -1902,9 +1902,14 @@ def wait_for_partition_device(path: str, timeout_seconds: int = 20) -> None:
 def reread_partition_table(device: str) -> None:
     subprocess.run(["sync"], check=False, capture_output=True)
     subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
+
+    # Drop any stale kernel-side partition bookkeeping for this disk only.
+    subprocess.run(["partx", "-d", device], check=False, capture_output=True)
+
+    # Ask the kernel to re-read the on-disk table, then repopulate partition nodes.
     subprocess.run(["blockdev", "--rereadpt", device], check=False, capture_output=True)
     subprocess.run(["partprobe", device], check=False, capture_output=True)
-    subprocess.run(["partx", "-u", device], check=False, capture_output=True)
+    subprocess.run(["partx", "-a", device], check=False, capture_output=True)
     subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
 def partition_is_mounted(device: str) -> bool:
@@ -1994,10 +1999,32 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
     if last_error:
         raise last_error
         
+
+def write_recovery_gpt_layout(device: str) -> None:
+    run_command(
+        [
+            "sgdisk",
+            "--clear",
+            "--new=1:1M:3M",
+            "--typecode=1:ef02",
+            "--change-name=1:bios_grub",
+            "--new=2:3M:1027M",
+            "--typecode=2:ef00",
+            "--change-name=2:ESP",
+            "--new=3:1027M:0",
+            "--typecode=3:8300",
+            "--change-name=3:root",
+            device,
+        ],
+        check=True,
+        capture=True,
+    )
+
+
 def guided_partition_disk(device: str) -> Dict[str, str]:
     device = assert_safe_target_disk(device)
     ensure_recovery_builder_prereqs()
-    unmount_device_tree(device)
+    ensure_device_tree_unmounted(device)
     swapoff_device_tree(device)
 
     sgdisk_result = subprocess.run(
@@ -2013,15 +2040,34 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
 
-    run_blockdev_command(["wipefs", "-af", device], device, check=True, capture=True)
+    run_command(["wipefs", "-af", device], check=True, capture=True)
     reread_partition_table(device)
 
-    run_blockdev_command(["parted", "-s", device, "mklabel", "gpt"], device, check=True, capture=True)
-    run_blockdev_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], device, check=True, capture=True)
-    run_blockdev_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], device, check=True, capture=True)
-    run_blockdev_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], device, check=True, capture=True)
-    run_blockdev_command(["parted", "-s", device, "set", "2", "esp", "on"], device, check=True, capture=True)
-    run_blockdev_command(["parted", "-s", device, "mkpart", "root", "ext4", "1027MiB", "100%"], device, check=True, capture=True)
+    last_error: Optional[Exception] = None
+    for attempt in range(3):
+        ensure_device_tree_unmounted(device)
+        reread_partition_table(device)
+
+        try:
+            write_recovery_gpt_layout(device)
+            break
+        except Exception as exc:
+            last_error = exc
+            if attempt == 2:
+                detail = str(exc)
+                if "unable to inform the kernel" in detail or "in use" in detail:
+                    raise AegisError(
+                        f"{detail} The selected USB disk would not accept a clean "
+                        f"partition-table rescan. AegisVault only touched the selected "
+                        f"target disk ({device}). Try the same stick once after unplugging "
+                        f"and reconnecting it; if it still fails, the stick or its controller "
+                        f"is not healthy enough for reliable recovery-media creation."
+                    ) from exc
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+    if last_error and not Path(disk_partition_path(device, 3)).exists():
+        raise last_error
 
     reread_partition_table(device)
 
