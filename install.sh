@@ -8,6 +8,7 @@ REPO_SLUG="${REPO_SLUG:-MagnetosphereLabs/Aegis}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO_SLUG}/${BRANCH}}"
 ACTION="${1:-install}"
+UNINSTALL_MODE="${2:-}"
 
 require_root() {
   if [ "${EUID}" -ne 0 ]; then
@@ -93,6 +94,60 @@ initialise_app() {
   "${BIN_PATH}" init --repo /var/backups/aegisvault --label "$(hostname)" --encryption on
 }
 
+normalise_uninstall_mode() {
+  case "${UNINSTALL_MODE:-}" in
+    "")
+      ;;
+    keep|keep-data|app-only)
+      UNINSTALL_MODE="keep-data"
+      ;;
+    purge|full|wipe|wipe-data)
+      UNINSTALL_MODE="purge"
+      ;;
+    *)
+      echo "Unknown uninstall mode: ${UNINSTALL_MODE}" >&2
+      echo "Use: uninstall, uninstall keep-data, or uninstall purge" >&2
+      exit 1
+      ;;
+  esac
+}
+
+prompt_uninstall_mode() {
+  normalise_uninstall_mode
+  if [ -n "${UNINSTALL_MODE}" ]; then
+    return
+  fi
+
+  if [ ! -r /dev/tty ]; then
+    echo "Uninstall mode is required when no interactive terminal is available." >&2
+    echo "Use one of:" >&2
+    echo "  uninstall keep-data" >&2
+    echo "  uninstall purge" >&2
+    exit 1
+  fi
+
+  echo >/dev/tty
+  echo "Choose uninstall level:" >/dev/tty
+  echo "  1) Remove app files only (keep settings, keys, and backups)" >/dev/tty
+  echo "  2) Remove app files and purge all local AegisVault data" >/dev/tty
+  echo "  3) Cancel" >/dev/tty
+  printf "Selection [1-3]: " >/dev/tty
+
+  read -r choice </dev/tty
+  case "${choice}" in
+    1) UNINSTALL_MODE="keep-data" ;;
+    2) UNINSTALL_MODE="purge" ;;
+    3)
+      echo "Canceled." >/dev/tty
+      exit 0
+      ;;
+    *)
+      echo "Invalid selection." >&2
+      exit 1
+      ;;
+  esac
+}
+
 do_install() {
   require_root
   apt_install
@@ -120,6 +175,8 @@ do_update() {
 
 do_uninstall() {
   require_root
+  prompt_uninstall_mode
+
   systemctl disable --now aegisvault.service || true
   rm -f /etc/systemd/system/aegisvault.service
   rm -f /usr/share/applications/aegisvault.desktop
@@ -128,25 +185,23 @@ do_uninstall() {
   rm -rf /run/aegisvault
   systemctl daemon-reload
   systemctl reset-failed aegisvault.service >/dev/null 2>&1 || true
-  echo "AegisVault app files removed. Data under /var/lib/aegisvault and /var/backups/aegisvault was left in place."
-}
 
-do_purge() {
-  require_root
-  do_uninstall
-  rm -rf /var/lib/aegisvault
-  rm -rf /var/backups/aegisvault
-  groupdel aegisvault >/dev/null 2>&1 || true
-  echo "AegisVault fully purged, including settings, keys, state, and backup repository data."
+  if [ "${UNINSTALL_MODE}" = "purge" ]; then
+    rm -rf /var/lib/aegisvault
+    rm -rf /var/backups/aegisvault
+    groupdel aegisvault >/dev/null 2>&1 || true
+    echo "AegisVault fully removed, including settings, keys, state, and local backup repository data."
+  else
+    echo "AegisVault app files removed. Data under /var/lib/aegisvault and /var/backups/aegisvault was left in place."
+  fi
 }
 
 case "${ACTION}" in
   install) do_install ;;
   update) do_update ;;
   uninstall) do_uninstall ;;
-  purge) do_purge ;;
   *)
-    echo "Usage: curl ... | sudo bash -s -- {install|update|uninstall|purge}" >&2
+    echo "Usage: curl ... | sudo bash -s -- {install|update|uninstall} [keep-data|purge]" >&2
     exit 1
     ;;
 esac
