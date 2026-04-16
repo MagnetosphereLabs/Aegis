@@ -1037,8 +1037,10 @@ def safe_read_text(path: str) -> str:
 def blkid_value(device: str, field: str) -> str:
     return run_command_optional(["blkid", "-s", field, "-o", "value", device]).strip()
 
-
 def disk_partition_path(device: str, number: int) -> str:
+    if device.startswith("/dev/disk/by-id/") or device.startswith("/dev/disk/by-path/"):
+        return f"{device}-part{number}"
+
     base = Path(device).name
     suffix = f"p{number}" if base[-1:].isdigit() else str(number)
     return f"{device}{suffix}"
@@ -1114,6 +1116,119 @@ def canonical_block_device_path(device: str) -> str:
         return ""
     return os.path.realpath(value)
 
+def block_device_symlink_candidates(device: str) -> List[str]:
+    real = canonical_block_device_path(device)
+    if not real:
+        return []
+
+    found: List[str] = []
+    for root in (Path("/dev/disk/by-id"), Path("/dev/disk/by-path")):
+        if not root.is_dir():
+            continue
+        for child in sorted(root.iterdir()):
+            if "-part" in child.name:
+                continue
+            try:
+                if os.path.realpath(str(child)) == real:
+                    found.append(str(child))
+            except OSError:
+                continue
+
+    return dedupe(
+        sorted(
+            found,
+            key=lambda p: (
+                "/by-id/" not in p,
+                "wwn-" not in Path(p).name,
+                len(Path(p).name),
+                p,
+            ),
+        )
+    )
+
+
+def stable_disk_device_path(device: str) -> str:
+    real = canonical_block_device_path(device)
+    if not real:
+        return ""
+    candidates = block_device_symlink_candidates(real)
+    return candidates[0] if candidates else real
+
+
+def capture_block_device_identity(device: str) -> Dict[str, Any]:
+    entry = find_block_device_entry(device) or {}
+    stable = stable_disk_device_path(device)
+
+    return {
+        "requested_path": str(device or "").strip(),
+        "stable_path": stable if stable.startswith("/dev/disk/") else "",
+        "real_path": canonical_block_device_path(device),
+        "serial": str(entry.get("serial") or ""),
+        "model": str(entry.get("model") or ""),
+        "size": int(entry.get("size") or 0),
+        "transport": str(entry.get("transport") or ""),
+        "removable": bool(entry.get("removable", False)),
+    }
+
+
+def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds: int = 20) -> str:
+    deadline = time.time() + max(1, timeout_seconds)
+
+    while time.time() < deadline:
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+        for candidate in (
+            str(identity.get("stable_path") or "").strip(),
+            str(identity.get("requested_path") or "").strip(),
+            str(identity.get("real_path") or "").strip(),
+        ):
+            if not candidate or not Path(candidate).exists():
+                continue
+
+            entry = find_block_device_entry(candidate)
+            if entry and entry.get("type") == "disk" and not bool(entry.get("read_only")):
+                if int(entry.get("size") or 0) > 0:
+                    return stable_disk_device_path(entry.get("path") or candidate)
+
+        serial = str(identity.get("serial") or "")
+        model = str(identity.get("model") or "")
+        size = int(identity.get("size") or 0)
+        transport = str(identity.get("transport") or "")
+        removable = bool(identity.get("removable", False))
+
+        matches: List[Dict[str, Any]] = []
+        for entry in list_block_devices():
+            if entry.get("type") != "disk":
+                continue
+            if bool(entry.get("read_only")):
+                continue
+            if size > 0 and int(entry.get("size") or 0) != size:
+                continue
+            if serial and str(entry.get("serial") or "") != serial:
+                continue
+            if not serial and model and str(entry.get("model") or "") != model:
+                continue
+            if transport and str(entry.get("transport") or "") != transport:
+                continue
+            if bool(entry.get("removable", False)) != removable:
+                continue
+            matches.append(entry)
+
+        if len(matches) == 1:
+            return stable_disk_device_path(matches[0].get("path", ""))
+
+        time.sleep(0.5)
+
+    label = (
+        str(identity.get("stable_path") or "").strip()
+        or str(identity.get("requested_path") or "").strip()
+        or str(identity.get("real_path") or "").strip()
+        or "the selected USB disk"
+    )
+    raise AegisError(
+        f"{label} did not come back after the kernel rescanned block devices. "
+        "If the stick is still present, Linux may have renumbered it and could not match it unambiguously."
+    )
 
 def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
     wanted = canonical_block_device_path(device)
@@ -1225,30 +1340,31 @@ def ensure_recovery_builder_prereqs() -> None:
 
 
 def assert_safe_target_disk(device: str) -> str:
-    device = canonical_block_device_path(device)
-    if not device:
+    requested = str(device or "").strip()
+    real_device = canonical_block_device_path(requested)
+    if not real_device:
         raise AegisError("Choose a whole-disk device first.")
 
-    entry = find_block_device_entry(device)
+    entry = find_block_device_entry(real_device)
     if not entry:
         raise AegisError(
-            f"{device} is not currently available. Reconnect it, click Refresh, and try again."
+            f"{requested or real_device} is not currently available. Reconnect it, click Refresh, and try again."
         )
 
     if entry.get("type") != "disk":
-        parent = device_parent_disk(device)
-        example = parent if parent and parent != device else "/dev/sdb"
-        raise AegisError(f"Choose a whole-disk device like {example}, not {device}.")
+        parent = device_parent_disk(real_device)
+        example = parent if parent and parent != real_device else "/dev/sdb"
+        raise AegisError(f"Choose a whole-disk device like {example}, not {requested or real_device}.")
 
     if bool(entry.get("read_only")):
         raise AegisError(
-            f"{device} is read-only. Disable any write-protect switch or choose another drive."
+            f"{requested or real_device} is read-only. Disable any write-protect switch or choose another drive."
         )
 
-    if device == current_root_disk():
+    if real_device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
-    return device
+    return stable_disk_device_path(real_device)
 
 
 RECOVERY_PASSWORD_REQUIRED_ERROR = (
@@ -2049,6 +2165,9 @@ def write_recovery_gpt_layout(device: str) -> None:
 
 def guided_partition_disk(device: str) -> Dict[str, str]:
     device = assert_safe_target_disk(device)
+    identity = capture_block_device_identity(device)
+    device = resolve_block_device_from_identity(identity, timeout_seconds=10)
+
     ensure_recovery_builder_prereqs()
     ensure_device_tree_unmounted(device)
     swapoff_device_tree(device)
@@ -2066,28 +2185,12 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
 
-    # Some USB sticks briefly disappear/reset after zap-all. Wait for the
-    # whole-disk node to become usable again instead of failing immediately.
-    deadline = time.time() + 20
-    while time.time() < deadline:
-        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-        entry = find_block_device_entry(device)
-        if Path(device).exists() and entry and entry.get("type") == "disk":
-            size = int(entry.get("size") or 0)
-            if not bool(entry.get("read_only")) and size > 0:
-                break
-        time.sleep(0.5)
-    else:
-        raise AegisError(
-            f"{device} disappeared after sgdisk --zap-all. "
-            "Try unplugging and reconnecting the USB stick once; "
-            "if it repeats, the stick or its USB bridge is unstable."
-        )
-
+    device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     reread_partition_table(device)
 
     last_error: Optional[Exception] = None
     for attempt in range(3):
+        device = resolve_block_device_from_identity(identity, timeout_seconds=30)
         ensure_device_tree_unmounted(device)
         reread_partition_table(device)
 
@@ -2113,6 +2216,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     if last_error is not None:
         raise last_error
 
+    device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     reread_partition_table(device)
 
     bios_partition = disk_partition_path(device, 1)
@@ -2136,13 +2240,14 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         attempts=4,
     )
 
+    device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     reread_partition_table(device)
 
     return {
         "disk": device,
-        "bios": bios_partition,
-        "efi": efi_partition,
-        "root": root_partition,
+        "bios": disk_partition_path(device, 1),
+        "efi": disk_partition_path(device, 2),
+        "root": disk_partition_path(device, 3),
     }
 
 
