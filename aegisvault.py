@@ -35,6 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+import getpass
 
 
 APP_NAME = "AegisVault"
@@ -263,6 +264,19 @@ def is_external_backup_path(repo_path: str) -> bool:
     normalized = os.path.abspath(repo_path).rstrip("/") + "/"
     return normalized.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES)
 
+def prompt_new_recovery_password_cli() -> str:
+    if not sys.stdin.isatty():
+        raise AegisError(
+            "Provide --recovery-password for first encrypted setup when no interactive terminal is available."
+        )
+
+    first = getpass.getpass("Create a password: ")
+    second = getpass.getpass("Confirm your password: ")
+
+    if first != second:
+        raise AegisError("Passwords did not match.")
+
+    return validate_recovery_password(first)
 
 def external_mount_present_for_path(repo_path: str) -> bool:
     normalized = os.path.abspath(repo_path)
@@ -1075,13 +1089,15 @@ def assert_safe_target_disk(device: str) -> None:
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
 
-def recovery_key_normalized(key: str) -> str:
-    return "".join(ch for ch in key.upper() if ch.isalnum())
+RECOVERY_PASSWORD_REQUIRED_ERROR = (
+    "A password is required when encrypting a new backup."
+)
 
 
-def generate_recovery_key() -> str:
-    raw = base64.b16encode(os.urandom(20)).decode("ascii")
-    return "-".join(raw[i:i+4] for i in range(0, len(raw), 4))
+def validate_recovery_password(password: str) -> str:
+    if not isinstance(password, str) or not password or not password.strip():
+        raise AegisError("Recovery password cannot be empty.")
+    return password
 
 
 def derive_key_from_password(password: str, salt: bytes) -> bytes:
@@ -1089,9 +1105,9 @@ def derive_key_from_password(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode("utf-8"))
 
 
-def wrap_machine_key(machine: str, machine_key: bytes, recovery_key: str) -> Dict[str, Any]:
+def wrap_machine_key(machine: str, machine_key: bytes, recovery_password: str) -> Dict[str, Any]:
     salt = os.urandom(16)
-    key = derive_key_from_password(recovery_key_normalized(recovery_key), salt)
+    key = derive_key_from_password(validate_recovery_password(recovery_password), salt)
     nonce = os.urandom(12)
     cipher = AESGCM(key)
     ciphertext = cipher.encrypt(nonce, machine_key, None)
@@ -1105,16 +1121,16 @@ def wrap_machine_key(machine: str, machine_key: bytes, recovery_key: str) -> Dic
     }
 
 
-def unwrap_machine_key(envelope: Dict[str, Any], recovery_key: str) -> bytes:
+def unwrap_machine_key(envelope: Dict[str, Any], recovery_password: str) -> bytes:
     salt = base64.b64decode(envelope["salt_b64"])
     nonce = base64.b64decode(envelope["nonce_b64"])
     ciphertext = base64.b64decode(envelope["ciphertext_b64"])
-    key = derive_key_from_password(recovery_key_normalized(recovery_key), salt)
+    key = derive_key_from_password(validate_recovery_password(recovery_password), salt)
     cipher = AESGCM(key)
     return cipher.decrypt(nonce, ciphertext, None)
 
 
-def materialize_settings(settings: Settings) -> Optional[str]:
+def materialize_settings(settings: Settings, recovery_password: Optional[str] = None) -> bool:
     ensure_repo_path_ready(settings.repo_path)
     repo = Path(settings.repo_path)
 
@@ -1123,13 +1139,12 @@ def materialize_settings(settings: Settings) -> Optional[str]:
     VAR_DIR.mkdir(parents=True, exist_ok=True)
 
     if not settings.encryption_enabled:
-        return None
+        return False
 
     envelope_path = key_envelope_path(repo, settings.machine_id)
     legacy_key = local_key_path(settings.machine_id)
     cred_path = local_key_credential_path(settings.machine_id)
 
-    # One-time migration from the old plaintext local key file
     if legacy_key.exists():
         machine_key_value = legacy_key.read_bytes()
         if len(machine_key_value) != 32:
@@ -1137,32 +1152,28 @@ def materialize_settings(settings: Settings) -> Optional[str]:
         write_machine_key_credential(settings.machine_id, machine_key_value)
         legacy_key.unlink(missing_ok=True)
 
-    # First-time setup: create the local encrypted credential
     elif not cred_path.exists():
         if envelope_path.exists():
             raise AegisError(
                 "The local unlock credential is missing for this machine. "
-                "Restore it with the recovery key instead of recreating encryption."
+                "Restore it with the recovery password instead of recreating encryption."
             )
         write_machine_key_credential(settings.machine_id, os.urandom(32))
 
-    # If the envelope already exists, local key material is ready and there is
-    # no new recovery key to show.
     if envelope_path.exists():
-        return None
+        return False
+
+    if not recovery_password:
+        raise AegisError(RECOVERY_PASSWORD_REQUIRED_ERROR)
 
     machine_key_value = read_local_machine_key(settings.machine_id)
-
-    # First encrypted setup only: create a recovery key, wrap the machine key,
-    # and return the recovery key to the caller so it can be shown once.
-    recovery_key = generate_recovery_key()
-    envelope = wrap_machine_key(settings.machine_id, machine_key_value, recovery_key)
+    envelope = wrap_machine_key(settings.machine_id, machine_key_value, recovery_password)
     save_json(envelope_path, envelope, mode=0o600)
 
     state = load_state()
     state.recovery_key_path = ""
     save_state(state)
-    return recovery_key
+    return True
 
 
 def object_encode(plaintext: bytes, key: Optional[bytes]) -> bytes:
@@ -1484,18 +1495,18 @@ def load_key_envelope(repo: Path, machine: str) -> Dict[str, Any]:
     return load_json(path)
 
 
-def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManifest, recovery_key: Optional[str]) -> Optional[bytes]:
+def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManifest, recovery_password: Optional[str]) -> Optional[bytes]:
     repo = Path(settings.repo_path)
     objects_root = repo / "objects" / manifest.machine_id
     if not objects_root.exists():
         return None
     if has_local_machine_key(manifest.machine_id):
         return read_local_machine_key(manifest.machine_id)
-    if recovery_key:
+    if recovery_password:
         envelope = load_key_envelope(repo, manifest.machine_id)
-        return unwrap_machine_key(envelope, recovery_key)
+        return unwrap_machine_key(envelope, recovery_password)
     raise AegisError(
-        f"No local key found for machine {manifest.machine_id}. Supply that machine's recovery key."
+        f"No local key found for machine {manifest.machine_id}. Supply that machine's recovery password."
     )
 
 
@@ -1602,11 +1613,11 @@ def build_tar_restore_command(target: Path, member: Optional[str]) -> subprocess
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Path, member: Optional[str], apply_packages: bool, recovery_key: Optional[str]) -> None:
+def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Path, member: Optional[str], apply_packages: bool, recovery_password: Optional[str]) -> None:
     manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
     if manifest.kind == "full_recovery" and target.resolve() == Path("/"):
         raise AegisError("Full Recovery restore must target an offline-mounted root, not /.")
-    key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
+    key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, target, member)
     after_restore_actions(target, manifest, apply_packages)
 
@@ -1767,11 +1778,11 @@ def mounted_guided_target(device: str):
         shutil.rmtree(mount_root, ignore_errors=True)
 
 
-def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_key: Optional[str]) -> None:
+def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_password: Optional[str]) -> None:
     manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
     if manifest.kind != "full_recovery":
         raise AegisError("Guided full restore only works with Full Recovery snapshots.")
-    key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
+    key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     with mounted_guided_target(target_disk) as (layout, mount_root):
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
         extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, mount_root, None)
@@ -1972,11 +1983,11 @@ def decrypt_bundle_to_stream(source, password: str, dest) -> None:
         dest.write(plain)
 
 
-def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, password: str, recovery_key: Optional[str]) -> None:
+def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, password: str, recovery_password: Optional[str]) -> None:
     if not password.strip():
         raise AegisError("Bundle export requires a password.")
     manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
-    key = resolve_machine_key_for_manifest(settings, manifest, recovery_key)
+    key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     archive_tmp_path = secure_temp_path(".aegisvault-export-archive-", ".tar")
     with archive_tmp_path.open("wb") as archive_tmp:
         digest = stream_archive_from_repo(Path(settings.repo_path), manifest, key, archive_tmp)
@@ -2186,7 +2197,8 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "dashboard": asdict(dashboard())}
     if action == "save_settings":
         settings = settings_from_dict(request["settings"])
-        recovery_key = materialize_settings(settings)
+        recovery_password = request.get("recovery_password") or None
+        created_new_envelope = materialize_settings(settings, recovery_password=recovery_password)
         save_settings(settings)
         install_or_update_host_service()
 
@@ -2194,11 +2206,10 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         state.recovery_key_path = ""
         save_state(state)
 
-        if recovery_key:
+        if created_new_envelope:
             return {
                 "ok": True,
-                "message": "Settings saved. Write down the recovery key now; it is not written to disk.",
-                "recovery_key": recovery_key,
+                "message": "Settings saved. Password set for encrypted restore.",
             }
         return {"ok": True, "message": "Settings saved."}
     if action == "run_backup":
@@ -2209,10 +2220,10 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         snapshot_id = request["snapshot"]
         output = Path(request["output"])
         password = request["password"]
-        recovery_key = request.get("recovery_key") or None
+        recovery_password = request.get("recovery_password") or None
         run_job(
             f"Export bundle {snapshot_id}",
-            lambda: export_bundle_from_repo(load_settings(), snapshot_id, output, password, recovery_key),
+            lambda: export_bundle_from_repo(load_settings(), snapshot_id, output, password, recovery_password),
         )
         return {"ok": True, "message": "Bundle export started."}
     if action == "run_restore_repo":
@@ -2224,7 +2235,7 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 Path(request["target"]),
                 request.get("member") or None,
                 bool(request.get("apply_packages", False)),
-                request.get("recovery_key") or None,
+                request.get("recovery_password") or None,
             ),
         )
         return {"ok": True, "message": "Restore started."}
@@ -2280,10 +2291,13 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "run_guided_restore_repo":
         device = str(request.get("target_disk") or "").strip()
         snapshot_id = str(request.get("snapshot") or "").strip()
-        recovery_key = request.get("recovery_key") or None
+        recovery_password = request.get("recovery_password") or None
         if not snapshot_id or not device:
             raise AegisError("Snapshot and target disk are required.")
-        run_job(f"Guided restore {snapshot_id} to {device}", lambda: guided_full_restore_from_repo(load_settings(), snapshot_id, device, recovery_key))
+        run_job(
+            f"Guided restore {snapshot_id} to {device}",
+            lambda: guided_full_restore_from_repo(load_settings(), snapshot_id, device, recovery_password),
+        )
         return {"ok": True, "message": "Guided full restore started."}
     if action == "run_guided_restore_bundle":
         device = str(request.get("target_disk") or "").strip()
@@ -2483,7 +2497,7 @@ def authorize_socket_command(user: str) -> int:
         return 1
 
 
-def init_command(repo: Optional[str], label: Optional[str], encryption: bool) -> int:
+def init_command(repo: Optional[str], label: Optional[str], encryption: bool, recovery_password: Optional[str]) -> int:
     ensure_root()
     settings = load_settings()
     if repo:
@@ -2499,14 +2513,22 @@ def init_command(repo: Optional[str], label: Optional[str], encryption: bool) ->
         settings.machine_label = hostname()
     settings.portable_includes = settings.portable_includes or default_portable_includes()
     settings.portable_excludes = settings.portable_excludes or default_portable_excludes()
-    recovery_key = materialize_settings(settings)
+
+    try:
+        materialize_settings(settings, recovery_password=recovery_password)
+    except AegisError as exc:
+        if str(exc) != RECOVERY_PASSWORD_REQUIRED_ERROR or not encryption:
+            raise
+        recovery_password = prompt_new_recovery_password_cli()
+        materialize_settings(settings, recovery_password=recovery_password)
+
     save_settings(settings)
     install_or_update_host_service()
 
     print(f"{APP_NAME} initialized at {settings.repo_path}")
-    if recovery_key:
-        print("Recovery key (shown once; not written to disk):")
-        print(recovery_key)
+    if encryption:
+        print("Encrypted backups are enabled.")
+        print("Use your chosen recovery password to restore on another machine or after a reset.")
     return 0
 
 
@@ -2546,7 +2568,7 @@ def backup_now_command(profile: str, direct: bool) -> int:
         return 1
 
 
-def export_bundle_command(snapshot: str, output: str, password: str, recovery_key: Optional[str], direct: bool) -> int:
+def export_bundle_command(snapshot: str, output: str, password: str, recovery_password: Optional[str], direct: bool) -> int:
     try:
         if not direct:
             try:
@@ -2555,7 +2577,7 @@ def export_bundle_command(snapshot: str, output: str, password: str, recovery_ke
                     "snapshot": snapshot,
                     "output": output,
                     "password": password,
-                    "recovery_key": recovery_key or "",
+                    "recovery_password": recovery_password or "",
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
@@ -2564,7 +2586,7 @@ def export_bundle_command(snapshot: str, output: str, password: str, recovery_ke
             except Exception:
                 pass
         ensure_root()
-        export_bundle_from_repo(load_settings(), snapshot, Path(output), password, recovery_key)
+        export_bundle_from_repo(load_settings(), snapshot, Path(output), password, recovery_password)
         print(f"Bundle written to {output}")
         return 0
     except Exception as exc:
@@ -2584,7 +2606,7 @@ def restore_command(args) -> int:
                             "action": "run_guided_restore_repo",
                             "snapshot": args.snapshot,
                             "target_disk": target_disk,
-                            "recovery_key": args.recovery_key or "",
+                            "recovery_password": args.recovery_password or "",
                         }
                     else:
                         payload = {
@@ -2601,7 +2623,7 @@ def restore_command(args) -> int:
                         "target": args.target,
                         "member": args.path or "",
                         "apply_packages": bool(args.apply_packages),
-                        "recovery_key": args.recovery_key or "",
+                        "recovery_password": args.recovery_password or "",
                     }
                 else:
                     payload = {
@@ -2627,7 +2649,7 @@ def restore_command(args) -> int:
             if not target_disk:
                 raise AegisError("Guided restore requires --target-disk /dev/sdX.")
             if args.snapshot:
-                guided_full_restore_from_repo(settings, args.snapshot, target_disk, args.recovery_key)
+                guided_full_restore_from_repo(settings, args.snapshot, target_disk, args.recovery_password)
             elif args.bundle:
                 guided_full_restore_from_bundle(Path(args.bundle), args.bundle_password or "", target_disk)
             elif args.url:
@@ -2637,7 +2659,7 @@ def restore_command(args) -> int:
         else:
             target = Path(args.target)
             if args.snapshot:
-                restore_snapshot_from_repo(settings, args.snapshot, target, args.path, bool(args.apply_packages), args.recovery_key)
+                restore_snapshot_from_repo(settings, args.snapshot, target, args.path, bool(args.apply_packages), args.recovery_password)
             elif args.bundle:
                 restore_from_bundle_file(Path(args.bundle), args.bundle_password or "", target, args.path, bool(args.apply_packages))
             elif args.url:
@@ -2707,7 +2729,7 @@ def sync_peers_command(direct: bool) -> int:
 
 def gui_main() -> int:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, messagebox, simpledialog, ttk
     from tkinter.scrolledtext import ScrolledText
 
     class App:
@@ -2928,6 +2950,52 @@ def gui_main() -> int:
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
+        def prompt_new_recovery_password(self) -> Optional[str]:
+            first = simpledialog.askstring(
+                "Create recovery password",
+                "Choose the recovery password for encrypted restores.\n\n"
+                "You will need this to restore on another machine or after a full reset.",
+                show="*",
+            )
+            if first is None:
+                return None
+
+            second = simpledialog.askstring(
+                "Confirm recovery password",
+                "Re-enter the recovery password.",
+                show="*",
+            )
+            if second is None:
+                return None
+
+            if first != second:
+                raise AegisError("Recovery passwords did not match.")
+
+            return validate_recovery_password(first)
+
+        def submit_settings_with_recovery_password_if_needed(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+            try:
+                response = send_daemon_request({"action": "save_settings", "settings": payload})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                return response
+            except Exception as exc:
+                if str(exc) != RECOVERY_PASSWORD_REQUIRED_ERROR or not bool(payload.get("encryption_enabled", True)):
+                    raise
+
+                recovery_password = self.prompt_new_recovery_password()
+                if recovery_password is None:
+                    raise AegisError("Recovery password setup was canceled.")
+
+                response = send_daemon_request({
+                    "action": "save_settings",
+                    "settings": payload,
+                    "recovery_password": recovery_password,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                return response
+        
         def build_setup_tab(self) -> None:
             frame = ttk.Frame(self.setup_tab)
             frame.pack(fill="both", expand=True)
@@ -3020,16 +3088,7 @@ def gui_main() -> int:
         def complete_onboarding(self) -> None:
             try:
                 payload = self.build_settings_payload(onboarding_complete=True)
-                response = send_daemon_request({"action": "save_settings", "settings": payload})
-                if not response.get("ok"):
-                    raise AegisError(response.get("error", "Unknown daemon error"))
-                recovery_key = response.get("recovery_key", "")
-                if recovery_key:
-                    messagebox.showwarning(
-                        "Write down your recovery key now",
-                        "This key is shown only once and is not written to disk.\n\n"
-                        f"{recovery_key}"
-                    )
+                response = self.submit_settings_with_recovery_password_if_needed(payload)
                 self.message_var.set(
                     response.get("message", "Setup saved.")
                     + " AegisVault will now keep running in the background using your selected plan."
@@ -3075,7 +3134,7 @@ def gui_main() -> int:
                 ("last_good", "Last successful backup"),
                 ("last_run", "Last attempted backup"),
                 ("last_sync", "Last peer sync"),
-                ("recovery_key", "Recovery key"),
+                ("recovery_key", "Recovery password"),
             ]
             for idx, (key, label) in enumerate(grid_items):
                 row = idx // 2
@@ -3150,7 +3209,7 @@ def gui_main() -> int:
             ttk.Label(export, text="Bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
 
-            ttk.Label(export, text="Recovery key for foreign machine snapshot (optional)").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Label(export, text="Recovery password for foreign machine snapshot (optional)").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(export, textvariable=self.export_recovery_key_var, width=34).grid(row=2, column=1, sticky="w", pady=(12, 0))
 
             ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=3, column=1, sticky="w", pady=(14, 0))
@@ -3221,7 +3280,7 @@ def gui_main() -> int:
             ttk.Label(repo_section, text="Only restore this path (optional)").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
 
-            ttk.Label(repo_section, text="Recovery key (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Label(repo_section, text="Recovery password (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(repo_section, textvariable=self.repo_recovery_key_var, width=46).grid(row=4, column=1, sticky="w", pady=(12, 0))
 
             ttk.Button(
@@ -3723,7 +3782,7 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
                     "action": "run_guided_restore_repo",
                     "snapshot": self.selected_snapshot_id,
                     "target_disk": device,
-                    "recovery_key": self.repo_recovery_key_var.get().strip(),
+                    "recovery_password": self.repo_recovery_key_var.get().strip(),
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
@@ -3808,7 +3867,7 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
             self.summary_labels["last_run"].configure(text=state.get("last_run_at") or "—")
             self.summary_labels["last_sync"].configure(text=state.get("last_sync_at") or "—")
             self.summary_labels["recovery_key"].configure(
-                text=state.get("recovery_key_path") or "Not written to disk; shown once at initial encrypted setup."
+                text=state.get("recovery_key_path") or "Chosen during encrypted setup; not written to disk."
             )
 
             self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
@@ -3916,7 +3975,7 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
                     "snapshot": self.selected_snapshot_id,
                     "output": output,
                     "password": password,
-                    "recovery_key": self.export_recovery_key_var.get().strip(),
+                    "recovery_password": self.export_recovery_key_var.get().strip(),
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
@@ -3957,7 +4016,7 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
                     "target": self.repo_restore_target_var.get().strip() or "/",
                     "member": self.repo_restore_path_var.get().strip(),
                     "apply_packages": bool(self.apply_packages_var.get()),
-                    "recovery_key": self.repo_recovery_key_var.get().strip(),
+                    "recovery_password": self.repo_recovery_key_var.get().strip(),
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
@@ -4101,16 +4160,7 @@ def open_directory_chooser(self, start_path: str) -> Optional[str]:
         def save_settings(self) -> None:
             try:
                 payload = self.build_settings_payload(onboarding_complete=True)
-                response = send_daemon_request({"action": "save_settings", "settings": payload})
-                if not response.get("ok"):
-                    raise AegisError(response.get("error", "Unknown daemon error"))
-                recovery_key = response.get("recovery_key", "")
-                if recovery_key:
-                    messagebox.showwarning(
-                        "Write down your recovery key now",
-                        "This key is shown only once and is not written to disk.\n\n"
-                        f"{recovery_key}"
-                    )
+                response = self.submit_settings_with_recovery_password_if_needed(payload)
                 self.message_var.set(response.get("message", "Settings saved."))
                 self.settings_loaded = False
                 self.refresh_dashboard()
@@ -4144,6 +4194,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     init_parser.add_argument("--repo")
     init_parser.add_argument("--label")
     init_parser.add_argument("--encryption", choices=["on", "off"], default="on")
+    init_parser.add_argument("--recovery-password")
 
     sub.add_parser("status")
     sub.add_parser("dashboard")
@@ -4158,7 +4209,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     export.add_argument("snapshot")
     export.add_argument("output")
     export.add_argument("--password", required=True)
-    export.add_argument("--recovery-key")
+    export.add_argument("--recovery-password")
     export.add_argument("--direct", action="store_true")
 
     restore = sub.add_parser("restore")
@@ -4170,7 +4221,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     restore.add_argument("--guided", action="store_true")
     restore.add_argument("--path")
     restore.add_argument("--apply-packages", action="store_true")
-    restore.add_argument("--recovery-key")
+    restore.add_argument("--recovery-password")
     restore.add_argument("--bundle-password")
     restore.add_argument("--direct", action="store_true")
 
@@ -4196,7 +4247,7 @@ def main(argv: List[str]) -> int:
         if cmd == "daemon":
             return daemon_main()
         if cmd == "init":
-            return init_command(args.repo, args.label, args.encryption == "on")
+            return init_command(args.repo, args.label, args.encryption == "on", args.recovery_password)
         if cmd in ("status", "dashboard"):
             return print_status_json()
         if cmd == "list-snapshots":
@@ -4206,7 +4257,7 @@ def main(argv: List[str]) -> int:
         if cmd == "backup-now":
             return backup_now_command(args.profile, args.direct)
         if cmd == "export-bundle":
-            return export_bundle_command(args.snapshot, args.output, args.password, args.recovery_key, args.direct)
+            return export_bundle_command(args.snapshot, args.output, args.password, args.recovery_password, args.direct)
         if cmd == "restore":
             return restore_command(args)
         if cmd == "create-recovery-usb":
