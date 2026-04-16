@@ -3728,8 +3728,9 @@ def gui_main() -> int:
                         [name for name in os.listdir(path) if os.path.isdir(os.path.join(path, name))],
                         key=str.lower,
                     )
-                except (PermissionError, FileNotFoundError, NotADirectoryError):
+                except (PermissionError, FileNotFoundError, NotADirectoryError, OSError) as exc:
                     names = []
+                    self.message_var.set(f"Could not read folders in {path}: {exc}")
 
                 for name in names:
                     full = os.path.join(path, name)
@@ -3809,6 +3810,46 @@ def gui_main() -> int:
                 parent = os.path.dirname(current.rstrip("/")) or "/"
                 set_current_path(parent)
 
+            def refresh_current_view() -> None:
+                current = current_path_var.get().strip() or "/"
+                refresh_roots()
+                set_current_path(current)
+
+            def create_current_folder() -> None:
+                parent_path = current_path_var.get().strip() or "/"
+                folder_name = simpledialog.askstring(
+                    "Create Folder",
+                    f"New folder name inside:\n{parent_path}",
+                    parent=dialog,
+                )
+                if folder_name is None:
+                    return
+
+                folder_name = folder_name.strip()
+                if not folder_name:
+                    self.message_var.set("Folder name cannot be empty.")
+                    return
+                if folder_name in {".", ".."} or "/" in folder_name or "\x00" in folder_name:
+                    self.message_var.set("Choose a folder name without slashes.")
+                    return
+
+                new_path = os.path.join(parent_path, folder_name)
+
+                try:
+                    os.mkdir(new_path)
+                except FileExistsError:
+                    self.message_var.set(f"Folder already exists: {new_path}")
+                    set_current_path(new_path)
+                    return
+                except Exception as exc:
+                    messagebox.showerror("Create Folder Failed", str(exc), parent=dialog)
+                    self.message_var.set(f"Could not create folder in {parent_path}: {exc}")
+                    return
+
+                self.message_var.set(f"Created folder: {new_path}")
+                refresh_roots()
+                set_current_path(new_path)
+            
             def choose_current() -> None:
                 current = current_path_var.get().strip()
                 if current:
@@ -3825,7 +3866,8 @@ def gui_main() -> int:
             folder_action_btn = ttk.Button(left_actions, text="Open Selected Folder", command=open_selected_child)
 
             ttk.Button(buttons, text="Up", command=go_up).pack(side="left", padx=(8, 0))
-            ttk.Button(buttons, text="Refresh", command=refresh_roots).pack(side="left", padx=(8, 0))
+            ttk.Button(buttons, text="↻", width=3, command=refresh_current_view).pack(side="left", padx=(8, 0))
+            ttk.Button(buttons, text="New Folder", command=create_current_folder).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Choose This Folder", command=choose_current).pack(side="right")
             ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
 
