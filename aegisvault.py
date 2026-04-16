@@ -303,6 +303,58 @@ def safe_mount_component(value: str) -> str:
     cleaned = cleaned.strip(".-")
     return cleaned or "drive"
 
+_UDEVADM_LOCK_SUPPORTED: Optional[bool] = None
+
+
+def udevadm_lock_supported() -> bool:
+    global _UDEVADM_LOCK_SUPPORTED
+    if _UDEVADM_LOCK_SUPPORTED is not None:
+        return _UDEVADM_LOCK_SUPPORTED
+
+    binary = shutil.which("udevadm")
+    if not binary:
+        _UDEVADM_LOCK_SUPPORTED = False
+        return False
+
+    help_text = run_command_optional([binary, "--help"]).lower()
+    _UDEVADM_LOCK_SUPPORTED = (
+        "\nlock " in help_text
+        or "\n  lock " in help_text
+        or " udevadm lock " in help_text
+    )
+    return _UDEVADM_LOCK_SUPPORTED
+
+
+def run_blockdev_command(
+    cmd: List[str],
+    device: str,
+    check: bool = True,
+    capture: bool = True,
+) -> subprocess.CompletedProcess:
+    if udevadm_lock_supported():
+        return run_command(
+            ["udevadm", "lock", f"--device={device}", *cmd],
+            check=check,
+            capture=capture,
+        )
+    return run_command(cmd, check=check, capture=capture)
+
+
+def swapoff_device_tree(device: str) -> None:
+    disk = device_parent_disk(device) or device
+    active_swaps = [
+        line.strip()
+        for line in run_command_optional(
+            ["swapon", "--noheadings", "--raw", "--output", "NAME"]
+        ).splitlines()
+        if line.strip()
+    ]
+
+    for swap_device in active_swaps:
+        swap_real = canonical_block_device_path(swap_device)
+        if swap_real == disk or device_parent_disk(swap_real) == disk:
+            subprocess.run(["swapoff", swap_device], check=False, capture_output=True)
+
 def ensure_traversable_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     os.chmod(path, 0o755)
@@ -1869,27 +1921,14 @@ def ensure_device_tree_unmounted(device: str) -> None:
     subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
 
-def prepare_partition_for_filesystem(device: str, zero_mib: int = 8) -> None:
+def prepare_partition_for_filesystem(device: str) -> None:
+    ensure_device_tree_unmounted(device)
+
     subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
 
-    result = subprocess.run(
-        [
-            "dd",
-            "if=/dev/zero",
-            f"of={device}",
-            "bs=1M",
-            f"count={zero_mib}",
-            "conv=fsync,notrunc",
-            "status=none",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
-        raise AegisError(f"Failed to clear the beginning of {device}: {detail}")
+    if shutil.which("blkdiscard"):
+        subprocess.run(["blkdiscard", "-f", device], check=False, capture_output=True)
 
-    subprocess.run(["sync"], check=False, capture_output=True)
     subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
     subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
         
@@ -1930,20 +1969,26 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
         prepare_partition_for_filesystem(device)
 
         try:
-            run_command(cmd, check=True, capture=True)
+            run_blockdev_command(cmd, device, check=True, capture=True)
             subprocess.run(["sync"], check=False, capture_output=True)
             subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
             subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
             return
         except Exception as exc:
             last_error = exc
+            detail = str(exc)
+
             if attempt == attempts - 1:
-                detail = str(exc)
                 if "Input/output error" in detail:
                     raise AegisError(
-                        f"{detail} The target drive returned a low-level I/O error while formatting {device}."
+                        f"{detail} The selected USB drive is visible to Linux, "
+                        f"but it did not complete a required write/flush on {device}. "
+                        f"AegisVault only touched the selected target disk ({disk}). "
+                        f"Try one different USB port; if the same error returns, "
+                        f"replace the USB stick."
                     ) from exc
                 raise
+
             time.sleep(1.5 * (attempt + 1))
 
     if last_error:
@@ -1953,7 +1998,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     device = assert_safe_target_disk(device)
     ensure_recovery_builder_prereqs()
     unmount_device_tree(device)
-    subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
+    swapoff_device_tree(device)
 
     sgdisk_result = subprocess.run(
         ["sgdisk", "--zap-all", device],
@@ -1968,15 +2013,15 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
 
-    run_command(["wipefs", "-af", device], check=True, capture=True)
+    run_blockdev_command(["wipefs", "-af", device], device, check=True, capture=True)
     reread_partition_table(device)
 
-    run_command(["parted", "-s", device, "mklabel", "gpt"], check=True, capture=True)
-    run_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], check=True, capture=True)
-    run_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], check=True, capture=True)
-    run_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], check=True, capture=True)
-    run_command(["parted", "-s", device, "set", "2", "esp", "on"], check=True, capture=True)
-    run_command(["parted", "-s", device, "mkpart", "root", "ext4", "1027MiB", "100%"], check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "mklabel", "gpt"], device, check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], device, check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], device, check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], device, check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "set", "2", "esp", "on"], device, check=True, capture=True)
+    run_blockdev_command(["parted", "-s", device, "mkpart", "root", "ext4", "1027MiB", "100%"], device, check=True, capture=True)
 
     reread_partition_table(device)
 
