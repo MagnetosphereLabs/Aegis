@@ -950,13 +950,18 @@ def update_stage(stage: str) -> None:
 
 
 def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        check=check,
-        capture_output=capture,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            check=check,
+            capture_output=capture,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        cmd_text = " ".join(exc.cmd)
+        raise AegisError(f"{cmd_text} failed: {detail or f'exit status {exc.returncode}'}") from exc
 
 
 def run_command_optional(cmd: List[str]) -> str:
@@ -1152,6 +1157,8 @@ def ensure_recovery_builder_prereqs() -> None:
 def assert_safe_target_disk(device: str) -> None:
     if run_command_optional(["lsblk", "-ndo", "TYPE", device]).strip() != "disk":
         raise AegisError(f"Choose a whole-disk device like /dev/sdb, not {device}.")
+    if run_command_optional(["lsblk", "-ndo", "RO", device]).strip() == "1":
+        raise AegisError(f"{device} is read-only. Disable any write-protect switch or choose another drive.")
     if device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
@@ -1810,8 +1817,8 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     ensure_recovery_builder_prereqs()
     unmount_device_tree(device)
     subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
-    run_command(["sgdisk", "--zap-all", device], check=False, capture=True)
-    run_command(["wipefs", "-a", device], check=False, capture=True)
+    run_command(["sgdisk", "--zap-all", device], check=True, capture=True)
+    run_command(["wipefs", "-af", device], check=True, capture=True)
     run_command(["parted", "-s", device, "mklabel", "gpt"], check=True, capture=True)
     run_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], check=True, capture=True)
     run_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], check=True, capture=True)
