@@ -2197,12 +2197,35 @@ def create_recovery_usb(device: str) -> None:
             update_stage("Installing recovery environment packages")
             run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"], "apt-get update in recovery media")
             packages = [
-                "linux-image-amd64", "systemd-sysv", "grub-pc", "grub-efi-amd64",
-                "python3", "python3-tk", "python3-cryptography",
-                "xorg", "xinit", "openbox", "xterm", "dbus-x11",
-                "network-manager", "ca-certificates", "curl", "rsync", "openssh-client", "tar",
-                "parted", "dosfstools", "e2fsprogs", "btrfs-progs", "xfsprogs", "ntfs-3g", "exfatprogs",
-                "util-linux", "sudo"
+                "linux-image-amd64",
+                "systemd-sysv",
+                "grub-common",
+                "grub2-common",
+                "grub-pc-bin",
+                "grub-efi-amd64-bin",
+                "python3",
+                "python3-tk",
+                "python3-cryptography",
+                "xorg",
+                "xinit",
+                "openbox",
+                "xterm",
+                "dbus-x11",
+                "network-manager",
+                "ca-certificates",
+                "curl",
+                "rsync",
+                "openssh-client",
+                "tar",
+                "parted",
+                "dosfstools",
+                "e2fsprogs",
+                "btrfs-progs",
+                "xfsprogs",
+                "ntfs-3g",
+                "exfatprogs",
+                "util-linux",
+                "sudo",
             ]
             run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", *packages], "package install in recovery media")
 
