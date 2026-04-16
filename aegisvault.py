@@ -267,7 +267,7 @@ def is_external_backup_path(repo_path: str) -> bool:
 def prompt_new_recovery_password_cli() -> str:
     if not sys.stdin.isatty():
         raise AegisError(
-            "Provide --recovery-password for first encrypted setup when no interactive terminal is available."
+            "Provide --recovery-password for manual encrypted setup when no desktop env is available."
         )
 
     first = getpass.getpass("Create a password: ")
