@@ -2066,7 +2066,24 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
 
-    run_command(["wipefs", "-af", device], check=True, capture=True)
+    # Some USB sticks briefly disappear/reset after zap-all. Wait for the
+    # whole-disk node to become usable again instead of failing immediately.
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+        entry = find_block_device_entry(device)
+        if Path(device).exists() and entry and entry.get("type") == "disk":
+            size = int(entry.get("size") or 0)
+            if not bool(entry.get("read_only")) and size > 0:
+                break
+        time.sleep(0.5)
+    else:
+        raise AegisError(
+            f"{device} disappeared after sgdisk --zap-all. "
+            "Try unplugging and reconnecting the USB stick once; "
+            "if it repeats, the stick or its USB bridge is unstable."
+        )
+
     reread_partition_table(device)
 
     last_error: Optional[Exception] = None
@@ -2076,6 +2093,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
         try:
             write_recovery_gpt_layout(device)
+            last_error = None
             break
         except Exception as exc:
             last_error = exc
@@ -2092,7 +2110,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
                 raise
             time.sleep(1.5 * (attempt + 1))
 
-    if last_error and not Path(disk_partition_path(device, 3)).exists():
+    if last_error is not None:
         raise last_error
 
     reread_partition_table(device)
