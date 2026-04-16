@@ -2584,10 +2584,6 @@ def gui_main() -> int:
             self.recovery_usb_device_var = tk.StringVar(value="")
             self.guided_target_disk_var = tk.StringVar(value="")
 
-            self.notifications_enabled_var = tk.BooleanVar(value=True)
-            self.default_backup_profile_var = tk.StringVar(value="both")
-            self.storage_choice_var = tk.StringVar(value="")
-
             self.peer_label_var = tk.StringVar()
             self.peer_target_var = tk.StringVar()
             self.peer_repo_var = tk.StringVar(value=DEFAULT_REPO)
@@ -2599,11 +2595,9 @@ def gui_main() -> int:
             self.recovery_mode = is_recovery_environment()
             self.ui_configured_state: Optional[bool] = None
             self.repo_candidates: List[str] = []
-            self.storage_choices: List[str] = []
             self.usb_choice_map: Dict[str, str] = {}
             self.guided_disk_map: Dict[str, str] = {}
             self.recovery_mounts: List[str] = []
-            self.activity_bar_running = False
 
             self.storage_choices: List[str] = []
             self.activity_bar_running = False
@@ -2654,8 +2648,6 @@ def gui_main() -> int:
             self.activity_bar = ttk.Progressbar(footer, mode="indeterminate", length=180)
             self.activity_bar.pack(side="right")
 
-            self.activity_bar = ttk.Progressbar(footer, mode="indeterminate", length=180)
-            self.activity_bar.pack(side="right")
             if self.recovery_mode and os.geteuid() == 0:
                 try:
                     self.recovery_mounts = auto_mount_recovery_sources()
@@ -3217,6 +3209,26 @@ def gui_main() -> int:
             if value:
                 variable.set(value)
 
+        def refresh_local_device_lists(self) -> None:
+            try:
+                usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
+                guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
+
+                self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
+                self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
+
+                if hasattr(self, "recovery_usb_combo"):
+                    self.recovery_usb_combo.configure(values=list(self.usb_choice_map.keys()))
+                if hasattr(self, "guided_disk_combo"):
+                    self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
+
+                if usb_choices and self.recovery_usb_device_var.get() not in self.usb_choice_map:
+                    self.recovery_usb_device_var.set(usb_choices[0]["display"])
+                if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
+                    self.guided_target_disk_var.set(guided_choices[0]["display"])
+            except Exception as exc:
+                self.message_var.set(str(exc))
+        
         def refresh_backup_location_suggestions(self) -> None:
             try:
                 self.storage_choices = discover_backup_location_choices()
