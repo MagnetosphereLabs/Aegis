@@ -440,7 +440,6 @@ def host_service_unit_text() -> str:
         RestartSec=5
         WorkingDirectory=/var/lib/aegisvault
         UMask=0077
-        PrivateMounts=yes
         {load_cred_line}
 
         [Install]
