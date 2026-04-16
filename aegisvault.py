@@ -56,6 +56,7 @@ LOG_LIMIT = 250
 RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
 RECOVERY_MOUNT_ROOT = Path("/mnt/aegisvault-recovery")
 AUTO_MOUNT_ROOT = Path("/media/aegisvault")
+BACKUP_BROWSE_MOUNT_ROOT = Path("/media/aegisvault-browser")
 DEFAULT_RECOVERY_SUITE = "bookworm"
 DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
 DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
@@ -296,6 +297,62 @@ def ensure_repo_path_ready(repo_path: str) -> None:
             "The selected backup drive is not mounted. Reconnect it and choose the mounted folder again."
         )
     Path(repo_path).mkdir(parents=True, exist_ok=True)
+
+def safe_mount_component(value: str) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in (value or "").strip())
+    cleaned = cleaned.strip(".-")
+    return cleaned or "drive"
+
+
+def mount_backup_browser_device(device: str) -> str:
+    ensure_root()
+    device = str(device or "").strip()
+    if not device:
+        raise AegisError("Choose a drive first.")
+
+    entries = list_block_devices()
+    entry = next((item for item in entries if item.get("path") == device), None)
+    if not entry or entry.get("type") not in {"part", "disk"}:
+        raise AegisError("Choose a mountable drive or partition.")
+
+    existing_mounts = [os.path.abspath(mp) for mp in (entry.get("mountpoints") or []) if mp]
+    if existing_mounts:
+        return existing_mounts[0]
+
+    fstype = (entry.get("fstype") or "").strip()
+    if not fstype or fstype in {"swap", "crypto_LUKS", "LVM2_member"}:
+        raise AegisError("That drive is not a mountable filesystem.")
+
+    base_name = safe_mount_component(entry.get("label") or entry.get("name") or Path(device).name)
+    BACKUP_BROWSE_MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    mountpoint = BACKUP_BROWSE_MOUNT_ROOT / base_name
+    suffix = 2
+    while mountpoint.exists():
+        if mountpoint.is_mount():
+            return str(mountpoint)
+        mountpoint = BACKUP_BROWSE_MOUNT_ROOT / f"{base_name}-{suffix}"
+        suffix += 1
+
+    mountpoint.mkdir(parents=True, exist_ok=True)
+
+    try:
+        result = subprocess.run(
+            ["mount", device, str(mountpoint)],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(mountpoint, ignore_errors=True)
+        raise AegisError(f"Mount timed out for {device}.") from exc
+
+    if result.returncode != 0:
+        shutil.rmtree(mountpoint, ignore_errors=True)
+        detail = result.stderr.strip() or result.stdout.strip() or "mount failed"
+        raise AegisError(f"Could not mount {device}: {detail}")
+
+    return str(mountpoint)
 
 
 def discover_backup_location_choices() -> List[Dict[str, str]]:
@@ -2290,6 +2347,16 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
             settings.full_excludes = default_full_excludes(settings.repo_path)
         save_settings(settings)
         return {"ok": True, "message": f"Backup location set to {repo_path}."}
+    if action == "mount_backup_device":
+        device = str(request.get("device") or "").strip()
+        if not device:
+            raise AegisError("Choose a drive first.")
+        mountpoint = mount_backup_browser_device(device)
+        return {
+            "ok": True,
+            "mountpoint": mountpoint,
+            "message": f"Mounted {device} at {mountpoint}.",
+        }
     if action == "run_create_recovery_usb":
         device = str(request.get("device") or "").strip()
         if not device:
@@ -2850,7 +2917,6 @@ def gui_main() -> int:
                 except Exception:
                     self.recovery_mounts = []
             self.refresh_local_device_lists()
-            self.refresh_backup_location_suggestions()
             self.scan_repository_candidates(auto_use=False)
             if self.recovery_mode:
                 hint = "Recovery mode: use Guided Full Restore for the easiest same-machine disaster restore."
@@ -3022,57 +3088,55 @@ def gui_main() -> int:
 
             ttk.Label(frame, text="Backups drive or folder").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(frame, textvariable=self.repo_path_var, width=54).grid(row=3, column=1, sticky="ew", pady=(12, 0))
-            
+
             repo_buttons = ttk.Frame(frame)
             repo_buttons.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
-            ttk.Button(repo_buttons, text="Choose Drive or Folder", command=lambda: self.browse_directory(self.repo_path_var)).pack(side="left")
-            ttk.Button(repo_buttons, text="Refresh Drives", command=self.refresh_backup_location_suggestions).pack(side="left", padx=(8, 0))
-            
-            ttk.Label(frame, text="Detected backup drives").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            self.storage_choice_combo = ttk.Combobox(frame, textvariable=self.storage_choice_var, width=78, state="readonly")
-            self.storage_choice_combo.grid(row=4, column=1, sticky="ew", pady=(12, 0))
-            ttk.Button(frame, text="Use Selected Drive", command=self.apply_suggested_backup_location).grid(row=4, column=2, padx=(8, 0), pady=(12, 0))
-            
+            ttk.Button(
+                repo_buttons,
+                text="Choose Drive or Folder",
+                command=lambda: self.browse_directory(self.repo_path_var),
+            ).pack(side="left")
+
             ttk.Label(
                 frame,
-                text="Pick the drive root itself or open the drive and choose a folder inside it. A Windows-formatted drive is fine as long as Linux mounted it read/write.",
+                text="Use the chooser to browse folders, open already-mounted drives, or mount an unmounted external USB drive. A Windows-formatted drive is fine as long as Linux can mount it read/write.",
                 wraplength=1020,
                 style="Muted.TLabel",
-            ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            
-            ttk.Checkbutton(frame, text="Encrypt backups", variable=self.encryption_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 0))
+            ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+            ttk.Checkbutton(frame, text="Encrypt backups", variable=self.encryption_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(14, 0))
             ttk.Label(
                 frame,
                 text="This protects backup data at rest. To allow automatic backups, AegisVault keeps a local root-only unlock key on this machine.",
                 wraplength=1020,
                 style="Muted.TLabel",
-            ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(6, 0))
-            
-            ttk.Checkbutton(frame, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=8, column=0, columnspan=2, sticky="w", pady=(12, 0))
-            
-            ttk.Label(frame, text="Backup schedule").grid(row=9, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+            ttk.Checkbutton(frame, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Backup schedule").grid(row=8, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Combobox(
                 frame,
                 textvariable=self.schedule_preset_var,
                 values=["manual", "hourly", "daily", "weekly", "custom"],
                 width=18,
                 state="readonly",
-            ).grid(row=9, column=1, sticky="w", pady=(12, 0))
-            
-            ttk.Label(frame, text="Custom minutes").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(frame, textvariable=self.schedule_custom_var, width=12).grid(row=10, column=1, sticky="w", pady=(12, 0))
-            
-            ttk.Label(frame, text="I/O yield milliseconds per chunk").grid(row=11, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=11, column=1, sticky="w", pady=(12, 0))
-            
+            ).grid(row=8, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Custom minutes").grid(row=9, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.schedule_custom_var, width=12).grid(row=9, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="I/O yield milliseconds per chunk").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=10, column=1, sticky="w", pady=(12, 0))
+
             ttk.Checkbutton(
                 frame,
                 text="Apply package list after portable restore to /",
                 variable=self.apply_packages_var,
-            ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(12, 0))
-            
+            ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+
             buttons = ttk.Frame(frame)
-            buttons.grid(row=13, column=0, columnspan=3, sticky="w", pady=(22, 0))
+            buttons.grid(row=12, column=0, columnspan=3, sticky="w", pady=(22, 0))
             ttk.Button(buttons, text="Save Setup and Open App", command=self.complete_onboarding).pack(side="left")
 
         def apply_configuration_state(self, configured: bool) -> None:
@@ -3480,7 +3544,7 @@ def gui_main() -> int:
             initial_path = start_path if os.path.isdir(start_path) else "/"
             current_path_var = tk.StringVar(value=os.path.abspath(initial_path))
             result: Dict[str, Optional[str]] = {"path": None}
-            root_items: List[Tuple[str, str]] = []
+            root_items: List[Dict[str, str]] = []
             child_items: List[str] = []
 
             header = ttk.Frame(dialog, padding=16)
@@ -3488,7 +3552,7 @@ def gui_main() -> int:
             ttk.Label(header, text="Choose where backups live", style="Header.TLabel").pack(anchor="w")
             ttk.Label(
                 header,
-                text="Drives are listed on the left. Open a drive, then choose its root folder or drill into a subfolder.",
+                text="Select a drive or folder on the left. Unmounted external drives can be mounted from here.",
                 wraplength=900,
                 style="Muted.TLabel",
             ).pack(anchor="w", pady=(6, 0))
@@ -3499,7 +3563,7 @@ def gui_main() -> int:
             body.grid_columnconfigure(1, weight=2)
             body.grid_rowconfigure(1, weight=1)
 
-            ttk.Label(body, text="Drives and mount points").grid(row=0, column=0, sticky="w", pady=(0, 8))
+            ttk.Label(body, text="Drives and locations").grid(row=0, column=0, sticky="w", pady=(0, 8))
             ttk.Label(body, text="Folders in current location").grid(row=0, column=1, sticky="w", padx=(12, 0), pady=(0, 8))
 
             roots_frame = ttk.Frame(body)
@@ -3559,27 +3623,29 @@ def gui_main() -> int:
             current_entry.configure(state="readonly")
             current_entry.pack(side="left", fill="x", expand=True, padx=(12, 0))
 
-            def available_roots() -> List[Tuple[str, str]]:
-                rows: List[Tuple[str, str]] = []
-                seen: Set[str] = set()
+            def available_roots() -> List[Dict[str, str]]:
+                rows: List[Dict[str, str]] = []
+                seen_paths: Set[str] = set()
+                seen_devices: Set[str] = set()
                 root_disk = current_root_disk()
                 entries = list_block_devices()
                 entries_by_path = {entry.get("path", ""): entry for entry in entries}
 
                 for entry in entries:
-                    if entry.get("type") != "part":
+                    if entry.get("type") not in {"disk", "part"}:
                         continue
 
-                    mountpoints = [os.path.abspath(mp) for mp in (entry.get("mountpoints") or []) if mp]
-                    if not mountpoints:
+                    device_path = entry.get("path", "")
+                    if not device_path or device_path in seen_devices:
                         continue
+                    seen_devices.add(device_path)
 
-                    part_path = entry.get("path", "")
-                    parent_disk = device_parent_disk(part_path)
-                    if parent_disk == root_disk:
+                    parent_disk = device_parent_disk(device_path)
+                    if device_path == root_disk or parent_disk == root_disk:
                         continue
 
                     parent_entry = entries_by_path.get(parent_disk, {})
+                    mountpoints = [os.path.abspath(mp) for mp in (entry.get("mountpoints") or []) if mp]
                     is_external = (
                         bool(entry.get("removable"))
                         or entry.get("transport") == "usb"
@@ -3590,30 +3656,59 @@ def gui_main() -> int:
                     if not is_external:
                         continue
 
-                    label = entry.get("label") or parent_entry.get("model") or Path(part_path).name
-                    fs_name = entry.get("fstype") or "unknown fs"
+                    fstype = (entry.get("fstype") or "").strip()
+                    if not mountpoints and fstype in {"", "swap", "crypto_LUKS", "LVM2_member"}:
+                        continue
+
+                    label = (
+                        entry.get("label")
+                        or entry.get("model")
+                        or parent_entry.get("label")
+                        or parent_entry.get("model")
+                        or parent_entry.get("serial")
+                        or Path(device_path).name
+                    )
                     size_text = human_bytes(int(entry.get("size") or 0))
 
-                    for mountpoint in mountpoints:
-                        if mountpoint in seen:
-                            continue
-                        seen.add(mountpoint)
-                        rows.append((f"Drive: {label} | {fs_name} | {size_text} | {mountpoint}", mountpoint))
+                    if mountpoints:
+                        mountpoint = mountpoints[0]
+                        if mountpoint not in seen_paths:
+                            seen_paths.add(mountpoint)
+                            rows.append({
+                                "kind": "mounted",
+                                "label": f"Drive: {label} | {fstype or 'unknown fs'} | {size_text} | {mountpoint}",
+                                "path": mountpoint,
+                                "device": device_path,
+                            })
+                    else:
+                        rows.append({
+                            "kind": "unmounted",
+                            "label": f"Drive: {label} | {fstype or 'unknown fs'} | {size_text} | {device_path} | not mounted",
+                            "path": "",
+                            "device": device_path,
+                        })
 
                 for fallback in [os.path.abspath(initial_path), "/", "/media", "/mnt", "/run/media", str(Path.home())]:
-                    if os.path.isdir(fallback) and fallback not in seen:
-                        seen.add(fallback)
-                        rows.append((f"Folder: {fallback}", fallback))
+                    folder = os.path.abspath(fallback)
+                    if os.path.isdir(folder) and folder not in seen_paths:
+                        seen_paths.add(folder)
+                        rows.append({
+                            "kind": "folder",
+                            "label": f"Folder: {folder}",
+                            "path": folder,
+                            "device": "",
+                        })
 
-                rows.sort(key=lambda item: (0 if item[1].startswith(("/media", "/mnt", "/run/media")) else 1, item[0].lower()))
+                rows.sort(key=lambda item: (0 if item["label"].startswith("Drive:") else 1, item["label"].lower()))
                 return rows
 
             def refresh_roots() -> None:
                 roots_list.delete(0, "end")
                 root_items.clear()
                 root_items.extend(available_roots())
-                for label, _path in root_items:
-                    roots_list.insert("end", label)
+                for item in root_items:
+                    roots_list.insert("end", item["label"])
+                update_action_buttons()
 
             def set_current_path(path: str) -> None:
                 path = os.path.abspath(path)
@@ -3637,17 +3732,53 @@ def gui_main() -> int:
                     child_items.append(full)
                     children_list.insert("end", name)
 
-            def open_selected_root(event=None) -> None:
-                selection = roots_list.curselection()
-                if not selection:
-                    return
-                set_current_path(root_items[selection[0]][1])
+                children_list.selection_clear(0, "end")
+                update_action_buttons()
 
             def open_selected_child(event=None) -> None:
                 selection = children_list.curselection()
                 if not selection:
                     return
                 set_current_path(child_items[selection[0]])
+
+            def act_on_selected_root(event=None) -> None:
+                selection = roots_list.curselection()
+                if not selection:
+                    return
+
+                item = root_items[selection[0]]
+                kind = item["kind"]
+
+                if kind in {"mounted", "folder"}:
+                    set_current_path(item["path"])
+                    return
+
+                try:
+                    response = send_daemon_request({
+                        "action": "mount_backup_device",
+                        "device": item["device"],
+                    })
+                    if not response.get("ok"):
+                        raise AegisError(response.get("error", "Unknown daemon error"))
+
+                    mounted_path = str(response.get("mountpoint") or "").strip()
+                    if not mounted_path:
+                        raise AegisError("Mount completed, but no mount path was returned.")
+
+                    refresh_roots()
+                    set_current_path(mounted_path)
+
+                    for index, row in enumerate(root_items):
+                        if os.path.abspath(row.get("path", "")) == os.path.abspath(mounted_path):
+                            roots_list.selection_clear(0, "end")
+                            roots_list.selection_set(index)
+                            roots_list.activate(index)
+                            roots_list.see(index)
+                            break
+
+                    update_action_buttons()
+                except Exception as exc:
+                    messagebox.showerror("Mount failed", str(exc), parent=dialog)
 
             def go_up() -> None:
                 current = current_path_var.get().strip() or "/"
@@ -3660,17 +3791,49 @@ def gui_main() -> int:
                     result["path"] = current
                     dialog.destroy()
 
-            roots_list.bind("<Double-Button-1>", open_selected_root)
-            children_list.bind("<Double-Button-1>", open_selected_child)
-
             buttons = ttk.Frame(dialog, padding=(16, 0, 16, 16))
             buttons.pack(fill="x")
-            ttk.Button(buttons, text="Open Selected Drive", command=open_selected_root).pack(side="left")
-            ttk.Button(buttons, text="Open Selected Folder", command=open_selected_child).pack(side="left", padx=(8, 0))
+
+            left_actions = ttk.Frame(buttons)
+            left_actions.pack(side="left")
+
+            root_action_btn = ttk.Button(left_actions, text="Open Selected Drive", command=act_on_selected_root)
+            folder_action_btn = ttk.Button(left_actions, text="Open Selected Folder", command=open_selected_child)
+
             ttk.Button(buttons, text="Up", command=go_up).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Refresh", command=refresh_roots).pack(side="left", padx=(8, 0))
             ttk.Button(buttons, text="Choose This Folder", command=choose_current).pack(side="right")
             ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side="right", padx=(0, 8))
+
+            def update_action_buttons(event=None) -> None:
+                root_selection = roots_list.curselection()
+                if root_selection:
+                    item = root_items[root_selection[0]]
+                    if item["kind"] == "unmounted":
+                        root_action_btn.configure(text="Mount Selected Drive")
+                    elif item["kind"] == "folder":
+                        root_action_btn.configure(text="Open Selected Location")
+                    else:
+                        root_action_btn.configure(text="Open Selected Drive")
+
+                    if not root_action_btn.winfo_ismapped():
+                        root_action_btn.pack(side="left")
+                else:
+                    if root_action_btn.winfo_ismapped():
+                        root_action_btn.pack_forget()
+
+                child_selection = children_list.curselection()
+                if child_selection:
+                    if not folder_action_btn.winfo_ismapped():
+                        folder_action_btn.pack(side="left", padx=(8, 0))
+                else:
+                    if folder_action_btn.winfo_ismapped():
+                        folder_action_btn.pack_forget()
+
+            roots_list.bind("<<ListboxSelect>>", update_action_buttons)
+            children_list.bind("<<ListboxSelect>>", update_action_buttons)
+            roots_list.bind("<Double-Button-1>", act_on_selected_root)
+            children_list.bind("<Double-Button-1>", open_selected_child)
 
             refresh_roots()
             set_current_path(current_path_var.get())
