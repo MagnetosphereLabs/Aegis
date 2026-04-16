@@ -1855,36 +1855,96 @@ def reread_partition_table(device: str) -> None:
     subprocess.run(["partx", "-u", device], check=False, capture_output=True)
     subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
+def partition_is_mounted(device: str) -> bool:
+    entry = find_block_device_entry(device)
+    mountpoints = [mp for mp in ((entry or {}).get("mountpoints") or []) if mp]
+    if mountpoints:
+        return True
+    return bool(run_command_optional(["findmnt", "-rn", "-S", device]).strip())
 
-def wait_for_partition_ready(path: str, timeout_seconds: int = 30) -> None:
+
+def ensure_device_tree_unmounted(device: str) -> None:
+    disk = device_parent_disk(device) or device
+    unmount_device_tree(disk)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+
+def prepare_partition_for_filesystem(device: str, zero_mib: int = 8) -> None:
+    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
+
+    result = subprocess.run(
+        [
+            "dd",
+            "if=/dev/zero",
+            f"of={device}",
+            "bs=1M",
+            f"count={zero_mib}",
+            "conv=fsync,notrunc",
+            "status=none",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise AegisError(f"Failed to clear the beginning of {device}: {detail}")
+
+    subprocess.run(["sync"], check=False, capture_output=True)
+    subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+        
+def wait_for_partition_ready(path: str, timeout_seconds: int = 45) -> None:
+    disk = device_parent_disk(path) or path
     end = time.time() + timeout_seconds
+
     while time.time() < end:
         if Path(path).exists():
-            size_text = run_command_optional(["blockdev", "--getsize64", path]).strip()
-            if size_text.isdigit() and int(size_text) > 0:
-                return
-        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-        time.sleep(0.5)
+            entry = find_block_device_entry(path)
+            size = int((entry or {}).get("size") or 0)
+
+            if size <= 0:
+                size_text = run_command_optional(["blockdev", "--getsize64", path]).strip()
+                if size_text.isdigit():
+                    size = int(size_text)
+
+            if entry and entry.get("type") == "part" and not bool(entry.get("read_only")) and size > 0:
+                if partition_is_mounted(path):
+                    ensure_device_tree_unmounted(disk)
+                else:
+                    return
+
+        reread_partition_table(disk)
+        time.sleep(0.75)
+
     raise AegisError(f"Partition device did not become ready: {path}")
 
 
-def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 3) -> None:
+def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
     disk = device_parent_disk(device) or device
     last_error: Optional[Exception] = None
 
     for attempt in range(attempts):
+        ensure_device_tree_unmounted(disk)
         reread_partition_table(disk)
-        wait_for_partition_ready(device, timeout_seconds=30)
+        wait_for_partition_ready(device, timeout_seconds=45)
+        prepare_partition_for_filesystem(device)
 
         try:
             run_command(cmd, check=True, capture=True)
             subprocess.run(["sync"], check=False, capture_output=True)
+            subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
+            subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
             return
         except Exception as exc:
             last_error = exc
             if attempt == attempts - 1:
+                detail = str(exc)
+                if "Input/output error" in detail:
+                    raise AegisError(
+                        f"{detail} The target drive returned a low-level I/O error while formatting {device}."
+                    ) from exc
                 raise
-            time.sleep(1.0)
+            time.sleep(1.5 * (attempt + 1))
 
     if last_error:
         raise last_error
@@ -1924,19 +1984,21 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     efi_partition = disk_partition_path(device, 2)
     root_partition = disk_partition_path(device, 3)
 
-    wait_for_partition_ready(efi_partition, timeout_seconds=30)
-    wait_for_partition_ready(root_partition, timeout_seconds=30)
+    ensure_device_tree_unmounted(device)
+    wait_for_partition_ready(efi_partition, timeout_seconds=45)
+    wait_for_partition_ready(root_partition, timeout_seconds=45)
 
-    subprocess.run(["wipefs", "-af", efi_partition], check=False, capture_output=True)
-    subprocess.run(["wipefs", "-af", root_partition], check=False, capture_output=True)
+    update_stage("Formatting recovery USB filesystems")
 
     run_mkfs_with_retry(
         ["mkfs.vfat", "-F", "32", "-n", "AEGIS-EFI", efi_partition],
         efi_partition,
+        attempts=4,
     )
     run_mkfs_with_retry(
         ["mkfs.ext4", "-F", "-L", "AegisSystem", root_partition],
         root_partition,
+        attempts=4,
     )
 
     reread_partition_table(device)
