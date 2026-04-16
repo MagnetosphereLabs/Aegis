@@ -1813,21 +1813,48 @@ def apply_portable_post_restore(target: Path, metadata: SnapshotMetadata) -> Non
 
 @contextmanager
 def mounted_chroot_bindings(target: Path):
-    mounts: List[str] = []
-    pairs = [("/dev", target / "dev"), ("/proc", target / "proc"), ("/sys", target / "sys"), ("/run", target / "run")]
+    mounts: List[Tuple[str, Path]] = []
     try:
-        for source, dest in pairs:
-            dest.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["mount", "--bind", source, str(dest)], check=False, capture_output=True)
-            mounts.append(str(dest))
+        (target / "proc").mkdir(parents=True, exist_ok=True)
+        (target / "sys").mkdir(parents=True, exist_ok=True)
+        (target / "dev").mkdir(parents=True, exist_ok=True)
+        (target / "run").mkdir(parents=True, exist_ok=True)
+
+        run_command(["mount", "-t", "proc", "proc", str(target / "proc")], check=True, capture=True)
+        mounts.append(("plain", target / "proc"))
+
+        for source, dest in [
+            ("/sys", target / "sys"),
+            ("/dev", target / "dev"),
+            ("/run", target / "run"),
+        ]:
+            run_command(["mount", "--rbind", source, str(dest)], check=True, capture=True)
+            subprocess.run(["mount", "--make-rslave", str(dest)], check=False, capture_output=True)
+            mounts.append(("rbind", dest))
+
         yield
     finally:
-        for mount_path in reversed(mounts):
-            subprocess.run(["umount", "-lf", mount_path], check=False, capture_output=True)
+        for kind, mount_path in reversed(mounts):
+            if kind == "rbind":
+                subprocess.run(["umount", "-R", "-lf", str(mount_path)], check=False, capture_output=True)
+            else:
+                subprocess.run(["umount", "-lf", str(mount_path)], check=False, capture_output=True)
 
 
 def run_chroot(target: Path, args: List[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(["chroot", str(target), *args], check=False, capture_output=True, text=True)
+    clean_env = [
+        "HOME=/root",
+        "TERM=xterm",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "LANG=C",
+        "LC_ALL=C",
+    ]
+    return subprocess.run(
+        ["chroot", str(target), "/usr/bin/env", "-i", *clean_env, *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def run_chroot_checked(target: Path, args: List[str], label: Optional[str] = None) -> subprocess.CompletedProcess:
@@ -2193,6 +2220,12 @@ def create_recovery_usb(device: str) -> None:
         if Path("/etc/resolv.conf").exists():
             shutil.copy2("/etc/resolv.conf", mount_root / "etc/resolv.conf")
         (mount_root / "var/lib/aegisvault/keys").mkdir(parents=True, exist_ok=True)
+        try:
+            probe = mount_root / ".aegisvault-write-test"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+        except OSError as exc:
+            raise AegisError(f"Recovery USB target is not writable before package install: {exc}")
         with mounted_chroot_bindings(mount_root):
             update_stage("Installing recovery environment packages")
             run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"], "apt-get update in recovery media")
@@ -2227,7 +2260,31 @@ def create_recovery_usb(device: str) -> None:
                 "util-linux",
                 "sudo",
             ]
-            run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", *packages], "package install in recovery media")
+            try:
+                run_chroot_checked(
+                    mount_root,
+                    [
+                        "/usr/bin/env",
+                        "DEBIAN_FRONTEND=noninteractive",
+                        "apt-get",
+                        "-o",
+                        "Dpkg::Use-Pty=0",
+                        "install",
+                        "-y",
+                        *packages,
+                    ],
+                    "package install in recovery media",
+                )
+            except AegisError as exc:
+                detail = str(exc)
+                if "Read-only file system" in detail:
+                    raise AegisError(
+                        "package install in recovery media failed because the target recovery USB "
+                        "filesystem became read-only during installation. The locale and /dev/pts "
+                        "warnings are not the real failure. Try the same job once with a different "
+                        "USB port or a different USB stick."
+                    ) from exc
+                raise
 
             update_stage("Configuring recovery environment")
             (mount_root / "opt/aegisvault").mkdir(parents=True, exist_ok=True)
