@@ -1811,40 +1811,106 @@ def wait_for_partition_device(path: str, timeout_seconds: int = 20) -> None:
         time.sleep(0.5)
     raise AegisError(f"Partition device did not appear: {path}")
 
+def reread_partition_table(device: str) -> None:
+    subprocess.run(["sync"], check=False, capture_output=True)
+    subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
+    subprocess.run(["blockdev", "--rereadpt", device], check=False, capture_output=True)
+    subprocess.run(["partprobe", device], check=False, capture_output=True)
+    subprocess.run(["partx", "-u", device], check=False, capture_output=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
+
+def wait_for_partition_ready(path: str, timeout_seconds: int = 30) -> None:
+    end = time.time() + timeout_seconds
+    while time.time() < end:
+        if Path(path).exists():
+            size_text = run_command_optional(["blockdev", "--getsize64", path]).strip()
+            if size_text.isdigit() and int(size_text) > 0:
+                return
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+        time.sleep(0.5)
+    raise AegisError(f"Partition device did not become ready: {path}")
+
+
+def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 3) -> None:
+    disk = device_parent_disk(device) or device
+    last_error: Optional[Exception] = None
+
+    for attempt in range(attempts):
+        reread_partition_table(disk)
+        wait_for_partition_ready(device, timeout_seconds=30)
+
+        try:
+            run_command(cmd, check=True, capture=True)
+            subprocess.run(["sync"], check=False, capture_output=True)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1.0)
+
+    if last_error:
+        raise last_error
+        
 def guided_partition_disk(device: str) -> Dict[str, str]:
     assert_safe_target_disk(device)
     ensure_recovery_builder_prereqs()
     unmount_device_tree(device)
     subprocess.run(["swapoff", "-a"], check=False, capture_output=True)
+
     sgdisk_result = subprocess.run(
         ["sgdisk", "--zap-all", device],
         capture_output=True,
         text=True,
     )
     if sgdisk_result.returncode not in (0, 2, 3):
-        detail = sgdisk_result.stderr.strip() or sgdisk_result.stdout.strip() or f"exit status {sgdisk_result.returncode}"
+        detail = (
+            sgdisk_result.stderr.strip()
+            or sgdisk_result.stdout.strip()
+            or f"exit status {sgdisk_result.returncode}"
+        )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
-    
+
     run_command(["wipefs", "-af", device], check=True, capture=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+    reread_partition_table(device)
+
     run_command(["parted", "-s", device, "mklabel", "gpt"], check=True, capture=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
     run_command(["parted", "-s", device, "mkpart", "bios_grub", "1MiB", "3MiB"], check=True, capture=True)
     run_command(["parted", "-s", device, "set", "1", "bios_grub", "on"], check=True, capture=True)
     run_command(["parted", "-s", device, "mkpart", "ESP", "fat32", "3MiB", "1027MiB"], check=True, capture=True)
     run_command(["parted", "-s", device, "set", "2", "esp", "on"], check=True, capture=True)
     run_command(["parted", "-s", device, "mkpart", "root", "ext4", "1027MiB", "100%"], check=True, capture=True)
-    subprocess.run(["partprobe", device], check=False, capture_output=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+    reread_partition_table(device)
+
     bios_partition = disk_partition_path(device, 1)
     efi_partition = disk_partition_path(device, 2)
     root_partition = disk_partition_path(device, 3)
-    wait_for_partition_device(efi_partition)
-    wait_for_partition_device(root_partition)
-    run_command(["mkfs.vfat", "-F", "32", "-n", "AEGIS-EFI", efi_partition], check=True, capture=True)
-    run_command(["mkfs.ext4", "-F", "-L", "AegisSystem", root_partition], check=True, capture=True)
-    return {"disk": device, "bios": bios_partition, "efi": efi_partition, "root": root_partition}
+
+    wait_for_partition_ready(efi_partition, timeout_seconds=30)
+    wait_for_partition_ready(root_partition, timeout_seconds=30)
+
+    subprocess.run(["wipefs", "-af", efi_partition], check=False, capture_output=True)
+    subprocess.run(["wipefs", "-af", root_partition], check=False, capture_output=True)
+
+    run_mkfs_with_retry(
+        ["mkfs.vfat", "-F", "32", "-n", "AEGIS-EFI", efi_partition],
+        efi_partition,
+    )
+    run_mkfs_with_retry(
+        ["mkfs.ext4", "-F", "-L", "AegisSystem", root_partition],
+        root_partition,
+    )
+
+    reread_partition_table(device)
+
+    return {
+        "disk": device,
+        "bios": bios_partition,
+        "efi": efi_partition,
+        "root": root_partition,
+    }
 
 
 @contextmanager
