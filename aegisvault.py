@@ -1408,6 +1408,7 @@ def ensure_recovery_builder_prereqs() -> None:
     ensure_host_packages([
         "debootstrap",
         "parted",
+        "fdisk",
         "dosfstools",
         "gdisk",
         "grub-pc-bin",
@@ -2360,45 +2361,44 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
 def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
     target = canonical_block_device_path(device) or device
-    parted_bin = shutil.which("parted")
-    if not parted_bin:
-        raise AegisError("parted is required to create the recovery USB layout.")
 
-    # One single parted process so we do not hit the old bug where mklabel
-    # succeeds and a later fresh parted invocation sees a transient bogus size.
-    cmd = [
-        parted_bin,
-        "-s",
-        "-a",
-        "optimal",
-        target,
-        "mklabel",
-        "msdos",
-        "mkpart",
-        "primary",
-        "fat32",
-        "1MiB",
-        "513MiB",
-        "set",
-        "1",
-        "boot",
-        "on",
-        "mkpart",
-        "primary",
-        "ext4",
-        "513MiB",
-        "100%",
-    ]
+    sfdisk_bin = shutil.which("sfdisk")
+    if not sfdisk_bin:
+        for candidate in (
+            "/usr/sbin/sfdisk",
+            "/sbin/sfdisk",
+            "/usr/bin/sfdisk",
+            "/bin/sfdisk",
+        ):
+            if Path(candidate).exists():
+                sfdisk_bin = candidate
+                break
+
+    if not sfdisk_bin:
+        raise AegisError(
+            "sfdisk is required to create the recovery USB layout. "
+            "Install the fdisk package."
+        )
+
+    layout_script = textwrap.dedent("""\
+    label: dos
+    unit: MiB
+
+    1 : start=1, size=512, type=c, bootable
+    2 : start=513, type=83
+    """)
 
     last_detail = ""
     for attempt in range(3):
         wait_for_expected_disk_size(target, expected_size, timeout_seconds=25)
         ensure_device_tree_unmounted(target)
 
-        subprocess.run(["wipefs", "-af", target], check=False, capture_output=True)
-        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(
+            [sfdisk_bin, "--wipe", "always", target],
+            input=layout_script,
+            text=True,
+            capture_output=True,
+        )
 
         parts: List[str] = []
         if result.stdout and result.stdout.strip():
@@ -2417,7 +2417,7 @@ def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
         time.sleep(1.5 * (attempt + 1))
 
-    raise AegisError(f"{' '.join(cmd)} failed: {last_detail}")
+    raise AegisError(f"{sfdisk_bin} recovery USB layout failed on {target}: {last_detail}")
 
 
 def partition_recovery_usb_disk(device: str) -> Dict[str, str]:
