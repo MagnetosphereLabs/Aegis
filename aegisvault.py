@@ -2360,19 +2360,49 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
 def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
     target = canonical_block_device_path(device) or device
-    wait_for_expected_disk_size(target, expected_size, timeout_seconds=25)
 
-    commands = [
-        ["parted", "-s", "-a", "optimal", target, "mklabel", "msdos"],
-        ["parted", "-s", "-a", "optimal", target, "mkpart", "primary", "fat32", "1MiB", "1025MiB"],
-        ["parted", "-s", target, "set", "1", "boot", "on"],
-        ["parted", "-s", "-a", "optimal", target, "mkpart", "primary", "ext4", "1025MiB", "100%"],
-    ]
+    # One partition-table write in one tool invocation.
+    # Partition 1 starts at 1 MiB so BIOS grub has embedding room.
+    # 512 MiB FAT32 is plenty for removable UEFI boot files and gives the root
+    # partition more space on small 8 GB sticks.
+    layout_script = textwrap.dedent("""\
+    label: dos
+    unit: MiB
 
-    for cmd in commands:
-        run_command(cmd, check=True, capture=True)
+    1 : start=1, size=512, type=c, bootable
+    2 : start=513, type=83
+    """)
 
-    reread_partition_table(target)
+    last_detail = ""
+    for attempt in range(3):
+        wait_for_expected_disk_size(target, expected_size, timeout_seconds=25)
+        ensure_device_tree_unmounted(target)
+
+        subprocess.run(["wipefs", "-af", target], check=False, capture_output=True)
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+        result = subprocess.run(
+            ["sfdisk", "--wipe", "always", target],
+            input=layout_script,
+            text=True,
+            capture_output=True,
+        )
+
+        parts: List[str] = []
+        if result.stdout and result.stdout.strip():
+            parts.append(result.stdout.strip())
+        if result.stderr and result.stderr.strip():
+            parts.append(result.stderr.strip())
+        detail = "\n".join(parts).strip()
+        last_detail = detail or f"exit status {result.returncode}"
+
+        if result.returncode == 0:
+            reread_partition_table(target)
+            return
+
+        time.sleep(1.5 * (attempt + 1))
+
+    raise AegisError(f"sfdisk recovery USB layout failed on {target}: {last_detail}")
 
 
 def partition_recovery_usb_disk(device: str) -> Dict[str, str]:
