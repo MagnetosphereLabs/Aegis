@@ -1188,7 +1188,9 @@ def observed_block_device_size_bytes(device: str) -> int:
             pass
 
     positive = [value for value in sizes if value > 0]
-    return min(positive) if positive else 0
+    # During USB repartition/rescan, one observer can lag low briefly.
+    # Do not let a single stale size veto a sane current device.
+    return max(positive) if positive else 0
 
 def _usable_block_device_node(path: Path, expected_major: int, expected_minor: int) -> bool:
     try:
@@ -1356,6 +1358,7 @@ def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds
 def capture_block_device_identity(device: str) -> Dict[str, Any]:
     entry = find_block_device_entry(device) or {}
     stable = stable_disk_device_path(device)
+    observed_size = observed_block_device_size_bytes(stable or device)
 
     return {
         "requested_path": str(device or "").strip(),
@@ -1363,7 +1366,7 @@ def capture_block_device_identity(device: str) -> Dict[str, Any]:
         "real_path": canonical_block_device_path(device),
         "serial": str(entry.get("serial") or ""),
         "model": str(entry.get("model") or ""),
-        "size": int(entry.get("size") or 0),
+        "size": observed_size or int(entry.get("size") or 0),
         "transport": str(entry.get("transport") or ""),
         "removable": bool(entry.get("removable", False)),
     }
@@ -1583,7 +1586,8 @@ def assert_safe_target_disk(device: str) -> str:
     if real_device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
-    return ensure_block_device_node(real_device, timeout_seconds=5)
+    identity = capture_block_device_identity(real_device)
+    return resolve_block_device_from_identity(identity, timeout_seconds=30)
 
 
 RECOVERY_PASSWORD_REQUIRED_ERROR = (
