@@ -2360,18 +2360,35 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
 def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
     target = canonical_block_device_path(device) or device
+    parted_bin = shutil.which("parted")
+    if not parted_bin:
+        raise AegisError("parted is required to create the recovery USB layout.")
 
-    # One partition-table write in one tool invocation.
-    # Partition 1 starts at 1 MiB so BIOS grub has embedding room.
-    # 512 MiB FAT32 is plenty for removable UEFI boot files and gives the root
-    # partition more space on small 8 GB sticks.
-    layout_script = textwrap.dedent("""\
-    label: dos
-    unit: MiB
-
-    1 : start=1, size=512, type=c, bootable
-    2 : start=513, type=83
-    """)
+    # One single parted process so we do not hit the old bug where mklabel
+    # succeeds and a later fresh parted invocation sees a transient bogus size.
+    cmd = [
+        parted_bin,
+        "-s",
+        "-a",
+        "optimal",
+        target,
+        "mklabel",
+        "msdos",
+        "mkpart",
+        "primary",
+        "fat32",
+        "1MiB",
+        "513MiB",
+        "set",
+        "1",
+        "boot",
+        "on",
+        "mkpart",
+        "primary",
+        "ext4",
+        "513MiB",
+        "100%",
+    ]
 
     last_detail = ""
     for attempt in range(3):
@@ -2381,12 +2398,7 @@ def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
         subprocess.run(["wipefs", "-af", target], check=False, capture_output=True)
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
-        result = subprocess.run(
-            ["sfdisk", "--wipe", "always", target],
-            input=layout_script,
-            text=True,
-            capture_output=True,
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
         parts: List[str] = []
         if result.stdout and result.stdout.strip():
@@ -2400,9 +2412,12 @@ def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
             reread_partition_table(target)
             return
 
+        subprocess.run(["blockdev", "--rereadpt", target], check=False, capture_output=True)
+        subprocess.run(["partprobe", target], check=False, capture_output=True)
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
         time.sleep(1.5 * (attempt + 1))
 
-    raise AegisError(f"sfdisk recovery USB layout failed on {target}: {last_detail}")
+    raise AegisError(f"{' '.join(cmd)} failed: {last_detail}")
 
 
 def partition_recovery_usb_disk(device: str) -> Dict[str, str]:
