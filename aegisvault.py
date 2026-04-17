@@ -1000,7 +1000,6 @@ def update_stage(stage: str) -> None:
             RUNTIME.current_job.stage = stage
     log_line(stage)
 
-
 def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -1011,7 +1010,12 @@ def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: O
             text=True,
         )
     except subprocess.CalledProcessError as exc:
-        detail = (exc.stderr or exc.stdout or "").strip()
+        parts: List[str] = []
+        if exc.stdout and exc.stdout.strip():
+            parts.append(exc.stdout.strip())
+        if exc.stderr and exc.stderr.strip():
+            parts.append(exc.stderr.strip())
+        detail = "\n".join(parts).strip()
         cmd_text = " ".join(exc.cmd)
         raise AegisError(f"{cmd_text} failed: {detail or f'exit status {exc.returncode}'}") from exc
 
@@ -2143,24 +2147,63 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
         raise last_error
         
 def write_recovery_gpt_layout(device: str) -> None:
-    run_command(
-        [
-            "sgdisk",
-            "--clear",
-            "--new=1:1M:+2M",
-            "--typecode=1:ef02",
-            "--change-name=1:bios_grub",
-            "--new=2:0:+1024M",
-            "--typecode=2:ef00",
-            "--change-name=2:ESP",
-            "--new=3:0:0",
-            "--typecode=3:8300",
-            "--change-name=3:root",
-            device,
-        ],
-        check=True,
-        capture=True,
-    )
+    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+    cmd = [
+        "sgdisk",
+        "--clear",
+        "--new=1:1M:+2M",
+        "--typecode=1:ef02",
+        "--change-name=1:bios_grub",
+        "--new=2:0:+1024M",
+        "--typecode=2:ef00",
+        "--change-name=2:ESP",
+        "--new=3:0:0",
+        "--typecode=3:8300",
+        "--change-name=3:root",
+        device,
+    ]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    reread_partition_table(device)
+
+    bios_partition = disk_partition_path(device, 1)
+    efi_partition = disk_partition_path(device, 2)
+    root_partition = disk_partition_path(device, 3)
+
+    # Some removable media report damaged old backup GPT metadata and sgdisk
+    # exits non-zero even though the fresh layout was written. If the requested
+    # partitions now exist, treat that as success and continue.
+    if result.returncode == 2:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+            reread_partition_table(device)
+
+            bios_entry = find_block_device_entry(bios_partition)
+            efi_entry = find_block_device_entry(efi_partition)
+            root_entry = find_block_device_entry(root_partition)
+
+            if (
+                bios_entry and bios_entry.get("type") == "part" and
+                efi_entry and efi_entry.get("type") == "part" and
+                root_entry and root_entry.get("type") == "part"
+            ):
+                return
+
+            time.sleep(0.5)
+
+    parts: List[str] = []
+    if result.stdout and result.stdout.strip():
+        parts.append(result.stdout.strip())
+    if result.stderr and result.stderr.strip():
+        parts.append(result.stderr.strip())
+    detail = "\n".join(parts).strip() or f"exit status {result.returncode}"
+    raise AegisError(f"{' '.join(cmd)} failed: {detail}")
 
 
 def guided_partition_disk(device: str) -> Dict[str, str]:
@@ -2185,7 +2228,9 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         )
         raise AegisError(f"sgdisk --zap-all {device} failed: {detail}")
 
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
     device = resolve_block_device_from_identity(identity, timeout_seconds=30)
+    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
     reread_partition_table(device)
 
     last_error: Optional[Exception] = None
