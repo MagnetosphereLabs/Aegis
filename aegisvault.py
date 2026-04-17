@@ -1159,6 +1159,65 @@ def stable_disk_device_path(device: str) -> str:
     return candidates[0] if candidates else real
 
 
+def observed_block_device_size_bytes(device: str) -> int:
+    real = canonical_block_device_path(device)
+    if not real:
+        return 0
+
+    sizes: List[int] = []
+
+    blockdev_text = run_command_optional(["blockdev", "--getsize64", real]).strip()
+    if blockdev_text.isdigit():
+        sizes.append(int(blockdev_text))
+
+    entry = find_block_device_entry(real) or {}
+    entry_size = int(entry.get("size") or 0)
+    if entry_size > 0:
+        sizes.append(entry_size)
+
+    sysfs_size_path = Path("/sys/class/block") / Path(real).name / "size"
+    if sysfs_size_path.exists():
+        try:
+            raw = sysfs_size_path.read_text(encoding="utf-8", errors="ignore").strip()
+            if raw.isdigit():
+                sizes.append(int(raw) * 512)
+        except Exception:
+            pass
+
+    positive = [value for value in sizes if value > 0]
+    return min(positive) if positive else 0
+
+
+def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds: int = 25) -> int:
+    real = canonical_block_device_path(device) or device
+    end = time.time() + timeout_seconds
+    last_seen = 0
+
+    minimum_acceptable = (
+        max(expected_size - (64 * 1024 * 1024), expected_size // 2)
+        if expected_size > 0
+        else 64 * 1024 * 1024
+    )
+
+    while time.time() < end:
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+        last_seen = observed_block_device_size_bytes(real)
+        if last_seen >= minimum_acceptable:
+            return last_seen
+
+        subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
+        subprocess.run(["partprobe", real], check=False, capture_output=True)
+        time.sleep(0.5)
+
+    expected_text = human_bytes(expected_size) if expected_size > 0 else "its expected size"
+    seen_text = human_bytes(last_seen) if last_seen > 0 else "0 B"
+    raise AegisError(
+        f"{real} is still reporting an invalid transient size ({seen_text}) instead of {expected_text}. "
+        "Refusing to partition until the kernel reports the real USB capacity."
+    )
+
+
 def capture_block_device_identity(device: str) -> Dict[str, Any]:
     entry = find_block_device_entry(device) or {}
     stable = stable_disk_device_path(device)
@@ -1174,14 +1233,17 @@ def capture_block_device_identity(device: str) -> Dict[str, Any]:
         "removable": bool(entry.get("removable", False)),
     }
 
-
 def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds: int = 20) -> str:
     deadline = time.time() + max(1, timeout_seconds)
+    expected_size = int(identity.get("size") or 0)
+    minimum_acceptable = (
+        max(expected_size - (64 * 1024 * 1024), expected_size // 2)
+        if expected_size > 0
+        else 64 * 1024 * 1024
+    )
 
     while time.time() < deadline:
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-
-        expected_size = int(identity.get("size") or 0)
 
         for candidate in (
             str(identity.get("stable_path") or "").strip(),
@@ -1197,22 +1259,14 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
             if entry.get("type") != "disk" or bool(entry.get("read_only")):
                 continue
 
-            entry_size = int(entry.get("size") or 0)
-
-            # Some USB devices briefly reappear with a bogus tiny size right after
-            # zap/reread. Do not accept the disk until it reports a sane size again.
-            if expected_size > 0:
-                minimum_acceptable = max(expected_size - (64 * 1024 * 1024), expected_size // 2)
-                if entry_size < minimum_acceptable:
-                    continue
-            elif entry_size <= 16 * 1024 * 1024:
+            observed_size = observed_block_device_size_bytes(candidate)
+            if observed_size < minimum_acceptable:
                 continue
 
             return stable_disk_device_path(entry.get("path") or candidate)
 
         serial = str(identity.get("serial") or "")
         model = str(identity.get("model") or "")
-        size = int(identity.get("size") or 0)
         transport = str(identity.get("transport") or "")
         removable = bool(identity.get("removable", False))
 
@@ -1222,8 +1276,6 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
                 continue
             if bool(entry.get("read_only")):
                 continue
-            if size > 0 and int(entry.get("size") or 0) != size:
-                continue
             if serial and str(entry.get("serial") or "") != serial:
                 continue
             if not serial and model and str(entry.get("model") or "") != model:
@@ -1232,21 +1284,15 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
                 continue
             if bool(entry.get("removable", False)) != removable:
                 continue
+
+            observed_size = observed_block_device_size_bytes(entry.get("path", ""))
+            if observed_size < minimum_acceptable:
+                continue
+
             matches.append(entry)
 
-        sane_matches: List[Dict[str, Any]] = []
-        for match in matches:
-            match_size = int(match.get("size") or 0)
-            if size > 0:
-                minimum_acceptable = max(size - (64 * 1024 * 1024), size // 2)
-                if match_size < minimum_acceptable:
-                    continue
-            elif match_size <= 16 * 1024 * 1024:
-                continue
-            sane_matches.append(match)
-
-        if len(sane_matches) == 1:
-            return stable_disk_device_path(sane_matches[0].get("path", ""))
+        if len(matches) == 1:
+            return stable_disk_device_path(matches[0].get("path", ""))
 
         time.sleep(0.5)
 
@@ -1257,8 +1303,8 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
         or "the selected USB disk"
     )
     raise AegisError(
-        f"{label} did not come back after the kernel rescanned block devices. "
-        "If the stick is still present, Linux may have renumbered it and could not match it unambiguously."
+        f"{label} did not come back after the kernel rescanned block devices with a sane capacity. "
+        "If the stick is still present, Linux may have renumbered it or is still reporting a transient bogus size."
     )
 
 def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
@@ -2173,7 +2219,9 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
     if last_error:
         raise last_error
         
-def write_recovery_gpt_layout(device: str) -> None:
+def write_recovery_gpt_layout(device: str, expected_size: int = 0) -> None:
+    target = canonical_block_device_path(device) or device
+
     cmd = [
         "sgdisk",
         "--new=1:1M:+2M",
@@ -2185,29 +2233,37 @@ def write_recovery_gpt_layout(device: str) -> None:
         "--new=3:0:0",
         "--typecode=3:8300",
         "--change-name=3:root",
-        device,
+        target,
     ]
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    for attempt in range(2):
+        wait_for_expected_disk_size(target, expected_size, timeout_seconds=25)
 
-    parts: List[str] = []
-    if result.stdout and result.stdout.strip():
-        parts.append(result.stdout.strip())
-    if result.stderr and result.stderr.strip():
-        parts.append(result.stderr.strip())
-    detail = "\n".join(parts).strip()
+        result = subprocess.run(cmd, capture_output=True, text=True)
 
-    if result.returncode == 0:
-        return
+        parts: List[str] = []
+        if result.stdout and result.stdout.strip():
+            parts.append(result.stdout.strip())
+        if result.stderr and result.stderr.strip():
+            parts.append(result.stderr.strip())
+        detail = "\n".join(parts).strip()
 
-    # sgdisk can return 2 because it had trouble reading the old damaged GPT,
-    # even though it did write the new table successfully. In that case, let
-    # the later reread_partition_table()/wait_for_partition_ready() logic
-    # validate the new partitions instead of failing here.
-    if result.returncode == 2 and "The operation has completed successfully." in detail:
-        return
+        if result.returncode == 0:
+            return
 
-    raise AegisError(f"{' '.join(cmd)} failed: {detail or f'exit status {result.returncode}'}")
+        # sgdisk can return 2 because it had trouble reading the old damaged GPT,
+        # even though it did write the new table successfully.
+        if result.returncode == 2 and "The operation has completed successfully." in detail:
+            return
+
+        if "Disk is too small to hold GPT data" in detail and attempt == 0:
+            subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+            subprocess.run(["blockdev", "--rereadpt", target], check=False, capture_output=True)
+            subprocess.run(["partprobe", target], check=False, capture_output=True)
+            time.sleep(1.0)
+            continue
+
+        raise AegisError(f"{' '.join(cmd)} failed: {detail or f'exit status {result.returncode}'}")
 
 
 def guided_partition_disk(device: str) -> Dict[str, str]:
@@ -2244,7 +2300,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
         reread_partition_table(device)
 
         try:
-            write_recovery_gpt_layout(device)
+            write_recovery_gpt_layout(device, expected_size=int(identity.get("size") or 0))
             last_error = None
             break
         except Exception as exc:
