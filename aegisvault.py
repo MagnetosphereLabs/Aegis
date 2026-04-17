@@ -331,6 +331,8 @@ def run_blockdev_command(
     check: bool = True,
     capture: bool = True,
 ) -> subprocess.CompletedProcess:
+    device = ensure_block_device_node(device, timeout_seconds=10)
+
     if udevadm_lock_supported():
         return run_command(
             ["udevadm", "lock", f"--device={device}", *cmd],
@@ -1075,7 +1077,7 @@ def list_block_devices() -> List[Dict[str, Any]]:
     raw = run_command_optional([
         "lsblk", "-J", "-b",
         "-o",
-        "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,MOUNTPOINTS",
+        "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,PARTN,MOUNTPOINTS",
     ])
     if not raw:
         return []
@@ -1103,6 +1105,7 @@ def list_block_devices() -> List[Dict[str, Any]]:
             "uuid": node.get("uuid") or "",
             "partuuid": node.get("partuuid") or "",
             "pkname": node.get("pkname") or "",
+            "partn": int(node.get("partn") or 0),
             "mountpoints": mountpoints,
         }
         out.append(entry)
@@ -1187,53 +1190,98 @@ def observed_block_device_size_bytes(device: str) -> int:
     positive = [value for value in sizes if value > 0]
     return min(positive) if positive else 0
 
-def sysfs_write(path: Path, value: str) -> bool:
+def ensure_block_device_node(device: str, timeout_seconds: int = 10) -> str:
+    requested = str(device or "").strip()
+    if not requested:
+        raise AegisError("Missing block device path.")
+
+    candidate = canonical_block_device_path(requested) or requested
+
     try:
-        path.write_text(value, encoding="utf-8")
-        return True
-    except Exception:
-        return False
+        if stat.S_ISBLK(os.stat(candidate).st_mode):
+            return candidate
+    except OSError:
+        pass
+
+    name = Path(candidate).name
+    sysfs = Path("/sys/class/block") / name
+    if not sysfs.exists():
+        raise AegisError(f"{requested} is not currently present in sysfs.")
+
+    udevadm = shutil.which("udevadm")
+    if udevadm:
+        subprocess.run(
+            [udevadm, "trigger", "--action=add", "--settle", str(sysfs)],
+            check=False,
+            capture_output=True,
+        )
+        subprocess.run([udevadm, "settle"], check=False, capture_output=True)
+
+    devnode = Path("/dev") / name
+    deadline = time.time() + max(1, timeout_seconds)
+    while time.time() < deadline:
+        try:
+            if stat.S_ISBLK(os.stat(devnode).st_mode):
+                return str(devnode)
+        except OSError:
+            pass
+        time.sleep(0.2)
+
+    dev_text = (sysfs / "dev").read_text(encoding="utf-8", errors="ignore").strip()
+    if ":" in dev_text:
+        major_text, minor_text = dev_text.split(":", 1)
+        if major_text.isdigit() and minor_text.isdigit():
+            try:
+                if devnode.exists() or devnode.is_symlink():
+                    try:
+                        if stat.S_ISBLK(os.stat(devnode).st_mode):
+                            return str(devnode)
+                    except OSError:
+                        pass
+                    devnode.unlink()
+            except FileNotFoundError:
+                pass
+
+            os.mknod(
+                devnode,
+                stat.S_IFBLK | 0o600,
+                os.makedev(int(major_text), int(minor_text)),
+            )
+
+            if stat.S_ISBLK(os.stat(devnode).st_mode):
+                return str(devnode)
+
+    raise AegisError(
+        f"{requested} exists in sysfs as {name}, but Linux did not provide a usable /dev node."
+    )
 
 
-def rescan_specific_block_device(device: str) -> None:
-    real = canonical_block_device_path(device) or device
-    name = Path(real).name
-    if not name:
-        return
+def partition_path_for_number(device: str, number: int, timeout_seconds: int = 30) -> str:
+    disk = ensure_block_device_node(device, timeout_seconds=10)
+    disk_name = Path(disk).name
+    deadline = time.time() + timeout_seconds
 
-    sysfs_rescan = Path("/sys/class/block") / name / "device" / "rescan"
-    if sysfs_rescan.exists():
-        sysfs_write(sysfs_rescan, "1\n")
+    while time.time() < deadline:
+        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-    subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
-    subprocess.run(["partprobe", real], check=False, capture_output=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+        for entry in list_block_devices():
+            if entry.get("type") != "part":
+                continue
+            if str(entry.get("pkname") or "") != disk_name:
+                continue
+            if int(entry.get("partn") or 0) != number:
+                continue
 
+            part_path = str(entry.get("path") or "").strip()
+            if part_path:
+                return ensure_block_device_node(part_path, timeout_seconds=10)
 
-def delete_and_rescan_block_device(identity: Dict[str, Any], device: str) -> str:
-    real = canonical_block_device_path(device) or device
-    name = Path(real).name
-    if not name:
-        return resolve_block_device_from_identity(identity, timeout_seconds=30)
-
-    sysfs_delete = Path("/sys/class/block") / name / "device" / "delete"
-    if sysfs_delete.exists():
-        sysfs_write(sysfs_delete, "1\n")
         time.sleep(0.5)
 
-    scsi_host_root = Path("/sys/class/scsi_host")
-    if scsi_host_root.exists():
-        for host in sorted(scsi_host_root.iterdir()):
-            scan = host / "scan"
-            if scan.exists():
-                sysfs_write(scan, "- - -\n")
-
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-    return resolve_block_device_from_identity(identity, timeout_seconds=30)
+    raise AegisError(f"Partition {number} did not appear on {disk}.")
 
 def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds: int = 25) -> int:
-    real = canonical_block_device_path(device) or device
+    requested = str(device or "").strip()
     end = time.time() + timeout_seconds
     last_seen = 0
 
@@ -1244,19 +1292,34 @@ def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds
     )
 
     while time.time() < end:
+        try:
+            real = ensure_block_device_node(requested, timeout_seconds=3)
+        except AegisError:
+            real = canonical_block_device_path(requested) or requested
+
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
         last_seen = observed_block_device_size_bytes(real)
         if last_seen >= minimum_acceptable:
             return last_seen
 
-        rescan_specific_block_device(real)
-        time.sleep(0.75)
+        subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
+        subprocess.run(["partprobe", real], check=False, capture_output=True)
+
+        sysfs = Path("/sys/class/block") / Path(real).name
+        if shutil.which("udevadm") and sysfs.exists():
+            subprocess.run(
+                ["udevadm", "trigger", "--action=change", "--settle", str(sysfs)],
+                check=False,
+                capture_output=True,
+            )
+
+        time.sleep(0.5)
 
     expected_text = human_bytes(expected_size) if expected_size > 0 else "its expected size"
     seen_text = human_bytes(last_seen) if last_seen > 0 else "0 B"
     raise AegisError(
-        f"{real} is still reporting an invalid transient size ({seen_text}) instead of {expected_text}. "
+        f"{requested} is still reporting an invalid transient size ({seen_text}) instead of {expected_text}. "
         "Refusing to partition until the kernel reports the real USB capacity."
     )
 
@@ -1293,7 +1356,7 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
             str(identity.get("requested_path") or "").strip(),
             str(identity.get("real_path") or "").strip(),
         ):
-            if not candidate or not Path(candidate).exists():
+            if not candidate:
                 continue
 
             entry = find_block_device_entry(candidate)
@@ -1302,11 +1365,14 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
             if entry.get("type") != "disk" or bool(entry.get("read_only")):
                 continue
 
-            observed_size = observed_block_device_size_bytes(candidate)
+            observed_size = observed_block_device_size_bytes(entry.get("path", ""))
             if observed_size < minimum_acceptable:
                 continue
 
-            return stable_disk_device_path(entry.get("path") or candidate)
+            try:
+                return ensure_block_device_node(entry.get("path") or candidate, timeout_seconds=5)
+            except AegisError:
+                continue
 
         serial = str(identity.get("serial") or "")
         model = str(identity.get("model") or "")
@@ -1335,7 +1401,10 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
             matches.append(entry)
 
         if len(matches) == 1:
-            return stable_disk_device_path(matches[0].get("path", ""))
+            try:
+                return ensure_block_device_node(matches[0].get("path", ""), timeout_seconds=5)
+            except AegisError:
+                pass
 
         time.sleep(0.5)
 
@@ -1347,7 +1416,7 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
     )
     raise AegisError(
         f"{label} did not come back after the kernel rescanned block devices with a sane capacity. "
-        "If the stick is still present, Linux may have renumbered it or is still reporting a transient bogus size."
+        "If the stick is still present, Linux may have renumbered it or udev failed to recreate the device node."
     )
 
 def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
@@ -1485,7 +1554,7 @@ def assert_safe_target_disk(device: str) -> str:
     if real_device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
-    return stable_disk_device_path(real_device)
+    return real_device
 
 
 RECOVERY_PASSWORD_REQUIRED_ERROR = (
@@ -2266,7 +2335,7 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
         raise last_error
         
 def write_recovery_gpt_layout(device: str, expected_size: int = 0) -> None:
-    target = canonical_block_device_path(device) or device
+    target = ensure_block_device_node(device, timeout_seconds=10)
 
     cmd = [
         "sgdisk",
@@ -2297,8 +2366,6 @@ def write_recovery_gpt_layout(device: str, expected_size: int = 0) -> None:
         if result.returncode == 0:
             return
 
-        # sgdisk can return 2 because it had trouble reading the old damaged GPT,
-        # even though it did write the new table successfully.
         if result.returncode == 2 and "The operation has completed successfully." in detail:
             return
 
@@ -2338,14 +2405,12 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
     reread_partition_table(device)
-    rescan_specific_block_device(device)
 
     last_error: Optional[Exception] = None
     for attempt in range(3):
         device = resolve_block_device_from_identity(identity, timeout_seconds=30)
         ensure_device_tree_unmounted(device)
         reread_partition_table(device)
-        rescan_specific_block_device(device)
 
         try:
             write_recovery_gpt_layout(device, expected_size=int(identity.get("size") or 0))
@@ -2361,13 +2426,21 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
                 or "invalid transient size" in detail
             ):
                 if attempt < 2:
-                    device = delete_and_rescan_block_device(identity, device)
+                    ensure_block_device_node(device, timeout_seconds=5)
+                    sysfs = Path("/sys/class/block") / Path(device).name
+                    if shutil.which("udevadm") and sysfs.exists():
+                        subprocess.run(
+                            ["udevadm", "trigger", "--action=change", "--settle", str(sysfs)],
+                            check=False,
+                            capture_output=True,
+                        )
                     time.sleep(1.5 * (attempt + 1))
                     continue
+
                 raise AegisError(
-                    f"{device} keeps reappearing with a bogus tiny capacity while creating the GPT. "
-                    "That is a host-side USB/SCSI state problem, not the actual USB stick size. "
-                    "After repeated rescans, the reliable next step is one reboot and then retry the job."
+                    f"{device} is still reporting a bogus transient size to the kernel while partitioning. "
+                    "AegisVault now avoids destructive delete/rescan behavior, but the current host block-device "
+                    "state is already wedged. Reboot once, reconnect the USB stick, and retry."
                 ) from exc
 
             if attempt == 2:
@@ -2375,9 +2448,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
                     raise AegisError(
                         f"{detail} The selected USB disk would not accept a clean "
                         f"partition-table rescan. AegisVault only touched the selected "
-                        f"target disk ({device}). Try the same stick once after unplugging "
-                        f"and reconnecting it; if it still fails, the stick or its controller "
-                        f"is not healthy enough for reliable recovery-media creation."
+                        f"target disk ({device}). Try unplugging and reconnecting it once."
                     ) from exc
                 raise
 
@@ -2389,9 +2460,9 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     reread_partition_table(device)
 
-    bios_partition = disk_partition_path(device, 1)
-    efi_partition = disk_partition_path(device, 2)
-    root_partition = disk_partition_path(device, 3)
+    bios_partition = partition_path_for_number(device, 1, timeout_seconds=45)
+    efi_partition = partition_path_for_number(device, 2, timeout_seconds=45)
+    root_partition = partition_path_for_number(device, 3, timeout_seconds=45)
 
     ensure_device_tree_unmounted(device)
     wait_for_partition_ready(efi_partition, timeout_seconds=45)
@@ -2415,9 +2486,9 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
     return {
         "disk": device,
-        "bios": disk_partition_path(device, 1),
-        "efi": disk_partition_path(device, 2),
-        "root": disk_partition_path(device, 3),
+        "bios": bios_partition,
+        "efi": efi_partition,
+        "root": root_partition,
     }
 
 
