@@ -2147,12 +2147,8 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
         raise last_error
         
 def write_recovery_gpt_layout(device: str) -> None:
-    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-
     cmd = [
         "sgdisk",
-        "--clear",
         "--new=1:1M:+2M",
         "--typecode=1:ef02",
         "--change-name=1:bios_grub",
@@ -2166,44 +2162,25 @@ def write_recovery_gpt_layout(device: str) -> None:
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode == 0:
-        return
-
-    reread_partition_table(device)
-
-    bios_partition = disk_partition_path(device, 1)
-    efi_partition = disk_partition_path(device, 2)
-    root_partition = disk_partition_path(device, 3)
-
-    # Some removable media report damaged old backup GPT metadata and sgdisk
-    # exits non-zero even though the fresh layout was written. If the requested
-    # partitions now exist, treat that as success and continue.
-    if result.returncode == 2:
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
-            reread_partition_table(device)
-
-            bios_entry = find_block_device_entry(bios_partition)
-            efi_entry = find_block_device_entry(efi_partition)
-            root_entry = find_block_device_entry(root_partition)
-
-            if (
-                bios_entry and bios_entry.get("type") == "part" and
-                efi_entry and efi_entry.get("type") == "part" and
-                root_entry and root_entry.get("type") == "part"
-            ):
-                return
-
-            time.sleep(0.5)
 
     parts: List[str] = []
     if result.stdout and result.stdout.strip():
         parts.append(result.stdout.strip())
     if result.stderr and result.stderr.strip():
         parts.append(result.stderr.strip())
-    detail = "\n".join(parts).strip() or f"exit status {result.returncode}"
-    raise AegisError(f"{' '.join(cmd)} failed: {detail}")
+    detail = "\n".join(parts).strip()
+
+    if result.returncode == 0:
+        return
+
+    # sgdisk can return 2 because it had trouble reading the old damaged GPT,
+    # even though it did write the new table successfully. In that case, let
+    # the later reread_partition_table()/wait_for_partition_ready() logic
+    # validate the new partitions instead of failing here.
+    if result.returncode == 2 and "The operation has completed successfully." in detail:
+        return
+
+    raise AegisError(f"{' '.join(cmd)} failed: {detail or f'exit status {result.returncode}'}")
 
 
 def guided_partition_disk(device: str) -> Dict[str, str]:
