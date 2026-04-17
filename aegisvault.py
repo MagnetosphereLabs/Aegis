@@ -1287,13 +1287,167 @@ def ensure_block_device_node(device: str, timeout_seconds: int = 10) -> str:
     )
 
 
+_UDEVADM_WAIT_SUPPORTED: Optional[bool] = None
+
+
+def udevadm_wait_supported() -> bool:
+    global _UDEVADM_WAIT_SUPPORTED
+    if _UDEVADM_WAIT_SUPPORTED is not None:
+        return _UDEVADM_WAIT_SUPPORTED
+
+    binary = shutil.which("udevadm")
+    if not binary:
+        _UDEVADM_WAIT_SUPPORTED = False
+        return False
+
+    help_text = run_command_optional([binary, "--help"]).lower()
+    _UDEVADM_WAIT_SUPPORTED = (
+        "\nwait " in help_text
+        or "\n  wait " in help_text
+        or " udevadm wait " in help_text
+    )
+    return _UDEVADM_WAIT_SUPPORTED
+
+
+def wait_for_udev_device(path: str, timeout_seconds: int = 10, initialized: bool = False) -> None:
+    path = str(path or "").strip()
+    udevadm = shutil.which("udevadm")
+    if not path or not udevadm:
+        return
+
+    if udevadm_wait_supported():
+        subprocess.run(
+            [
+                udevadm,
+                "wait",
+                "--settle",
+                f"--initialized={'yes' if initialized else 'no'}",
+                "-t",
+                str(max(1, timeout_seconds)),
+                path,
+            ],
+            check=False,
+            capture_output=True,
+        )
+    else:
+        subprocess.run([udevadm, "settle"], check=False, capture_output=True)
+
+
+def udev_device_properties(device: str) -> Dict[str, str]:
+    udevadm = shutil.which("udevadm")
+    real = canonical_block_device_path(device)
+    if not udevadm or not real:
+        return {}
+
+    output = run_command_optional([udevadm, "info", "--query=property", "--name", real])
+    props: Dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        props[key] = value
+    return props
+
+
+def block_device_sysfs_identity_path(device: str) -> str:
+    real = canonical_block_device_path(device)
+    if not real:
+        return ""
+
+    path = Path("/sys/class/block") / Path(real).name / "device"
+    try:
+        if path.exists():
+            return os.path.realpath(str(path))
+    except OSError:
+        pass
+    return ""
+
+
+def block_device_devtype(device: str) -> str:
+    real = canonical_block_device_path(device)
+    if not real:
+        return ""
+
+    sysfs = Path("/sys/class/block") / Path(real).name
+    if not sysfs.exists():
+        return ""
+
+    return "part" if (sysfs / "partition").exists() else "disk"
+
+
+def block_device_read_only(device: str) -> bool:
+    real = canonical_block_device_path(device)
+    if not real:
+        return False
+
+    ro_path = Path("/sys/class/block") / Path(real).name / "ro"
+    try:
+        return ro_path.read_text(encoding="utf-8", errors="ignore").strip() == "1"
+    except Exception:
+        return False
+
+
+def best_effort_block_device_rescan(device: str) -> None:
+    real = canonical_block_device_path(device)
+    if not real:
+        return
+
+    rescan_path = Path("/sys/class/block") / Path(real).name / "device" / "rescan"
+    try:
+        if rescan_path.exists():
+            rescan_path.write_text("1\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def recover_block_device_state(device: str, allow_rescan: bool = True) -> None:
+    try:
+        real = ensure_block_device_node(device, timeout_seconds=1)
+    except AegisError:
+        real = canonical_block_device_path(device) or str(device or "").strip()
+
+    if not real:
+        return
+
+    if Path(real).exists():
+        subprocess.run(["sync"], check=False, capture_output=True)
+        subprocess.run(["blockdev", "--flushbufs", real], check=False, capture_output=True)
+        subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
+        subprocess.run(["partprobe", real], check=False, capture_output=True)
+        subprocess.run(["partx", "-u", real], check=False, capture_output=True)
+
+        if allow_rescan:
+            best_effort_block_device_rescan(real)
+
+        sysfs = Path("/sys/class/block") / Path(real).name
+        if shutil.which("udevadm") and sysfs.exists():
+            subprocess.run(
+                ["udevadm", "trigger", "--action=change", str(sysfs)],
+                check=False,
+                capture_output=True,
+            )
+
+    wait_for_udev_device(real, timeout_seconds=3, initialized=False)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+    
 def partition_path_for_number(device: str, number: int, timeout_seconds: int = 30) -> str:
     disk = ensure_block_device_node(device, timeout_seconds=10)
+    expected = disk_partition_path(disk, number)
     disk_name = Path(disk).name
     deadline = time.time() + timeout_seconds
 
     while time.time() < deadline:
-        subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+        wait_for_udev_device(expected, timeout_seconds=2, initialized=False)
+        try:
+            part_node = ensure_block_device_node(expected, timeout_seconds=2)
+        except AegisError:
+            part_node = ""
+
+        if part_node and block_device_devtype(part_node) == "part":
+            return part_node
+
+        recover_block_device_state(disk, allow_rescan=True)
 
         for entry in list_block_devices():
             if entry.get("type") != "part":
@@ -1326,44 +1480,46 @@ def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds
         try:
             real = ensure_block_device_node(requested, timeout_seconds=3)
         except AegisError:
-            real = canonical_block_device_path(requested) or requested
+            recover_block_device_state(requested, allow_rescan=True)
+            try:
+                real = ensure_block_device_node(requested, timeout_seconds=3)
+            except AegisError:
+                real = canonical_block_device_path(requested) or requested
 
+        wait_for_udev_device(real, timeout_seconds=3, initialized=False)
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
         last_seen = observed_block_device_size_bytes(real)
         if last_seen >= minimum_acceptable:
             return last_seen
 
-        subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
-        subprocess.run(["partprobe", real], check=False, capture_output=True)
-
-        sysfs = Path("/sys/class/block") / Path(real).name
-        if shutil.which("udevadm") and sysfs.exists():
-            subprocess.run(
-                ["udevadm", "trigger", "--action=change", "--settle", str(sysfs)],
-                check=False,
-                capture_output=True,
-            )
-
+        recover_block_device_state(real, allow_rescan=True)
         time.sleep(0.5)
 
     expected_text = human_bytes(expected_size) if expected_size > 0 else "its expected size"
     seen_text = human_bytes(last_seen) if last_seen > 0 else "0 B"
     raise AegisError(
         f"{requested} is still reporting an invalid transient size ({seen_text}) instead of {expected_text}. "
-        "Refusing to partition until the kernel reports the real USB capacity."
+        "AegisVault already tried partition-table rereads, udev reprocessing, and a per-device rescan before giving up."
     )
 
 
 def capture_block_device_identity(device: str) -> Dict[str, Any]:
     entry = find_block_device_entry(device) or {}
     stable = stable_disk_device_path(device)
-    observed_size = observed_block_device_size_bytes(stable or device)
+    lookup_device = stable or device
+    observed_size = observed_block_device_size_bytes(lookup_device)
+    props = udev_device_properties(lookup_device)
 
     return {
         "requested_path": str(device or "").strip(),
         "stable_path": stable if stable.startswith("/dev/disk/") else "",
         "real_path": canonical_block_device_path(device),
+        "sysfs_device": block_device_sysfs_identity_path(lookup_device),
+        "id_serial": str(props.get("ID_SERIAL") or ""),
+        "id_serial_short": str(props.get("ID_SERIAL_SHORT") or ""),
+        "id_wwn": str(props.get("ID_WWN_WITH_EXTENSION") or props.get("ID_WWN") or ""),
+        "id_path": str(props.get("ID_PATH") or ""),
         "serial": str(entry.get("serial") or ""),
         "model": str(entry.get("model") or ""),
         "size": observed_size or int(entry.get("size") or 0),
@@ -1371,72 +1527,133 @@ def capture_block_device_identity(device: str) -> Dict[str, Any]:
         "removable": bool(entry.get("removable", False)),
     }
 
+def _entry_identity_score(entry: Dict[str, Any], identity: Dict[str, Any]) -> int:
+    path = str(entry.get("path") or "").strip()
+    if not path:
+        return 0
+
+    score = 0
+    props = udev_device_properties(path)
+
+    if identity.get("sysfs_device") and block_device_sysfs_identity_path(path) == str(identity.get("sysfs_device")):
+        score += 1000
+
+    if identity.get("id_wwn"):
+        current_wwn = str(props.get("ID_WWN_WITH_EXTENSION") or props.get("ID_WWN") or "")
+        if current_wwn == str(identity.get("id_wwn")):
+            score += 900
+
+    if identity.get("id_serial_short"):
+        if str(props.get("ID_SERIAL_SHORT") or "") == str(identity.get("id_serial_short")):
+            score += 800
+
+    if identity.get("id_serial"):
+        if str(props.get("ID_SERIAL") or "") == str(identity.get("id_serial")):
+            score += 700
+
+    if identity.get("id_path"):
+        if str(props.get("ID_PATH") or "") == str(identity.get("id_path")):
+            score += 600
+
+    if identity.get("serial"):
+        if str(entry.get("serial") or "") == str(identity.get("serial")):
+            score += 500
+
+    if identity.get("model"):
+        if str(entry.get("model") or "") == str(identity.get("model")):
+            score += 100
+
+    if identity.get("transport"):
+        if str(entry.get("transport") or "") == str(identity.get("transport")):
+            score += 50
+
+    if "removable" in identity and bool(entry.get("removable", False)) == bool(identity.get("removable", False)):
+        score += 10
+
+    return score
+
+
 def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds: int = 20) -> str:
     deadline = time.time() + max(1, timeout_seconds)
-    expected_size = int(identity.get("size") or 0)
-    minimum_acceptable = (
-        max(expected_size - (64 * 1024 * 1024), expected_size // 2)
-        if expected_size > 0
-        else 64 * 1024 * 1024
-    )
+    last_seen_path = ""
 
     while time.time() < deadline:
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
-        for candidate in (
+        direct_candidates = dedupe([
             str(identity.get("stable_path") or "").strip(),
             str(identity.get("requested_path") or "").strip(),
             str(identity.get("real_path") or "").strip(),
-        ):
+        ])
+
+        # First try the exact device node/symlink we already know about.
+        # If that fails, try to heal it before giving up on that path.
+        for candidate in direct_candidates:
             if not candidate:
                 continue
 
-            entry = find_block_device_entry(candidate)
-            if not entry:
-                continue
-            if entry.get("type") != "disk" or bool(entry.get("read_only")):
-                continue
-
-            observed_size = observed_block_device_size_bytes(entry.get("path", ""))
-            if observed_size < minimum_acceptable:
-                continue
+            wait_for_udev_device(candidate, timeout_seconds=1, initialized=False)
 
             try:
-                return ensure_block_device_node(entry.get("path") or candidate, timeout_seconds=5)
+                node = ensure_block_device_node(candidate, timeout_seconds=2)
             except AegisError:
+                recover_block_device_state(candidate, allow_rescan=True)
+                try:
+                    node = ensure_block_device_node(candidate, timeout_seconds=3)
+                except AegisError:
+                    continue
+
+            if block_device_devtype(node) not in {"", "disk"}:
+                continue
+            if block_device_read_only(node):
                 continue
 
-        serial = str(identity.get("serial") or "")
-        model = str(identity.get("model") or "")
-        transport = str(identity.get("transport") or "")
-        removable = bool(identity.get("removable", False))
+            return node
 
-        matches: List[Dict[str, Any]] = []
+        # If the kernel renumbered the disk, score current disks by strong
+        # sysfs/udev identity signals and only auto-pick unambiguous matches.
+        scored_matches: List[Tuple[int, str]] = []
         for entry in list_block_devices():
             if entry.get("type") != "disk":
                 continue
             if bool(entry.get("read_only")):
                 continue
-            if serial and str(entry.get("serial") or "") != serial:
-                continue
-            if not serial and model and str(entry.get("model") or "") != model:
-                continue
-            if transport and str(entry.get("transport") or "") != transport:
-                continue
-            if bool(entry.get("removable", False)) != removable:
+
+            path = str(entry.get("path") or "").strip()
+            if not path:
                 continue
 
-            observed_size = observed_block_device_size_bytes(entry.get("path", ""))
-            if observed_size < minimum_acceptable:
+            score = _entry_identity_score(entry, identity)
+            if score <= 0:
                 continue
 
-            matches.append(entry)
+            scored_matches.append((score, path))
 
-        if len(matches) == 1:
-            try:
-                return ensure_block_device_node(matches[0].get("path", ""), timeout_seconds=5)
-            except AegisError:
-                pass
+        if scored_matches:
+            scored_matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            top_score, top_path = scored_matches[0]
+            second_score = scored_matches[1][0] if len(scored_matches) > 1 else -1
+
+            if top_score > 0 and top_score > second_score:
+                try:
+                    node = ensure_block_device_node(top_path, timeout_seconds=3)
+                except AegisError:
+                    recover_block_device_state(top_path, allow_rescan=True)
+                    try:
+                        node = ensure_block_device_node(top_path, timeout_seconds=5)
+                    except AegisError:
+                        node = ""
+
+                if node and block_device_devtype(node) in {"", "disk"} and not block_device_read_only(node):
+                    return node
+
+                if node:
+                    last_seen_path = node
+
+        # Keep nudging only the selected target disk identity, not the whole host.
+        for candidate in dedupe([last_seen_path] + direct_candidates):
+            if candidate:
+                recover_block_device_state(candidate, allow_rescan=True)
 
         time.sleep(0.5)
 
@@ -1447,8 +1664,9 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
         or "the selected USB disk"
     )
     raise AegisError(
-        f"{label} did not come back after the kernel rescanned block devices with a sane capacity. "
-        "If the stick is still present, Linux may have renumbered it or udev failed to recreate the device node."
+        f"{label} did not come back as a usable whole-disk device after the kernel updated block devices. "
+        "AegisVault tried udev settle/wait, partition-table rereads, partprobe, partx, and a per-device rescan. "
+        "If the stick is still present, Linux either renumbered it ambiguously or the device itself stopped responding."
     )
 
 def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
@@ -2266,13 +2484,7 @@ def wait_for_partition_device(path: str, timeout_seconds: int = 20) -> None:
     raise AegisError(f"Partition device did not appear: {path}")
 
 def reread_partition_table(device: str) -> None:
-    subprocess.run(["sync"], check=False, capture_output=True)
-    subprocess.run(["blockdev", "--flushbufs", device], check=False, capture_output=True)
-
-    # Be gentle with removable USB media. The old delete/add partx cycle can
-    # make some sticks briefly reappear with a bogus tiny capacity.
-    subprocess.run(["partprobe", device], check=False, capture_output=True)
-    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+    recover_block_device_state(device, allow_rescan=False)
 
 def partition_is_mounted(device: str) -> bool:
     entry = find_block_device_entry(device)
@@ -2308,28 +2520,55 @@ def prepare_partition_for_filesystem(device: str) -> None:
 def wait_for_partition_ready(path: str, timeout_seconds: int = 45) -> None:
     disk = device_parent_disk(path) or path
     end = time.time() + timeout_seconds
+    attempts = 0
 
     while time.time() < end:
-        if Path(path).exists():
-            entry = find_block_device_entry(path)
+        try:
+            part_node = ensure_block_device_node(path, timeout_seconds=2)
+        except AegisError:
+            part_node = ""
+
+        if part_node:
+            entry = find_block_device_entry(part_node)
             size = int((entry or {}).get("size") or 0)
 
             if size <= 0:
-                size_text = run_command_optional(["blockdev", "--getsize64", path]).strip()
-                if size_text.isdigit():
-                    size = int(size_text)
+                size = observed_block_device_size_bytes(part_node)
 
-            if entry and entry.get("type") == "part" and not bool(entry.get("read_only")) and size > 0:
-                if partition_is_mounted(path):
+            if block_device_devtype(part_node) == "part" and not block_device_read_only(part_node) and size > 0:
+                if partition_is_mounted(part_node):
                     ensure_device_tree_unmounted(disk)
                 else:
                     return
 
-        reread_partition_table(disk)
+        attempts += 1
+        if attempts % 4 == 0:
+            recover_block_device_state(disk, allow_rescan=True)
+        else:
+            reread_partition_table(disk)
         time.sleep(0.75)
 
     raise AegisError(f"Partition device did not become ready: {path}")
 
+def mount_block_device_with_retry(device: str, mountpoint: Path, attempts: int = 3) -> None:
+    disk = device_parent_disk(device) or device
+    last_detail = "mount failed"
+
+    for attempt in range(attempts):
+        wait_for_partition_ready(device, timeout_seconds=45)
+        result = subprocess.run(
+            ["mount", device, str(mountpoint)],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return
+
+        last_detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        recover_block_device_state(disk, allow_rescan=True)
+        time.sleep(1.0 * (attempt + 1))
+
+    raise AegisError(f"Could not mount {device}: {last_detail}")
 
 def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
     disk = device_parent_disk(device) or device
@@ -2615,9 +2854,9 @@ def mounted_recovery_usb_target(device: str):
     layout = partition_recovery_usb_disk(device)
     mount_root = Path(tempfile.mkdtemp(prefix="aegisvault-recovery-usb-"))
     try:
-        run_command(["mount", layout["root"], str(mount_root)], check=True, capture=True)
+        mount_block_device_with_retry(layout["root"], mount_root, attempts=3)
         (mount_root / "boot/efi").mkdir(parents=True, exist_ok=True)
-        run_command(["mount", layout["efi"], str(mount_root / "boot/efi")], check=True, capture=True)
+        mount_block_device_with_retry(layout["efi"], mount_root / "boot/efi", attempts=3)
         yield layout, mount_root
     finally:
         subprocess.run(["umount", "-lf", str(mount_root / "boot/efi")], check=False, capture_output=True)
@@ -2629,9 +2868,9 @@ def mounted_guided_target(device: str):
     layout = guided_partition_disk(device)
     mount_root = Path(tempfile.mkdtemp(prefix="aegisvault-target-"))
     try:
-        run_command(["mount", layout["root"], str(mount_root)], check=True, capture=True)
+        mount_block_device_with_retry(layout["root"], mount_root, attempts=3)
         (mount_root / "boot/efi").mkdir(parents=True, exist_ok=True)
-        run_command(["mount", layout["efi"], str(mount_root / "boot/efi")], check=True, capture=True)
+        mount_block_device_with_retry(layout["efi"], mount_root / "boot/efi", attempts=3)
         yield layout, mount_root
     finally:
         subprocess.run(["umount", "-lf", str(mount_root / "boot/efi")], check=False, capture_output=True)
@@ -2694,7 +2933,7 @@ def create_recovery_usb(device: str) -> None:
     device = assert_safe_target_disk(device)
 
     entry = find_block_device_entry(device)
-    size = int((entry or {}).get("size") or 0)
+    size = int((entry or {}).get("size") or 0) or observed_block_device_size_bytes(device)
     if size and size < MIN_RECOVERY_USB_BYTES:
         raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
     ensure_recovery_builder_prereqs()
