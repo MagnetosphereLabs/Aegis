@@ -1187,6 +1187,50 @@ def observed_block_device_size_bytes(device: str) -> int:
     positive = [value for value in sizes if value > 0]
     return min(positive) if positive else 0
 
+def sysfs_write(path: Path, value: str) -> bool:
+    try:
+        path.write_text(value, encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def rescan_specific_block_device(device: str) -> None:
+    real = canonical_block_device_path(device) or device
+    name = Path(real).name
+    if not name:
+        return
+
+    sysfs_rescan = Path("/sys/class/block") / name / "device" / "rescan"
+    if sysfs_rescan.exists():
+        sysfs_write(sysfs_rescan, "1\n")
+
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+    subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
+    subprocess.run(["partprobe", real], check=False, capture_output=True)
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+
+
+def delete_and_rescan_block_device(identity: Dict[str, Any], device: str) -> str:
+    real = canonical_block_device_path(device) or device
+    name = Path(real).name
+    if not name:
+        return resolve_block_device_from_identity(identity, timeout_seconds=30)
+
+    sysfs_delete = Path("/sys/class/block") / name / "device" / "delete"
+    if sysfs_delete.exists():
+        sysfs_write(sysfs_delete, "1\n")
+        time.sleep(0.5)
+
+    scsi_host_root = Path("/sys/class/scsi_host")
+    if scsi_host_root.exists():
+        for host in sorted(scsi_host_root.iterdir()):
+            scan = host / "scan"
+            if scan.exists():
+                sysfs_write(scan, "- - -\n")
+
+    subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
+    return resolve_block_device_from_identity(identity, timeout_seconds=30)
 
 def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds: int = 25) -> int:
     real = canonical_block_device_path(device) or device
@@ -1206,9 +1250,8 @@ def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds
         if last_seen >= minimum_acceptable:
             return last_seen
 
-        subprocess.run(["blockdev", "--rereadpt", real], check=False, capture_output=True)
-        subprocess.run(["partprobe", real], check=False, capture_output=True)
-        time.sleep(0.5)
+        rescan_specific_block_device(real)
+        time.sleep(0.75)
 
     expected_text = human_bytes(expected_size) if expected_size > 0 else "its expected size"
     seen_text = human_bytes(last_seen) if last_seen > 0 else "0 B"
@@ -2295,12 +2338,14 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     device = resolve_block_device_from_identity(identity, timeout_seconds=30)
     subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
     reread_partition_table(device)
+    rescan_specific_block_device(device)
 
     last_error: Optional[Exception] = None
     for attempt in range(3):
         device = resolve_block_device_from_identity(identity, timeout_seconds=30)
         ensure_device_tree_unmounted(device)
         reread_partition_table(device)
+        rescan_specific_block_device(device)
 
         try:
             write_recovery_gpt_layout(device, expected_size=int(identity.get("size") or 0))
@@ -2308,8 +2353,24 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
             break
         except Exception as exc:
             last_error = exc
+            detail = str(exc)
+
+            if (
+                "Disk is too small to hold GPT data" in detail
+                or "(34 sectors)" in detail
+                or "invalid transient size" in detail
+            ):
+                if attempt < 2:
+                    device = delete_and_rescan_block_device(identity, device)
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise AegisError(
+                    f"{device} keeps reappearing with a bogus tiny capacity while creating the GPT. "
+                    "That is a host-side USB/SCSI state problem, not the actual USB stick size. "
+                    "After repeated rescans, the reliable next step is one reboot and then retry the job."
+                ) from exc
+
             if attempt == 2:
-                detail = str(exc)
                 if "unable to inform the kernel" in detail or "in use" in detail:
                     raise AegisError(
                         f"{detail} The selected USB disk would not accept a clean "
@@ -2319,6 +2380,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
                         f"is not healthy enough for reliable recovery-media creation."
                     ) from exc
                 raise
+
             time.sleep(1.5 * (attempt + 1))
 
     if last_error is not None:
