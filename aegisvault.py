@@ -2421,66 +2421,14 @@ def write_recovery_usb_mbr_layout(device: str, expected_size: int = 0) -> None:
 
 
 def partition_recovery_usb_disk(device: str) -> Dict[str, str]:
-    device = assert_safe_target_disk(device)
-    identity = capture_block_device_identity(device)
-    device = resolve_block_device_from_identity(identity, timeout_seconds=10)
-
-    ensure_recovery_builder_prereqs()
-    ensure_device_tree_unmounted(device)
-    swapoff_device_tree(device)
-
-    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
-    reread_partition_table(device)
-
-    last_error: Optional[Exception] = None
-    for attempt in range(3):
-        device = resolve_block_device_from_identity(identity, timeout_seconds=30)
-        ensure_device_tree_unmounted(device)
-
-        try:
-            write_recovery_usb_mbr_layout(device, expected_size=int(identity.get("size") or 0))
-            last_error = None
-            break
-        except Exception as exc:
-            last_error = exc
-            if attempt == 2:
-                raise
-            time.sleep(1.5 * (attempt + 1))
-
-    if last_error is not None:
-        raise last_error
-
-    device = resolve_block_device_from_identity(identity, timeout_seconds=30)
-    reread_partition_table(device)
-
-    efi_partition = disk_partition_path(device, 1)
-    root_partition = disk_partition_path(device, 2)
-
-    ensure_device_tree_unmounted(device)
-    wait_for_partition_ready(efi_partition, timeout_seconds=45)
-    wait_for_partition_ready(root_partition, timeout_seconds=45)
-
-    update_stage("Formatting recovery USB filesystems")
-
-    run_mkfs_with_retry(
-        ["mkfs.vfat", "-F", "32", "-n", "AEGIS-EFI", efi_partition],
-        efi_partition,
-        attempts=4,
-    )
-    run_mkfs_with_retry(
-        ["mkfs.ext4", "-F", "-L", "AegisSystem", root_partition],
-        root_partition,
-        attempts=4,
-    )
-
-    device = resolve_block_device_from_identity(identity, timeout_seconds=30)
-    reread_partition_table(device)
-
-    return {
-        "disk": device,
-        "efi": disk_partition_path(device, 1),
-        "root": disk_partition_path(device, 2),
-    }
+    # Use the same robust GPT layout as guided full restore:
+    #   1 = BIOS boot partition
+    #   2 = EFI System Partition
+    #   3 = ext4 root
+    #
+    # This avoids the flaky recovery-only MBR/sfdisk path and still matches
+    # the later BIOS + UEFI grub-install steps in create_recovery_usb().
+    return guided_partition_disk(device)
 
 
 @contextmanager
