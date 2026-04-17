@@ -1181,6 +1181,8 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
     while time.time() < deadline:
         subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
 
+        expected_size = int(identity.get("size") or 0)
+
         for candidate in (
             str(identity.get("stable_path") or "").strip(),
             str(identity.get("requested_path") or "").strip(),
@@ -1190,9 +1192,23 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
                 continue
 
             entry = find_block_device_entry(candidate)
-            if entry and entry.get("type") == "disk" and not bool(entry.get("read_only")):
-                if int(entry.get("size") or 0) > 0:
-                    return stable_disk_device_path(entry.get("path") or candidate)
+            if not entry:
+                continue
+            if entry.get("type") != "disk" or bool(entry.get("read_only")):
+                continue
+
+            entry_size = int(entry.get("size") or 0)
+
+            # Some USB devices briefly reappear with a bogus tiny size right after
+            # zap/reread. Do not accept the disk until it reports a sane size again.
+            if expected_size > 0:
+                minimum_acceptable = max(expected_size - (64 * 1024 * 1024), expected_size // 2)
+                if entry_size < minimum_acceptable:
+                    continue
+            elif entry_size <= 16 * 1024 * 1024:
+                continue
+
+            return stable_disk_device_path(entry.get("path") or candidate)
 
         serial = str(identity.get("serial") or "")
         model = str(identity.get("model") or "")
@@ -1218,8 +1234,19 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
                 continue
             matches.append(entry)
 
-        if len(matches) == 1:
-            return stable_disk_device_path(matches[0].get("path", ""))
+        sane_matches: List[Dict[str, Any]] = []
+        for match in matches:
+            match_size = int(match.get("size") or 0)
+            if size > 0:
+                minimum_acceptable = max(size - (64 * 1024 * 1024), size // 2)
+                if match_size < minimum_acceptable:
+                    continue
+            elif match_size <= 16 * 1024 * 1024:
+                continue
+            sane_matches.append(match)
+
+        if len(sane_matches) == 1:
+            return stable_disk_device_path(sane_matches[0].get("path", ""))
 
         time.sleep(0.5)
 
