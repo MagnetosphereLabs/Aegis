@@ -1190,69 +1190,98 @@ def observed_block_device_size_bytes(device: str) -> int:
     positive = [value for value in sizes if value > 0]
     return min(positive) if positive else 0
 
+def _usable_block_device_node(path: Path, expected_major: int, expected_minor: int) -> bool:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+
+    if not stat.S_ISBLK(st.st_mode):
+        return False
+
+    if os.major(st.st_rdev) != expected_major or os.minor(st.st_rdev) != expected_minor:
+        return False
+
+    fd = -1
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
+        return True
+    except OSError as exc:
+        if exc.errno in (errno.ENXIO, errno.ENODEV, errno.ENOENT):
+            return False
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def ensure_block_device_node(device: str, timeout_seconds: int = 10) -> str:
     requested = str(device or "").strip()
     if not requested:
         raise AegisError("Missing block device path.")
 
     candidate = canonical_block_device_path(requested) or requested
-
-    try:
-        if stat.S_ISBLK(os.stat(candidate).st_mode):
-            return candidate
-    except OSError:
-        pass
-
     name = Path(candidate).name
     sysfs = Path("/sys/class/block") / name
     if not sysfs.exists():
         raise AegisError(f"{requested} is not currently present in sysfs.")
 
+    dev_text = (sysfs / "dev").read_text(encoding="utf-8", errors="ignore").strip()
+    if ":" not in dev_text:
+        raise AegisError(f"Could not read major:minor for {requested} from sysfs.")
+
+    major_text, minor_text = dev_text.split(":", 1)
+    if not major_text.isdigit() or not minor_text.isdigit():
+        raise AegisError(f"Could not parse major:minor for {requested} from sysfs.")
+
+    expected_major = int(major_text)
+    expected_minor = int(minor_text)
+    devnode = Path("/dev") / name
+
+    if _usable_block_device_node(devnode, expected_major, expected_minor):
+        return str(devnode)
+
     udevadm = shutil.which("udevadm")
     if udevadm:
         subprocess.run(
-            [udevadm, "trigger", "--action=add", "--settle", str(sysfs)],
+            [udevadm, "trigger", "--action=add", str(sysfs)],
             check=False,
             capture_output=True,
         )
         subprocess.run([udevadm, "settle"], check=False, capture_output=True)
 
-    devnode = Path("/dev") / name
-    deadline = time.time() + max(1, timeout_seconds)
-    while time.time() < deadline:
-        try:
-            if stat.S_ISBLK(os.stat(devnode).st_mode):
-                return str(devnode)
-        except OSError:
-            pass
-        time.sleep(0.2)
-
-    dev_text = (sysfs / "dev").read_text(encoding="utf-8", errors="ignore").strip()
-    if ":" in dev_text:
-        major_text, minor_text = dev_text.split(":", 1)
-        if major_text.isdigit() and minor_text.isdigit():
-            try:
-                if devnode.exists() or devnode.is_symlink():
-                    try:
-                        if stat.S_ISBLK(os.stat(devnode).st_mode):
-                            return str(devnode)
-                    except OSError:
-                        pass
-                    devnode.unlink()
-            except FileNotFoundError:
-                pass
-
-            os.mknod(
-                devnode,
-                stat.S_IFBLK | 0o600,
-                os.makedev(int(major_text), int(minor_text)),
+        # Newer systemd has "udevadm wait", which is even better after device churn.
+        wait_help = run_command_optional([udevadm, "--help"]).lower()
+        if "\nwait " in wait_help or "\n  wait " in wait_help or " udevadm wait " in wait_help:
+            subprocess.run(
+                [udevadm, "wait", "--settle", "--initialized=no", "-t", str(timeout_seconds), str(devnode)],
+                check=False,
+                capture_output=True,
             )
 
-            if stat.S_ISBLK(os.stat(devnode).st_mode):
-                return str(devnode)
+    deadline = time.time() + max(1, timeout_seconds)
+    while time.time() < deadline:
+        if _usable_block_device_node(devnode, expected_major, expected_minor):
+            return str(devnode)
+        time.sleep(0.2)
+
+    try:
+        if devnode.exists() or devnode.is_symlink():
+            devnode.unlink()
+    except FileNotFoundError:
+        pass
+
+    os.mknod(
+        devnode,
+        stat.S_IFBLK | 0o600,
+        os.makedev(expected_major, expected_minor),
+    )
+
+    if _usable_block_device_node(devnode, expected_major, expected_minor):
+        return str(devnode)
 
     raise AegisError(
-        f"{requested} exists in sysfs as {name}, but Linux did not provide a usable /dev node."
+        f"{requested} exists in sysfs as {name}, but Linux did not provide a usable block-device node."
     )
 
 
@@ -1554,7 +1583,7 @@ def assert_safe_target_disk(device: str) -> str:
     if real_device == current_root_disk():
         raise AegisError("Refusing to operate on the disk hosting the currently booted system.")
 
-    return real_device
+    return ensure_block_device_node(real_device, timeout_seconds=5)
 
 
 RECOVERY_PASSWORD_REQUIRED_ERROR = (
@@ -2337,24 +2366,25 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
 def write_recovery_gpt_layout(device: str, expected_size: int = 0) -> None:
     target = ensure_block_device_node(device, timeout_seconds=10)
 
-    cmd = [
-        "sgdisk",
-        "--new=1:1M:+2M",
-        "--typecode=1:ef02",
-        "--change-name=1:bios_grub",
-        "--new=2:0:+1024M",
-        "--typecode=2:ef00",
-        "--change-name=2:ESP",
-        "--new=3:0:0",
-        "--typecode=3:8300",
-        "--change-name=3:root",
-        target,
-    ]
-
     for attempt in range(2):
+        target = ensure_block_device_node(target, timeout_seconds=10)
         wait_for_expected_disk_size(target, expected_size, timeout_seconds=25)
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = [
+            "sgdisk",
+            "--new=1:1M:+2M",
+            "--typecode=1:ef02",
+            "--change-name=1:bios_grub",
+            "--new=2:0:+1024M",
+            "--typecode=2:ef00",
+            "--change-name=2:ESP",
+            "--new=3:0:0",
+            "--typecode=3:8300",
+            "--change-name=3:root",
+            target,
+        ]
+
+        result = run_blockdev_command(cmd, target, check=False, capture=True)
 
         parts: List[str] = []
         if result.stdout and result.stdout.strip():
@@ -2369,10 +2399,21 @@ def write_recovery_gpt_layout(device: str, expected_size: int = 0) -> None:
         if result.returncode == 2 and "The operation has completed successfully." in detail:
             return
 
-        if "Disk is too small to hold GPT data" in detail and attempt == 0:
+        if ("Disk is too small to hold GPT data" in detail or "Error is 6" in detail) and attempt == 0:
             subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
             subprocess.run(["blockdev", "--rereadpt", target], check=False, capture_output=True)
             subprocess.run(["partprobe", target], check=False, capture_output=True)
+
+            sysfs = Path("/sys/class/block") / Path(target).name
+            udevadm = shutil.which("udevadm")
+            if udevadm and sysfs.exists():
+                subprocess.run(
+                    [udevadm, "trigger", "--action=change", str(sysfs)],
+                    check=False,
+                    capture_output=True,
+                )
+                subprocess.run([udevadm, "settle"], check=False, capture_output=True)
+
             time.sleep(1.0)
             continue
 
@@ -2388,10 +2429,11 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     ensure_device_tree_unmounted(device)
     swapoff_device_tree(device)
 
-    sgdisk_result = subprocess.run(
+    sgdisk_result = run_blockdev_command(
         ["sgdisk", "--zap-all", device],
-        capture_output=True,
-        text=True,
+        device,
+        check=False,
+        capture=True,
     )
     if sgdisk_result.returncode not in (0, 2, 3):
         detail = (
@@ -2403,7 +2445,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
     subprocess.run(["udevadm", "settle"], check=False, capture_output=True)
     device = resolve_block_device_from_identity(identity, timeout_seconds=30)
-    subprocess.run(["wipefs", "-af", device], check=False, capture_output=True)
+    run_blockdev_command(["wipefs", "-af", device], device, check=False, capture=True)
     reread_partition_table(device)
 
     last_error: Optional[Exception] = None
