@@ -4205,6 +4205,7 @@ def gui_main() -> int:
             self.peer_identity_var = tk.StringVar(value="")
             self.selected_snapshot_id = ""
             self.dashboard_payload: Dict[str, Any] = {}
+            self.snapshot_by_id: Dict[str, Dict[str, Any]] = {}
             self.settings_loaded = False
             self.recovery_mode = is_recovery_environment()
             self.ui_configured_state: Optional[bool] = None
@@ -4269,9 +4270,9 @@ def gui_main() -> int:
                 except Exception:
                     self.recovery_mounts = []
             self.refresh_local_device_lists()
-            self.scan_repository_candidates(auto_use=False)
+            self.scan_repository_candidates(auto_use=self.recovery_mode)
             if self.recovery_mode:
-                hint = "Recovery mode: use Guided Full Restore for the easiest same-machine disaster restore."
+                hint = "Recovery mode: connect the backup drive, let AegisVault find the backup repository, and use Guided Full Restore."
                 if self.recovery_mounts:
                     hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
                 self.message_var.set(hint)
@@ -4492,6 +4493,20 @@ def gui_main() -> int:
             ttk.Button(buttons, text="Save Setup and Open App", command=self.complete_onboarding).pack(side="left")
 
         def apply_configuration_state(self, configured: bool) -> None:
+            if self.recovery_mode:
+                if self.ui_configured_state is True:
+                    return
+                self.ui_configured_state = True
+                self.notebook.tab(self.setup_tab, state="hidden")
+                self.notebook.tab(self.overview_tab, state="hidden")
+                self.notebook.tab(self.backup_tab, state="hidden")
+                self.notebook.tab(self.restore_tab, state="normal")
+                self.notebook.tab(self.constellation_tab, state="hidden")
+                self.notebook.tab(self.settings_tab, state="hidden")
+                self.notebook.select(self.restore_tab)
+                self.message_var.set("Recovery mode: connect the backup drive, choose the backup repository, and run Guided Full Restore.")
+                return
+
             if self.ui_configured_state == configured:
                 return
             self.ui_configured_state = configured
@@ -4504,7 +4519,7 @@ def gui_main() -> int:
             self.notebook.tab(self.settings_tab, state="normal" if configured else "hidden")
 
             if configured:
-                self.notebook.select(self.restore_tab if self.recovery_mode else self.overview_tab)
+                self.notebook.select(self.overview_tab)
             else:
                 self.notebook.select(self.setup_tab)
                 self.message_var.set("Finish setup to unlock the rest of AegisVault.")
@@ -4611,9 +4626,9 @@ def gui_main() -> int:
             ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
             ttk.Button(controls, text="Run Default Backup", command=self.start_default_backup).grid(row=2, column=0, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Full Machine Backup", command=lambda: self.start_backup("full_recovery")).grid(row=2, column=1, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Portable Backup", command=lambda: self.start_backup("portable_state")).grid(row=2, column=2, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Both Backup Types", command=lambda: self.start_backup("both")).grid(row=2, column=3, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Full Recovery Backup", command=lambda: self.start_backup("full_recovery")).grid(row=2, column=1, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Portable Migration Backup", command=lambda: self.start_backup("portable_state")).grid(row=2, column=2, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(controls, text="Full + Portable Backups", command=lambda: self.start_backup("both")).grid(row=2, column=3, padx=(0, 8), pady=(12, 0), sticky="w")
 
             snaps = ttk.Frame(self.backup_tab)
             snaps.pack(fill="both", expand=True, pady=(18, 0))
@@ -4643,9 +4658,9 @@ def gui_main() -> int:
             intro.pack(fill="x")
             ttk.Label(intro, text="Restore and recovery", style="Header.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
             intro_text = (
-                "Use Portable restore inside a running Linux install, or use Guided Full Restore from recovery media "
-                "to wipe a disk and put a Full Recovery snapshot back exactly. "
-                "You can also restore from an encrypted bundle file or a hosted bundle URL."
+                "Full Recovery is for putting the whole machine back after SSD failure or same-hardware disaster recovery. "
+                "Portable Migration is for moving files, apps, and settings onto different hardware without dragging hardware-specific drivers along. "
+                "Use Guided Full Restore from recovery media for disk-level recovery, or restore a Portable Migration backup into a running Linux install."
             )
             ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
             ttk.Label(intro, text="Backups drive or folder").grid(row=2, column=0, sticky="w", pady=(12, 0))
@@ -4672,8 +4687,19 @@ def gui_main() -> int:
                 self.guided_disk_combo = ttk.Combobox(device_row, textvariable=self.guided_target_disk_var, width=54, state="readonly")
                 self.guided_disk_combo.pack(side="left", padx=(12, 8))
                 ttk.Button(device_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
-                ttk.Button(helper, text="Restore Selected Snapshot to Disk", command=self.guided_restore_repo).grid(row=3, column=1, sticky="w", pady=(12, 0))
-                ttk.Button(helper, text="Restore Bundle or URL to Disk", command=self.guided_restore_bundle).grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
+                self.guided_restore_repo_button = ttk.Button(
+                    helper,
+                    text="Guided Full Restore\nSelected Backup to Disk",
+                    command=self.guided_restore_repo,
+                )
+                self.guided_restore_repo_button.grid(row=3, column=1, sticky="w", pady=(12, 0))
+
+                self.guided_restore_bundle_button = ttk.Button(
+                    helper,
+                    text="Guided Full Restore\nBundle or URL to Disk",
+                    command=self.guided_restore_bundle,
+                )
+                self.guided_restore_bundle_button.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
             else:
                 ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
                 ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. AegisVault will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -4692,27 +4718,39 @@ def gui_main() -> int:
             repo_section = ttk.Frame(self.restore_tab)
             repo_section.pack(fill="x")
             ttk.Label(repo_section, text="Restore from saved backup", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-            self.restore_tree = self.build_snapshot_table(repo_section)
-            self.restore_tree.grid(row=1, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
-            repo_section.grid_columnconfigure(0, weight=1)
-            repo_section.grid_rowconfigure(1, weight=1)
 
-            ttk.Label(repo_section, text="Target path").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_restore_target_var, width=46).grid(row=2, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(repo_section, text="Browse", command=lambda: self.browse_directory(self.repo_restore_target_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
-
-            ttk.Label(repo_section, text="Only restore this path (optional)").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Label(repo_section, text="Recovery password (only needed for other machine snapshots)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_recovery_key_var, width=46).grid(row=4, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Button(
+            self.restore_context_var = tk.StringVar(
+                value="Select a backup. Full Recovery puts a whole system back. Portable Migration moves data onto different hardware."
+            )
+            ttk.Label(
                 repo_section,
-                text="Restore Selected\nSnapshot",
+                textvariable=self.restore_context_var,
+                wraplength=1080,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+            self.restore_tree = self.build_snapshot_table(repo_section)
+            self.restore_tree.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
+            repo_section.grid_columnconfigure(0, weight=1)
+            repo_section.grid_rowconfigure(2, weight=1)
+
+            ttk.Label(repo_section, text="Target path").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(repo_section, textvariable=self.repo_restore_target_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
+            ttk.Button(repo_section, text="Browse", command=lambda: self.browse_directory(self.repo_restore_target_var)).grid(row=3, column=2, padx=(8, 0), pady=(12, 0))
+
+            ttk.Label(repo_section, text="Only restore this path (optional)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=4, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(repo_section, text="Recovery password (only needed for other machine snapshots)").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(repo_section, textvariable=self.repo_recovery_key_var, width=46).grid(row=5, column=1, sticky="w", pady=(12, 0))
+
+            self.repo_restore_button = ttk.Button(
+                repo_section,
+                text="Restore Selected\nBackup",
                 width=20,
                 command=self.restore_repo_snapshot,
-            ).grid(row=5, column=1, sticky="w", pady=(14, 0))
+            )
+            self.repo_restore_button.grid(row=6, column=1, sticky="w", pady=(14, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
@@ -5264,8 +5302,9 @@ def gui_main() -> int:
 
         def refresh_local_device_lists(self) -> None:
             try:
-                usb_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=True)
-                guided_choices = list_disk_choices(exclude_paths={current_root_disk()}, removable_only=False)
+                excluded = self.excluded_target_disks()
+                usb_choices = list_disk_choices(exclude_paths=excluded, removable_only=True)
+                guided_choices = list_disk_choices(exclude_paths=excluded, removable_only=False)
 
                 self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
                 self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
@@ -5349,17 +5388,36 @@ def gui_main() -> int:
                 return
             self.repo_path_var.set(chosen)
             self.message_var.set(f"Backup location set to {chosen}")
-
         def scan_repository_candidates(self, auto_use: bool = False) -> None:
             try:
+                if self.recovery_mode and os.geteuid() == 0:
+                    self.recovery_mounts = auto_mount_recovery_sources()
+
                 self.repo_candidates = discover_repo_candidates()
                 if hasattr(self, "repo_candidate_combo"):
                     self.repo_candidate_combo.configure(values=self.repo_candidates)
-                if self.repo_candidates and not self.repo_candidate_var.get():
-                    self.repo_candidate_var.set(self.repo_candidates[0])
-                if auto_use and self.repo_candidates and not Path(self.repo_source_var.get() or "").exists():
-                    self.repo_source_var.set(self.repo_candidates[0])
-                    self.use_repo_source_path()
+
+                if self.repo_candidates:
+                    if self.repo_candidate_var.get() not in self.repo_candidates:
+                        self.repo_candidate_var.set(self.repo_candidates[0])
+
+                    current_repo = (self.repo_source_var.get().strip() or self.repo_path_var.get().strip())
+                    current_available = bool(current_repo) and Path(current_repo).exists()
+                    should_auto_use = auto_use or (len(self.repo_candidates) == 1 and not current_available)
+
+                    if should_auto_use:
+                        self.repo_source_var.set(self.repo_candidates[0])
+                        self.use_repo_source_path()
+                    elif self.recovery_mode:
+                        self.message_var.set(
+                            "Backup repository detected. Choose it below if AegisVault did not switch automatically."
+                        )
+                    return
+
+                if self.recovery_mode:
+                    self.message_var.set(
+                        "No backup repositories were detected yet. In recovery mode AegisVault will auto-mount readable external drives when you click Scan for Backup Drives."
+                    )
             except Exception as exc:
                 self.message_var.set(str(exc))
 
@@ -5377,8 +5435,11 @@ def gui_main() -> int:
                 response = send_daemon_request({"action": "set_repo_path", "repo_path": repo_path})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
-                self.repo_path_var.set(repo_path)
+                resolved_repo = response.get("repo_path", repo_path)
+                self.repo_path_var.set(resolved_repo)
+                self.repo_source_var.set(resolved_repo)
                 self.message_var.set(response.get("message", "Backup location updated."))
+                self.refresh_local_device_lists()
                 self.settings_loaded = False
                 self.refresh_dashboard()
             except Exception as exc:
@@ -5388,6 +5449,59 @@ def gui_main() -> int:
             value = raw_value.strip()
             return mapping.get(value, value)
 
+        def excluded_target_disks(self) -> Set[str]:
+            excluded: Set[str] = {current_root_disk()}
+
+            repo_path = (self.repo_source_var.get().strip() or self.repo_path_var.get().strip())
+            if repo_path:
+                source = canonical_block_device_path(mount_source_for_path(repo_path))
+                repo_disk = device_parent_disk(source) if source.startswith("/dev/") else ""
+                if repo_disk:
+                    excluded.add(repo_disk)
+
+            return {value for value in excluded if value}
+
+        def selected_snapshot(self) -> Dict[str, Any]:
+            return self.snapshot_by_id.get(self.selected_snapshot_id, {})
+
+        def refresh_restore_actions(self) -> None:
+            if not hasattr(self, "repo_restore_button"):
+                return
+
+            snapshot = self.selected_snapshot()
+            kind = snapshot.get("kind", "")
+
+            if not snapshot:
+                self.restore_context_var.set(
+                    "Select a backup. Full Recovery puts a whole system back. Portable Migration moves data onto different hardware."
+                )
+                self.repo_restore_button.state(["disabled"])
+                if hasattr(self, "guided_restore_repo_button"):
+                    self.guided_restore_repo_button.state(["disabled"])
+                return
+
+            if kind == "full_recovery":
+                if self.recovery_mode:
+                    self.restore_context_var.set(
+                        "Full Recovery backup selected. Use Guided Full Restore to wipe a target disk and rebuild the system."
+                    )
+                    self.repo_restore_button.state(["disabled"])
+                    if hasattr(self, "guided_restore_repo_button"):
+                        self.guided_restore_repo_button.state(["!disabled"])
+                else:
+                    self.restore_context_var.set(
+                        "Full Recovery backup selected. Live in-place restore is disabled for safety. Create and boot the recovery USB, then use Guided Full Restore."
+                    )
+                    self.repo_restore_button.state(["disabled"])
+                return
+
+            self.restore_context_var.set(
+                "Portable Migration backup selected. Restore it into a running Linux install or another mounted target folder."
+            )
+            self.repo_restore_button.state(["!disabled"])
+            if hasattr(self, "guided_restore_repo_button"):
+                self.guided_restore_repo_button.state(["disabled"])
+        
         def confirm_dangerous_action(self, title: str, message: str) -> bool:
             return messagebox.askyesno(title, message, icon="warning")
 
@@ -5485,6 +5599,8 @@ def gui_main() -> int:
             warnings = payload.get("warnings", [])
             logs = payload.get("logs", [])
 
+            self.snapshot_by_id = {snap.get("id", ""): snap for snap in snapshots if snap.get("id")}
+
             self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
 
             self.status_var.set(
@@ -5503,6 +5619,10 @@ def gui_main() -> int:
             self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
             self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
             self.summary_labels["last_good"].configure(text=state.get("last_success_at") or "—")
+
+            current_repo_path = settings.get("repo_path", "")
+            if current_repo_path and self.repo_source_var.get().strip() != current_repo_path:
+                self.repo_source_var.set(current_repo_path)
             self.summary_labels["last_run"].configure(text=state.get("last_run_at") or "—")
             self.summary_labels["last_sync"].configure(text=state.get("last_sync_at") or "—")
             self.summary_labels["recovery_key"].configure(
@@ -5534,6 +5654,7 @@ def gui_main() -> int:
                 self.fill_text(self.portable_includes_text, "\n".join(settings.get("portable_includes", [])))
                 self.fill_text(self.portable_excludes_text, "\n".join(settings.get("portable_excludes", [])))
                 self.settings_loaded = True
+            self.refresh_restore_actions()
 
         def fill_snapshot_tree(self, tree: ttk.Treeview, snapshots: List[Dict[str, Any]]) -> None:
             existing_selection = self.selected_snapshot_id
@@ -5582,6 +5703,7 @@ def gui_main() -> int:
             selection = tree.selection()
             if selection:
                 self.selected_snapshot_id = selection[0]
+            self.refresh_restore_actions()
 
         def start_backup(self, profile: str) -> None:
             try:
