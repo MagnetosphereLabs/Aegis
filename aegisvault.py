@@ -490,6 +490,7 @@ def resolve_settings_repo_path(settings: Settings, create_if_missing: bool = Fal
 
     raise AegisError(
         "The selected backup drive is not available right now. Reconnect it and click Scan for Backup Drives, or choose the mounted folder again."
+    )
 
 def safe_mount_component(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in (value or "").strip())
