@@ -100,6 +100,10 @@ class Settings:
     machine_id: str = ""
     machine_label: str = ""
     repo_path: str = DEFAULT_REPO
+    repo_device_uuid: str = ""
+    repo_device_partuuid: str = ""
+    repo_device_label: str = ""
+    repo_mount_subpath: str = ""
     encryption_enabled: bool = True
     notifications_enabled: bool = True
     default_backup_profile: str = "both"
@@ -243,9 +247,9 @@ DEFAULT_PORTABLE_EXCLUDES = [
 ]
 
 BACKUP_PROFILE_LABELS = {
-    "full_recovery": "Full Machine Backup",
-    "portable_state": "Portable Backup",
-    "both": "Both backup types",
+    "full_recovery": "Full Recovery Backup",
+    "portable_state": "Portable Migration Backup",
+    "both": "Full + Portable backups",
 }
 
 EXTERNAL_BACKUP_ROOT_PREFIXES = ("/media/", "/mnt/", "/run/media/")
@@ -297,6 +301,195 @@ def ensure_repo_path_ready(repo_path: str) -> None:
             "The selected backup drive is not mounted. Reconnect it and choose the mounted folder again."
         )
     Path(repo_path).mkdir(parents=True, exist_ok=True)
+
+def repo_structure_present(path: Path) -> bool:
+    return (path / "machines").is_dir() and (path / "objects").is_dir()
+
+
+def nearest_existing_path(path: str) -> str:
+    current = Path(os.path.abspath(path))
+    while not current.exists() and current != current.parent:
+        current = current.parent
+    return str(current)
+
+
+def mount_target_for_path(path: str) -> str:
+    query = nearest_existing_path(path)
+    return run_command_optional(["findmnt", "-nro", "TARGET", "--target", query]).strip()
+
+
+def mount_source_for_path(path: str) -> str:
+    query = nearest_existing_path(path)
+    return run_command_optional(["findmnt", "-nro", "SOURCE", "--target", query]).strip()
+
+
+def refresh_repo_locator(settings: Settings, repo_path: Optional[str] = None) -> None:
+    path = os.path.abspath(repo_path or settings.repo_path or DEFAULT_REPO)
+    settings.repo_path = path
+    settings.repo_device_uuid = ""
+    settings.repo_device_partuuid = ""
+    settings.repo_device_label = ""
+    settings.repo_mount_subpath = ""
+
+    mount_target = mount_target_for_path(path)
+    source = canonical_block_device_path(mount_source_for_path(path))
+    if not mount_target or not source.startswith("/dev/"):
+        return
+
+    settings.repo_device_uuid = blkid_value(source, "UUID")
+    settings.repo_device_partuuid = blkid_value(source, "PARTUUID")
+    settings.repo_device_label = blkid_value(source, "LABEL")
+
+    try:
+        rel = os.path.relpath(path, mount_target)
+        settings.repo_mount_subpath = "" if rel == "." else rel
+    except ValueError:
+        settings.repo_mount_subpath = ""
+
+
+def _repo_candidate_score(expected_path: str, candidate: str) -> int:
+    expected_parts = Path(os.path.abspath(expected_path)).parts
+    candidate_parts = Path(os.path.abspath(candidate)).parts
+
+    tail_matches = 0
+    for left, right in zip(reversed(expected_parts), reversed(candidate_parts)):
+        if left != right:
+            break
+        tail_matches += 1
+
+    score = tail_matches * 100
+    if Path(candidate).name == Path(expected_path).name:
+        score += 10
+    return score
+
+
+def best_matching_repo_candidate(expected_path: str, candidates: List[str]) -> str:
+    candidates = dedupe([os.path.abspath(value) for value in candidates if value])
+    if not candidates:
+        return ""
+    if len(candidates) == 1:
+        return candidates[0]
+
+    scored = sorted(
+        [(_repo_candidate_score(expected_path, candidate), candidate) for candidate in candidates],
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
+    )
+    top_score, top_candidate = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1
+    return top_candidate if top_score > second_score and top_score > 0 else ""
+
+
+def repo_locator_candidates(settings: Settings, allow_mount: bool = True) -> List[str]:
+    subpath = normalize_member_path(settings.repo_mount_subpath) if settings.repo_mount_subpath else ""
+    matches: List[str] = []
+
+    for entry in list_block_devices():
+        if entry.get("type") not in {"part", "disk"}:
+            continue
+
+        entry_uuid = str(entry.get("uuid") or "")
+        entry_partuuid = str(entry.get("partuuid") or "")
+        entry_label = str(entry.get("label") or "")
+
+        matched = False
+        if settings.repo_device_uuid and entry_uuid == settings.repo_device_uuid:
+            matched = True
+        if settings.repo_device_partuuid and entry_partuuid == settings.repo_device_partuuid:
+            matched = True
+        if (
+            not matched
+            and settings.repo_device_label
+            and not settings.repo_device_uuid
+            and not settings.repo_device_partuuid
+            and entry_label == settings.repo_device_label
+        ):
+            matched = True
+        if not matched:
+            continue
+
+        mountpoints = [os.path.abspath(mp) for mp in (entry.get("mountpoints") or []) if mp]
+        if not mountpoints and allow_mount:
+            fstype = (entry.get("fstype") or "").strip()
+            if fstype and fstype not in {"swap", "crypto_LUKS", "LVM2_member"}:
+                try:
+                    mountpoints = [mount_backup_browser_device(str(entry.get("path") or "").strip())]
+                except Exception:
+                    mountpoints = []
+
+        for mountpoint in mountpoints:
+            matches.append(os.path.join(mountpoint, subpath) if subpath else mountpoint)
+
+    return dedupe(matches)
+
+
+def iter_candidate_directories(root: Path, max_depth: int) -> List[Path]:
+    if not root.exists() or not root.is_dir():
+        return []
+    if repo_structure_present(root):
+        return [root]
+
+    found: List[Path] = []
+    for current, dirnames, _ in os.walk(root):
+        current_path = Path(current)
+        try:
+            depth = len(current_path.relative_to(root).parts)
+        except ValueError:
+            depth = 0
+
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+
+        if repo_structure_present(current_path):
+            found.append(current_path)
+            dirnames[:] = []
+            continue
+
+        if depth == max_depth:
+            dirnames[:] = []
+
+    return found
+
+
+def resolve_settings_repo_path(settings: Settings, create_if_missing: bool = False) -> str:
+    repo_path = os.path.abspath(settings.repo_path or DEFAULT_REPO)
+
+    if not is_external_backup_path(repo_path):
+        if create_if_missing:
+            Path(repo_path).mkdir(parents=True, exist_ok=True)
+        settings.repo_path = repo_path
+        return repo_path
+
+    if external_mount_present_for_path(repo_path) and (Path(repo_path).exists() or create_if_missing):
+        if create_if_missing:
+            Path(repo_path).mkdir(parents=True, exist_ok=True)
+        settings.repo_path = repo_path
+        if not settings.repo_device_uuid and not settings.repo_device_partuuid:
+            refresh_repo_locator(settings, repo_path)
+        return repo_path
+
+    locator_match = best_matching_repo_candidate(
+        repo_path,
+        repo_locator_candidates(settings, allow_mount=True),
+    )
+    if locator_match:
+        if create_if_missing:
+            Path(locator_match).mkdir(parents=True, exist_ok=True)
+        settings.repo_path = os.path.abspath(locator_match)
+        refresh_repo_locator(settings, settings.repo_path)
+        return settings.repo_path
+
+    scanned_match = best_matching_repo_candidate(repo_path, discover_repo_candidates())
+    if scanned_match:
+        settings.repo_path = os.path.abspath(scanned_match)
+        refresh_repo_locator(settings, settings.repo_path)
+        if create_if_missing:
+            Path(settings.repo_path).mkdir(parents=True, exist_ok=True)
+        return settings.repo_path
+
+    raise AegisError(
+        "The selected backup drive is not available right now. Reconnect it and click Scan for Backup Drives, or choose the mounted folder again."
 
 def safe_mount_component(value: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "-._" else "-" for ch in (value or "").strip())
@@ -538,7 +731,6 @@ def desktop_notification_recipients() -> List[Tuple[str, int]]:
 def send_desktop_notification(title: str, body: str, urgency: str = "normal") -> None:
     binary = shutil.which("notify-send")
     if not binary:
-        log_line(f"Desktop notification skipped: {title} — {body}")
         return
 
     for user_name, uid in desktop_notification_recipients():
@@ -899,6 +1091,10 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
         machine_id=str(data.get("machine_id") or machine_id()),
         machine_label=str(data.get("machine_label") or hostname()),
         repo_path=str(data.get("repo_path") or DEFAULT_REPO),
+        repo_device_uuid=str(data.get("repo_device_uuid") or ""),
+        repo_device_partuuid=str(data.get("repo_device_partuuid") or ""),
+        repo_device_label=str(data.get("repo_device_label") or ""),
+        repo_mount_subpath=str(data.get("repo_mount_subpath") or ""),
         encryption_enabled=bool(data.get("encryption_enabled", True)),
         notifications_enabled=bool(data.get("notifications_enabled", True)),
         default_backup_profile=normalize_backup_profile(str(data.get("default_backup_profile") or "both")),
@@ -1702,20 +1898,19 @@ def discover_repo_candidates() -> List[str]:
     candidates: List[str] = []
     seen: Set[str] = set()
     search_roots = [Path("/media"), Path("/mnt"), Path("/run/media")]
+
     current = Path(load_settings().repo_path)
     if current.exists():
         search_roots.insert(0, current)
+
     for root in search_roots:
-        if not root.exists():
-            continue
-        roots_to_scan = [root] if root.is_dir() else []
-        for base in roots_to_scan:
-            for candidate in [base] + [p for p in base.glob("*") if p.is_dir()] + [p for p in base.glob("*/*") if p.is_dir()]:
-                if candidate in seen:
-                    continue
-                seen.add(str(candidate))
-                if (candidate / "machines").is_dir() and (candidate / "objects").is_dir():
-                    candidates.append(str(candidate))
+        for candidate in iter_candidate_directories(root, max_depth=4):
+            candidate_str = str(candidate)
+            if candidate_str in seen:
+                continue
+            seen.add(candidate_str)
+            candidates.append(candidate_str)
+
     return dedupe(candidates)
 
 
@@ -1850,8 +2045,8 @@ def unwrap_machine_key(envelope: Dict[str, Any], recovery_password: str) -> byte
 
 
 def materialize_settings(settings: Settings, recovery_password: Optional[str] = None) -> bool:
-    ensure_repo_path_ready(settings.repo_path)
-    repo = Path(settings.repo_path)
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
+    refresh_repo_locator(settings, str(repo))
 
     (repo_machine_dir(repo, settings.machine_id) / "snapshots").mkdir(parents=True, exist_ok=True)
     (repo / "objects" / settings.machine_id).mkdir(parents=True, exist_ok=True)
@@ -2118,7 +2313,7 @@ def prune_empty_dirs(path: Path, stop_at: Path) -> None:
 
 
 def delete_snapshot_from_repo(settings: Settings, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
-    repo = Path(settings.repo_path)
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     with file_lock(LOCK_PATH):
         manifest, manifest_file = find_snapshot_manifest_with_path(repo, snapshot_id)
         candidate_hashes = {ref.hash for ref in manifest.archive_refs}
@@ -2168,7 +2363,10 @@ def snapshot_from_dict(data: Dict[str, Any]) -> SnapshotManifest:
 
 
 def list_snapshots(settings: Settings) -> List[Dict[str, Any]]:
-    repo = Path(settings.repo_path)
+    try:
+        repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    except AegisError:
+        return []
     out: List[Dict[str, Any]] = []
     machines_root = repo / "machines"
     if not machines_root.exists():
@@ -2332,12 +2530,43 @@ def build_tar_restore_command(target: Path, member: Optional[str]) -> subprocess
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
-def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Path, member: Optional[str], apply_packages: bool, recovery_password: Optional[str]) -> None:
-    manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
-    if manifest.kind == "full_recovery" and target.resolve() == Path("/"):
+def validate_restore_target(target: Path, snapshot_kind: str) -> None:
+    if snapshot_kind != "full_recovery":
+        return
+
+    target_path = Path(os.path.abspath(str(target)))
+    if target_path == Path("/"):
         raise AegisError("Full Recovery restore must target an offline-mounted root, not /.")
+
+    source = canonical_block_device_path(mount_source_for_path(str(target_path)))
+    target_disk = device_parent_disk(source) if source.startswith("/dev/") else ""
+
+    if not source:
+        raise AegisError(
+            "Choose a mounted target on another disk, or boot the recovery USB and use Guided Full Restore."
+        )
+
+    if not is_recovery_environment() and target_disk and target_disk == current_root_disk():
+        raise AegisError(
+            "Full Recovery restore is disabled on the disk hosting the running OS. "
+            "Boot from the recovery USB and use Guided Full Restore instead."
+        )
+
+
+def ensure_target_disk_is_not_source_disk(target_disk: str, source_path: str, label: str) -> None:
+    source = canonical_block_device_path(mount_source_for_path(source_path))
+    source_disk = device_parent_disk(source) if source.startswith("/dev/") else ""
+    if source_disk and canonical_block_device_path(target_disk) == canonical_block_device_path(source_disk):
+        raise AegisError(
+            f"Refusing to overwrite the disk that currently holds the {label}. Choose another target disk."
+        )
+
+def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Path, member: Optional[str], apply_packages: bool, recovery_password: Optional[str]) -> None:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    manifest = find_snapshot_manifest(repo, snapshot_id)
+    validate_restore_target(target, manifest.kind)
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
-    extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, target, member)
+    extract_manifest_from_repo_to_target(repo, manifest, key, target, member)
     after_restore_actions(target, manifest, apply_packages)
 
 
@@ -2879,13 +3108,17 @@ def mounted_guided_target(device: str):
 
 
 def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_password: Optional[str]) -> None:
-    manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    ensure_target_disk_is_not_source_disk(target_disk, str(repo), "selected backup repository")
+
+    manifest = find_snapshot_manifest(repo, snapshot_id)
     if manifest.kind != "full_recovery":
         raise AegisError("Guided full restore only works with Full Recovery snapshots.")
+
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     with mounted_guided_target(target_disk) as (layout, mount_root):
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
-        extract_manifest_from_repo_to_target(Path(settings.repo_path), manifest, key, mount_root, None)
+        extract_manifest_from_repo_to_target(repo, manifest, key, mount_root, None)
         write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
         best_effort_full_restore_post_actions(mount_root, layout["disk"])
 
@@ -2907,6 +3140,7 @@ def bundle_manifest_and_archive(bundle_path: Path, password: str) -> Tuple[Snaps
 
 
 def guided_full_restore_from_bundle(bundle_path: Path, password: str, target_disk: str) -> None:
+    ensure_target_disk_is_not_source_disk(target_disk, str(bundle_path), "selected bundle file")
     manifest, archive_path, td = bundle_manifest_and_archive(bundle_path, password)
     try:
         if manifest.kind != "full_recovery":
@@ -3140,11 +3374,13 @@ def decrypt_bundle_to_stream(source, password: str, dest) -> None:
 def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, password: str, recovery_password: Optional[str]) -> None:
     if not password.strip():
         raise AegisError("Bundle export requires a password.")
-    manifest = find_snapshot_manifest(Path(settings.repo_path), snapshot_id)
+
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    manifest = find_snapshot_manifest(repo, snapshot_id)
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     archive_tmp_path = secure_temp_path(".aegisvault-export-archive-", ".tar")
     with archive_tmp_path.open("wb") as archive_tmp:
-        digest = stream_archive_from_repo(Path(settings.repo_path), manifest, key, archive_tmp)
+        digest = stream_archive_from_repo(repo, manifest, key, archive_tmp)
 
     if digest != manifest.archive_sha256:
         archive_tmp_path.unlink(missing_ok=True)
@@ -3168,8 +3404,7 @@ def export_bundle_from_repo(settings: Settings, snapshot_id: str, output: Path, 
 
 
 def restore_plain_archive_file(archive_file: Path, manifest: SnapshotManifest, target: Path, member: Optional[str], apply_packages: bool) -> None:
-    if manifest.kind == "full_recovery" and target.resolve() == Path("/"):
-        raise AegisError("Full Recovery restore must target an offline-mounted root, not /.")
+    validate_restore_target(target, manifest.kind)
     if manifest.archive_sha256 and sha256_file(archive_file) != manifest.archive_sha256:
         raise AegisError("Bundle archive integrity mismatch.")
     extract_archive_file_to_target(archive_file, target, member)
@@ -3247,7 +3482,8 @@ def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path
 def sync_peers(settings: Settings) -> None:
     if not settings.peers_enabled or not settings.peers:
         return
-    repo = Path(settings.repo_path)
+
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
     local_objects = repo / "objects" / settings.machine_id
     local_meta = repo / "machines" / settings.machine_id
     for peer in settings.peers:
@@ -3268,10 +3504,16 @@ def dashboard() -> Dashboard:
     settings = load_settings()
     state = load_state()
     warnings: List[str] = []
-    if not Path(settings.repo_path).exists():
-        warnings.append(f"Backup location is not available: {settings.repo_path}")
-    if settings.notifications_enabled and not shutil.which("notify-send"):
-        warnings.append("Desktop notifications are enabled, but notify-send is not installed. Install libnotify-bin to receive them.")
+
+    try:
+        resolved_repo = resolve_settings_repo_path(settings, create_if_missing=False)
+        if resolved_repo != settings.repo_path:
+            settings.repo_path = resolved_repo
+            save_settings(settings)
+    except AegisError:
+        if settings.repo_path:
+            warnings.append(f"Backup location is not available right now: {settings.repo_path}")
+
     if settings.encryption_enabled and local_key_path(settings.machine_id).exists():
         warnings.append(
             "A legacy plaintext local key still exists. Open settings once to migrate it into the system credential store."
@@ -3350,7 +3592,16 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "dashboard":
         return {"ok": True, "dashboard": asdict(dashboard())}
     if action == "save_settings":
+        previous_settings = load_settings()
         settings = settings_from_dict(request["settings"])
+
+        if (
+            settings.repo_path != previous_settings.repo_path
+            and settings.full_excludes == previous_settings.full_excludes
+            and previous_settings.full_excludes == default_full_excludes(previous_settings.repo_path)
+        ):
+            settings.full_excludes = default_full_excludes(settings.repo_path)
+
         recovery_password = request.get("recovery_password") or None
         created_new_envelope = materialize_settings(settings, recovery_password=recovery_password)
         save_settings(settings)
@@ -3429,13 +3680,25 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         repo_path = str(request.get("repo_path") or "").strip()
         if not repo_path:
             raise AegisError("Backup location is required.")
-        ensure_repo_path_ready(repo_path)
+
         settings = load_settings()
+        previous_repo_path = settings.repo_path
         settings.repo_path = repo_path
-        if not settings.full_excludes:
+        resolved_repo = resolve_settings_repo_path(settings, create_if_missing=True)
+        refresh_repo_locator(settings, resolved_repo)
+
+        if (
+            not settings.full_excludes
+            or settings.full_excludes == default_full_excludes(previous_repo_path)
+        ):
             settings.full_excludes = default_full_excludes(settings.repo_path)
+
         save_settings(settings)
-        return {"ok": True, "message": f"Backup location set to {repo_path}."}
+        return {
+            "ok": True,
+            "repo_path": settings.repo_path,
+            "message": f"Backup location set to {settings.repo_path}.",
+        }
     if action == "mount_backup_device":
         device = str(request.get("device") or "").strip()
         if not device:
@@ -5515,6 +5778,10 @@ def gui_main() -> int:
                 "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
                 "machine_label": self.machine_label_var.get().strip() or hostname(),
                 "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
+                "repo_device_uuid": self.dashboard_payload.get("settings", {}).get("repo_device_uuid", ""),
+                "repo_device_partuuid": self.dashboard_payload.get("settings", {}).get("repo_device_partuuid", ""),
+                "repo_device_label": self.dashboard_payload.get("settings", {}).get("repo_device_label", ""),
+                "repo_mount_subpath": self.dashboard_payload.get("settings", {}).get("repo_mount_subpath", ""),
                 "encryption_enabled": bool(self.encryption_var.get()),
                 "notifications_enabled": bool(self.notifications_enabled_var.get()),
                 "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
