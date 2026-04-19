@@ -38,7 +38,7 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 import getpass
 
 
-APP_NAME = "AegisVault"
+APP_NAME = "Aegis"
 SOCKET_PATH = "/run/aegisvault/daemon.sock"
 VAR_DIR = Path("/var/lib/aegisvault")
 CONFIG_PATH = VAR_DIR / "settings.json"
