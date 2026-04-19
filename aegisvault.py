@@ -3196,11 +3196,16 @@ def best_effort_full_restore_post_actions(
             purge_matching_target_packages(target, PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS)
 
         if (target / "usr/sbin/update-initramfs").exists():
-            run_chroot_checked(
-                target,
-                ["/usr/sbin/update-initramfs", "-u", "-k", "all"]
-                "update-initramfs in restored system",
-            )
+            result = run_chroot(target, ["/usr/sbin/update-initramfs", "-u", "-k", "all"])
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                log_line(f"update-initramfs -u failed, retrying with -c: {detail}")
+        
+                run_chroot_checked(
+                    target,
+                    ["/usr/sbin/update-initramfs", "-c", "-k", "all"],
+                    "update-initramfs in restored system",
+                )
 
         if use_kernelstub_boot:
             host_bootctl = shutil.which("bootctl")
