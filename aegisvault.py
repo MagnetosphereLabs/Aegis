@@ -218,7 +218,7 @@ DEFAULT_FULL_EXCLUDES_BASE = [
     "run/media/*",
 ]
 
-DEFAULT_PORTABLE_INCLUDES = [
+LEGACY_PORTABLE_INCLUDES = [
     "home",
     "etc",
     "opt",
@@ -228,7 +228,11 @@ DEFAULT_PORTABLE_INCLUDES = [
     "var/snap",
 ]
 
-DEFAULT_PORTABLE_EXCLUDES = [
+DEFAULT_PORTABLE_INCLUDES = [
+    ".",
+]
+
+LEGACY_PORTABLE_EXCLUDES = [
     "etc/fstab",
     "etc/machine-id",
     "etc/hostname",
@@ -240,6 +244,50 @@ DEFAULT_PORTABLE_EXCLUDES = [
     "usr/lib/modules/*",
     "var/lib/dkms",
     "var/lib/dkms/*",
+    "home/*/.cache",
+    "home/*/.cache/*",
+    "var/cache",
+    "var/cache/*",
+]
+
+DEFAULT_PORTABLE_EXCLUDES = [
+    "dev",
+    "dev/*",
+    "proc",
+    "proc/*",
+    "sys",
+    "sys/*",
+    "run",
+    "run/*",
+    "tmp",
+    "tmp/*",
+    "var/tmp",
+    "var/tmp/*",
+    "swapfile",
+    "media",
+    "media/*",
+    "mnt",
+    "mnt/*",
+    "run/media",
+    "run/media/*",
+
+    "etc/fstab",
+    "etc/crypttab",
+    "etc/machine-id",
+    "var/lib/dbus/machine-id",
+    "etc/hostname",
+    "etc/hosts",
+    "etc/ssh/ssh_host_*",
+    "etc/udev/rules.d/70-persistent-net.rules",
+    "var/lib/systemd/random-seed",
+
+    "var/lib/dkms",
+    "var/lib/dkms/*",
+    "lib/modules/*/updates/dkms",
+    "lib/modules/*/updates/dkms/*",
+    "usr/lib/modules/*/updates/dkms",
+    "usr/lib/modules/*/updates/dkms/*",
+
     "home/*/.cache",
     "home/*/.cache/*",
     "var/cache",
@@ -825,22 +873,14 @@ def firmware_mode() -> str:
 
 
 PORTABLE_PACKAGE_EXCLUDE_PATTERNS = [
-    "linux-image*",
     "linux-headers*",
-    "linux-modules*",
     "linux-tools*",
     "linux-cloud-tools*",
-    "linux-generic*",
-    "linux-oem*",
-    "linux-firmware*",
     "nvidia*",
     "*-dkms",
     "broadcom-sta*",
     "virtualbox-dkms*",
     "zfs-dkms*",
-    "grub-*",
-    "shim-signed",
-    "systemd-boot*",
 ]
 
 
@@ -1130,9 +1170,11 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
         settings.machine_label = hostname()
     if not settings.full_excludes:
         settings.full_excludes = default_full_excludes(settings.repo_path)
-    if not settings.portable_includes:
+
+    if not settings.portable_includes or settings.portable_includes == LEGACY_PORTABLE_INCLUDES:
         settings.portable_includes = default_portable_includes()
-    if not settings.portable_excludes:
+
+    if not settings.portable_excludes or settings.portable_excludes == LEGACY_PORTABLE_EXCLUDES:
         settings.portable_excludes = default_portable_excludes()
 
     return settings
@@ -2392,12 +2434,16 @@ def kind_label(kind: str) -> str:
 def build_include_paths(settings: Settings, kind: str) -> List[str]:
     if kind == "full_recovery":
         return ["."]
-    includes = []
-    for item in settings.portable_includes:
+
+    includes: List[str] = []
+    for item in (settings.portable_includes or default_portable_includes()):
         cleaned = item.strip().lstrip("/")
-        if cleaned and Path("/") .joinpath(cleaned).exists():
+        if cleaned == ".":
+            return ["."]
+        if cleaned and Path("/").joinpath(cleaned).exists():
             includes.append(cleaned)
-    return dedupe(includes)
+
+    return dedupe(includes or ["."])
 
 
 def build_exclude_paths(settings: Settings, kind: str) -> List[str]:
@@ -2447,7 +2493,7 @@ def collect_snapshot_metadata(kind: str) -> SnapshotMetadata:
         notes.append("Mount target boot/efi before restore if the system uses EFI.")
     else:
         notes.append("Portable System State is intended for migration to different hardware.")
-        notes.append("Hardware-bound kernel modules and host identity files are excluded by default.")
+        notes.append("Machine identity files and out-of-tree hardware-specific driver state are excluded by default.")
     manual_packages = [line.strip() for line in run_command_optional(["apt-mark", "showmanual"]).splitlines() if line.strip()]
     root_source_value = run_command_optional(["findmnt", "-nro", "SOURCE", "/"])
     boot_source_value = run_command_optional(["findmnt", "-nro", "SOURCE", "/boot"])
@@ -3335,10 +3381,11 @@ def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_d
     ensure_target_disk_is_not_source_disk(target_disk, str(repo), "selected backup repository")
 
     manifest = find_snapshot_manifest(repo, snapshot_id)
-    if manifest.kind != "full_recovery":
-        raise AegisError("Guided full restore only works with Full Recovery snapshots.")
+    if manifest.kind not in {"full_recovery", "portable_state"}:
+        raise AegisError("Guided disk restore only works with Full Recovery or Portable Migration snapshots.")
 
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
+
     with mounted_guided_target(target_disk) as (layout, mount_root):
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
         extract_manifest_from_repo_to_target(repo, manifest, key, mount_root, None)
@@ -3538,7 +3585,8 @@ def create_recovery_usb(device: str) -> None:
                 AegisVault Recovery Media
 
                 This environment boots directly into AegisVault so you can restore Full Recovery
-                snapshots onto an internal disk. Use Guided Full Restore for the easiest path.
+                or Portable Migration snapshots onto an internal disk. Use Guided Restore for
+                the easiest path.
             """).strip() + "\n"
             atomic_write(mount_root / "etc/aegisvault-recovery", recovery_notice.encode("utf-8"), mode=0o644)
             atomic_write(mount_root / "etc/hostname", b"aegis-recovery\n", mode=0o644)
@@ -4182,8 +4230,11 @@ def init_command(repo: Optional[str], label: Optional[str], encryption: bool, re
         settings.machine_id = machine_id()
     if not settings.machine_label:
         settings.machine_label = hostname()
-    settings.portable_includes = settings.portable_includes or default_portable_includes()
-    settings.portable_excludes = settings.portable_excludes or default_portable_excludes()
+    if not settings.portable_includes or settings.portable_includes == LEGACY_PORTABLE_INCLUDES:
+        settings.portable_includes = default_portable_includes()
+
+    if not settings.portable_excludes or settings.portable_excludes == LEGACY_PORTABLE_EXCLUDES:
+        settings.portable_excludes = default_portable_excludes()
 
     try:
         materialize_settings(settings, recovery_password=recovery_password)
@@ -4970,7 +5021,7 @@ def gui_main() -> int:
                 ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
 
                 self.restore_context_var = tk.StringVar(
-                    value="Choose the Full Recovery backup you want to restore."
+                    value="Choose the Full Recovery or Portable Migration backup you want to restore."
                 )
                 ttk.Label(
                     recovery,
@@ -5796,48 +5847,62 @@ def gui_main() -> int:
 
             if not snapshot:
                 if hasattr(self, "restore_context_var"):
-                    self.restore_context_var.set(
-                        "Choose the backup to restore. On the recovery USB, only Full Recovery backups can be restored to a disk."
-                    )
+                    if self.recovery_mode:
+                        self.restore_context_var.set(
+                            "Choose a Full Recovery or Portable Migration backup you want to restore to a disk."
+                        )
+                    else:
+                        self.restore_context_var.set(
+                            "Select a backup. Full Recovery is for whole-machine restore. Portable Migration is for moving the system to different hardware."
+                        )
                 if hasattr(self, "repo_restore_button"):
                     self.repo_restore_button.state(["disabled"])
                 if hasattr(self, "guided_restore_repo_button"):
                     self.guided_restore_repo_button.state(["disabled"])
                 return
 
-            if kind == "full_recovery":
-                if hasattr(self, "restore_context_var"):
-                    if self.recovery_mode:
+            if self.recovery_mode:
+                if kind in {"full_recovery", "portable_state"}:
+                    if hasattr(self, "restore_context_var"):
                         self.restore_context_var.set(
-                            "Full Recovery backup selected. Choose the destination disk and click restore."
+                            "This backup can be restored to the selected destination disk from recovery media."
                         )
-                    else:
+                    if hasattr(self, "guided_restore_repo_button"):
+                        self.guided_restore_repo_button.state(["!disabled"])
+                else:
+                    if hasattr(self, "restore_context_var"):
                         self.restore_context_var.set(
-                            "Full Recovery backup selected. Live in-place restore is disabled for safety. Boot the recovery USB and use Guided Full Restore."
+                            "Choose a Full Recovery or Portable Migration backup."
                         )
-                if hasattr(self, "guided_restore_repo_button"):
-                    self.guided_restore_repo_button.state(["!disabled"])
+                    if hasattr(self, "guided_restore_repo_button"):
+                        self.guided_restore_repo_button.state(["disabled"])
+
                 if hasattr(self, "repo_restore_button"):
                     self.repo_restore_button.state(["disabled"])
                 return
 
-            if hasattr(self, "restore_context_var"):
-                if self.recovery_mode:
+            if kind == "full_recovery":
+                if hasattr(self, "restore_context_var"):
                     self.restore_context_var.set(
-                        "Portable Migration backups are not restored from the recovery USB. Boot a normal Linux system to apply a portable restore."
+                        "Full Recovery backup selected. For a full disk restore, boot the recovery USB and use Guided Restore."
                     )
-                else:
+                if hasattr(self, "repo_restore_button"):
+                    self.repo_restore_button.state(["disabled"])
+            elif kind == "portable_state":
+                if hasattr(self, "restore_context_var"):
                     self.restore_context_var.set(
-                        "Portable Migration backup selected. Restore it into a running Linux install or another mounted target folder."
+                        "Portable Migration backup selected. Restore it into a running Linux system, or use recovery media to restore it onto another disk."
                     )
+                if hasattr(self, "repo_restore_button"):
+                    self.repo_restore_button.state(["!disabled"])
+            else:
+                if hasattr(self, "restore_context_var"):
+                    self.restore_context_var.set("Choose a valid backup.")
+                if hasattr(self, "repo_restore_button"):
+                    self.repo_restore_button.state(["disabled"])
 
             if hasattr(self, "guided_restore_repo_button"):
                 self.guided_restore_repo_button.state(["disabled"])
-            if hasattr(self, "repo_restore_button"):
-                if self.recovery_mode:
-                    self.repo_restore_button.state(["disabled"])
-                else:
-                    self.repo_restore_button.state(["!disabled"])
         
         def confirm_dangerous_action(self, title: str, message: str) -> bool:
             return messagebox.askyesno(title, message, icon="warning")
@@ -5869,12 +5934,12 @@ def gui_main() -> int:
 
             try:
                 info = self.get_snapshot_restore_info(self.selected_snapshot_id)
-            except Exception as exc:
+            except Exception as exc: 
                 self.message_var.set(str(exc))
                 return
 
-            if info.get("kind") != "full_recovery":
-                self.message_var.set("Choose a Full Recovery backup for disk restore.")
+            if info.get("kind") not in {"full_recovery", "portable_state"}:
+                self.message_var.set("Choose a valid backup first.")
                 return
 
             recovery_password = self.repo_recovery_key_var.get().strip()
@@ -5894,7 +5959,7 @@ def gui_main() -> int:
 
             if not self.confirm_dangerous_action(
                 "Guided Full Restore",
-                f"This will erase everything on {device} and restore the selected Full Recovery backup. Continue?",
+                f"This will erase everything on {device} and restore the selected backup. Continue?",
             ):
                 return
 
@@ -5929,7 +5994,7 @@ def gui_main() -> int:
             if not password:
                 self.message_var.set("Bundle password is required.")
                 return
-            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery bundle. Continue?"):
+            if not self.confirm_dangerous_action("Guided Restore", f"This will wipe {device} and restore the selected bundle. Continue?"):
                 return
             try:
                 response = send_daemon_request({
