@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AegisVault
+Aegis
 Compact Linux backup app for Debian-based systems.
 Single application file with GUI, CLI, daemon, backup engine, restore engine, and peer sync.
 """
@@ -727,7 +727,7 @@ def host_service_unit_text() -> str:
     return textwrap.dedent(
         f"""
         [Unit]
-        Description=AegisVault background backup daemon
+        Description=Aegis background backup daemon
         After=network-online.target local-fs.target
         Wants=network-online.target
 
@@ -1694,7 +1694,7 @@ def wait_for_expected_disk_size(device: str, expected_size: int, timeout_seconds
     seen_text = human_bytes(last_seen) if last_seen > 0 else "0 B"
     raise AegisError(
         f"{requested} is still reporting an invalid transient size ({seen_text}) instead of {expected_text}. "
-        "AegisVault already tried partition-table rereads, udev reprocessing, and a per-device rescan before giving up."
+        "Aegis already tried partition-table rereads, udev reprocessing, and a per-device rescan before giving up."
     )
 
 
@@ -2072,7 +2072,7 @@ def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds
     )
     raise AegisError(
         f"{label} did not come back as a usable whole-disk device after the kernel updated block devices. "
-        "AegisVault tried udev settle/wait, partition-table rereads, partprobe, partx, and a per-device rescan. "
+        "Aegis tried udev settle/wait, partition-table rereads, partprobe, partx, and a per-device rescan. "
         "If the stick is still present, Linux either renumbered it ambiguously or the device itself stopped responding."
     )
 
@@ -3093,7 +3093,7 @@ def run_mkfs_with_retry(cmd: List[str], device: str, attempts: int = 4) -> None:
                     raise AegisError(
                         f"{detail} The selected USB drive is visible to Linux, "
                         f"but it did not complete a required write/flush on {device}. "
-                        f"AegisVault only touched the selected target disk ({disk}). "
+                        f"Aegis only touched the selected target disk ({disk}). "
                         f"Try one different USB port; if the same error returns, "
                         f"replace the USB stick."
                     ) from exc
@@ -3222,7 +3222,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
 
                 raise AegisError(
                     f"{device} is still reporting a bogus transient size to the kernel while partitioning. "
-                    "AegisVault now avoids destructive delete/rescan behavior, but the current host block-device "
+                    "Aegis avoids destructive delete/rescan behavior, but the current host block-device "
                     "state is already wedged. Reboot once, reconnect the USB stick, and retry."
                 ) from exc
 
@@ -3230,7 +3230,7 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
                 if "unable to inform the kernel" in detail or "in use" in detail:
                     raise AegisError(
                         f"{detail} The selected USB disk would not accept a clean "
-                        f"partition-table rescan. AegisVault only touched the selected "
+                        f"partition-table rescan. Aegis only touched the selected "
                         f"target disk ({device}). Try unplugging and reconnecting it once."
                     ) from exc
                 raise
@@ -3582,9 +3582,9 @@ def create_recovery_usb(device: str) -> None:
             atomic_write(root_dir / ".xinitrc", xinitrc.encode("utf-8"), mode=0o755)
 
             recovery_notice = textwrap.dedent("""
-                AegisVault Recovery Media
+                Aegis Recovery Media
 
-                This environment boots directly into AegisVault so you can restore Full Recovery
+                This environment boots directly into Aegis so you can restore Full Recovery
                 or Portable Migration snapshots onto an internal disk. Use Guided Restore for
                 the easiest path.
             """).strip() + "\n"
@@ -4148,7 +4148,7 @@ def authorize_socket_access_for_user() -> None:
 
     pkexec = shutil.which("pkexec")
     if not pkexec:
-        raise AegisError("pkexec is required to authorize AegisVault for this desktop session.")
+        raise AegisError("pkexec is required to authorize Aegis for this desktop session.")
 
     user_name = pwd.getpwuid(os.getuid()).pw_name
     cmd = [
@@ -4195,7 +4195,7 @@ def authorize_socket_command(user: str) -> int:
             time.sleep(0.2)
 
         if not Path(SOCKET_PATH).exists():
-            raise AegisError("AegisVault daemon socket was not created.")
+            raise AegisError("Aegis daemon socket was not created.")
 
         if shutil.which("setfacl"):
             result = subprocess.run(
@@ -4568,7 +4568,7 @@ def gui_main() -> int:
             self.refresh_local_device_lists()
             self.scan_repository_candidates(auto_use=self.recovery_mode)
             if self.recovery_mode:
-                hint = "Recovery mode: connect the backup drive, let AegisVault find the backup repository, and use Guided Full Restore."
+                hint = "Recovery mode: connect the backup drive, let Aegis find the backup repository, and use Guided Full Restore."
                 if self.recovery_mounts:
                     hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
                 self.message_var.set(hint)
@@ -4756,7 +4756,7 @@ def gui_main() -> int:
             ttk.Checkbutton(frame, text="Encrypt backups", variable=self.encryption_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(14, 0))
             ttk.Label(
                 frame,
-                text="This protects backup data at rest. To allow automatic backups, AegisVault keeps a local root-only unlock key on this machine.",
+                text="This protects backup data at rest. To allow automatic backups, Aegis keeps a local root-only unlock key on this machine.",
                 wraplength=1020,
                 style="Muted.TLabel",
             ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(6, 0))
@@ -4818,7 +4818,7 @@ def gui_main() -> int:
                 self.notebook.select(self.overview_tab)
             else:
                 self.notebook.select(self.setup_tab)
-                self.message_var.set("Finish setup to unlock the rest of AegisVault.")
+                self.message_var.set("Finish setup to unlock the rest of Aegis.")
 
         def complete_onboarding(self) -> None:
             try:
@@ -4826,7 +4826,7 @@ def gui_main() -> int:
                 response = self.submit_settings_with_recovery_password_if_needed(payload)
                 self.message_var.set(
                     response.get("message", "Setup saved.")
-                    + " AegisVault will now keep running in the background using your selected plan."
+                    + " Aegis will now keep running in the background using your selected plan."
                 )
                 self.settings_loaded = False
                 self.refresh_dashboard()
@@ -5056,7 +5056,7 @@ def gui_main() -> int:
                 return
             else:
                 ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-                ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. AegisVault will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+                ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. Aegis will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
                 device_row = ttk.Frame(helper)
                 device_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
 
@@ -5691,7 +5691,7 @@ def gui_main() -> int:
 
                 if self.recovery_mode and not guided_choices:
                     self.message_var.set(
-                        "No restore targets are visible yet. AegisVault asked Linux to rescan block devices, but the recovery environment still is not exposing any target disks."
+                        "No restore targets are visible yet. Aegis asked Linux to rescan block devices, but the recovery environment still is not exposing any target disks."
                     )
             except Exception as exc:
                 self.message_var.set(str(exc))
@@ -5785,13 +5785,13 @@ def gui_main() -> int:
                         self.use_repo_source_path()
                     elif self.recovery_mode:
                         self.message_var.set(
-                            "Backup repository detected. Choose it below if AegisVault did not switch automatically."
+                            "Backup repository detected. Choose it below if Aegis did not switch automatically."
                         )
                     return
 
                 if self.recovery_mode:
                     self.message_var.set(
-                        "No backup repositories were detected yet. In recovery mode AegisVault will auto-mount readable external drives when you click Scan for Backup Drives."
+                        "No backup repositories were detected yet. In recovery mode Aegis will auto-mount readable external drives when you click Scan for Backup Drives."
                     )
             except Exception as exc:
                 self.message_var.set(str(exc))
@@ -6197,7 +6197,7 @@ def gui_main() -> int:
             if not password:
                 self.message_var.set("Enter a bundle password first.")
                 return
-            output = filedialog.asksaveasfilename(defaultextension=".avb", filetypes=[("AegisVault bundle", "*.avb"), ("All files", "*.*")])
+            output = filedialog.asksaveasfilename(defaultextension=".avb", filetypes=[("Aegis bundle", "*.avb"), ("All files", "*.*")])
             if not output:
                 return
             try:
