@@ -2935,6 +2935,34 @@ def safe_unlink_any(path: Path) -> None:
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         pass
+
+def ensure_restored_runtime_dirs(target: Path) -> None:
+    """
+    Fresh restore targets start empty, and our backups intentionally exclude
+    volatile directories like /tmp and /var/tmp. Recreate the minimum runtime
+    layout that post-restore tools expect before we chroot into the target.
+    """
+    required_dirs = {
+        "tmp": 0o1777,
+        "var": 0o755,
+        "var/tmp": 0o1777,
+        "var/log": 0o755,
+        "var/cache": 0o755,
+        "var/cache/apt": 0o755,
+        "var/cache/apt/archives": 0o755,
+        "var/cache/apt/archives/partial": 0o755,
+        "var/lib": 0o755,
+        "var/lib/apt": 0o755,
+        "var/lib/apt/lists": 0o755,
+        "var/lib/apt/lists/partial": 0o755,
+        "var/lib/initramfs-tools": 0o755,
+    }
+
+    for rel, mode in required_dirs.items():
+        path = target / rel
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, mode)
+
 def remove_globbed_target_paths(target: Path, patterns: List[str]) -> None:
     for pattern in patterns:
         for candidate in target.glob(pattern):
@@ -3160,6 +3188,7 @@ def best_effort_full_restore_post_actions(
     target_disk: Optional[str] = None,
     snapshot_kind: str = "full_recovery",
 ) -> None:
+    ensure_restored_runtime_dirs(target)
     use_kernelstub_boot = target_uses_kernelstub_boot(target)
 
     with mounted_chroot_bindings(target):
@@ -3169,7 +3198,7 @@ def best_effort_full_restore_post_actions(
         if (target / "usr/sbin/update-initramfs").exists():
             run_chroot_checked(
                 target,
-                ["/usr/sbin/update-initramfs", "-c", "-k", "all"],
+                ["/usr/sbin/update-initramfs", "-u", "-k", "all"]
                 "update-initramfs in restored system",
             )
 
