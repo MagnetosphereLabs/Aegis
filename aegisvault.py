@@ -2919,19 +2919,79 @@ def run_chroot_checked(target: Path, args: List[str], label: Optional[str] = Non
         raise AegisError(f"{label or ' '.join(args)} failed: {detail}")
     return result
 
+def target_uses_kernelstub_boot(target: Path) -> bool:
+    if not (target / "boot/efi").exists():
+        return False
+
+    os_release = safe_read_text(str(target / "etc/os-release")).lower()
+    return (
+        (target / "usr/bin/kernelstub").exists()
+        or "id=pop" in os_release
+        or "pop!_os" in os_release
+    )
 
 def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[str] = None) -> None:
+    use_kernelstub_boot = target_uses_kernelstub_boot(target)
+
     with mounted_chroot_bindings(target):
         if (target / "usr/sbin/update-initramfs").exists():
-            run_chroot(target, ["/usr/sbin/update-initramfs", "-u", "-k", "all"])
+            run_chroot_checked(
+                target,
+                ["/usr/sbin/update-initramfs", "-c", "-k", "all"],
+                "update-initramfs in restored system",
+            )
+
+        if use_kernelstub_boot:
+            host_bootctl = shutil.which("bootctl")
+            if host_bootctl and (target / "boot/efi").exists():
+                result = subprocess.run(
+                    [host_bootctl, f"--path={target / 'boot/efi'}", "install"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                    raise AegisError(f"bootctl install failed: {detail}")
+
+            if (target / "usr/bin/kernelstub").exists():
+                run_chroot_checked(
+                    target,
+                    [
+                        "/usr/bin/kernelstub",
+                        "-v",
+                        "--esp-path",
+                        "/boot/efi",
+                        "--root-path",
+                        "/",
+                        "--loader",
+                        "--force-update",
+                    ],
+                    "kernelstub refresh in restored system",
+                )
+            return
+
         if target_disk and (target / "usr/sbin/grub-install").exists():
             if (target / "boot/efi").exists():
-                run_chroot(target, ["/usr/sbin/grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=AegisVault", "--recheck", "--no-nvram"])
+                run_chroot(
+                    target,
+                    [
+                        "/usr/sbin/grub-install",
+                        "--target=x86_64-efi",
+                        "--efi-directory=/boot/efi",
+                        "--bootloader-id=AegisVault",
+                        "--recheck",
+                        "--no-nvram",
+                    ],
+                )
             run_chroot(target, ["/usr/sbin/grub-install", target_disk])
+
         if (target / "usr/sbin/update-grub").exists():
-            run_chroot(target, ["/usr/sbin/update-grub"])
-        if (target / "usr/bin/bootctl").exists() and (target / "boot/efi").exists():
-            run_chroot(target, ["/usr/bin/bootctl", "install"])
+            run_chroot_checked(
+                target,
+                ["/usr/sbin/update-grub"],
+                "update-grub in restored system",
+            )
 
 
 def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], target: Path, member: Optional[str]) -> None:
