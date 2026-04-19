@@ -1269,51 +1269,6 @@ def device_parent_disk(device: str) -> str:
 def current_root_disk() -> str:
     return device_parent_disk(current_root_source())
 
-
-def list_block_devices() -> List[Dict[str, Any]]:
-    raw = run_command_optional([
-        "lsblk", "-J", "-b",
-        "-o",
-        "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,PARTN,MOUNTPOINTS",
-    ])
-    if not raw:
-        return []
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-
-    out: List[Dict[str, Any]] = []
-
-    def walk(node: Dict[str, Any]) -> None:
-        mountpoints = [mp for mp in (node.get("mountpoints") or []) if mp]
-        entry = {
-            "name": node.get("name", ""),
-            "path": node.get("path", ""),
-            "type": node.get("type", ""),
-            "size": int(node.get("size") or 0),
-            "removable": bool(node.get("rm", False)),
-            "read_only": bool(node.get("ro", False)),
-            "transport": node.get("tran") or "",
-            "model": (node.get("model") or "").strip(),
-            "serial": (node.get("serial") or "").strip(),
-            "fstype": node.get("fstype") or "",
-            "label": node.get("label") or "",
-            "uuid": node.get("uuid") or "",
-            "partuuid": node.get("partuuid") or "",
-            "pkname": node.get("pkname") or "",
-            "partn": int(node.get("partn") or 0),
-            "mountpoints": mountpoints,
-        }
-        out.append(entry)
-        for child in node.get("children") or []:
-            walk(child)
-
-    for node in payload.get("blockdevices") or []:
-        walk(node)
-    return out
-
-
 def canonical_block_device_path(device: str) -> str:
     value = str(device or "").strip()
     if not value:
@@ -1770,6 +1725,219 @@ def _entry_identity_score(entry: Dict[str, Any], identity: Dict[str, Any]) -> in
     return score
 
 
+def device_mountpoints_map() -> Dict[str, List[str]]:
+    mapping: Dict[str, List[str]] = {}
+    raw = run_command_optional(["findmnt", "-rn", "-o", "SOURCE,TARGET"])
+    for line in raw.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        source, target = parts
+        source_real = canonical_block_device_path(source)
+        if not source_real.startswith("/dev/"):
+            continue
+        mapping.setdefault(source_real, []).append(os.path.abspath(target))
+    return {key: dedupe(value) for key, value in mapping.items()}
+
+
+def refresh_block_device_inventory() -> None:
+    udevadm = shutil.which("udevadm")
+    if udevadm:
+        subprocess.run(
+            [udevadm, "trigger", "--subsystem-match=block", "--action=add"],
+            check=False,
+            capture_output=True,
+        )
+        subprocess.run(
+            [udevadm, "trigger", "--subsystem-match=block", "--action=change"],
+            check=False,
+            capture_output=True,
+        )
+
+    for host in sorted(Path("/sys/class/scsi_host").glob("host*")):
+        scan_path = host / "scan"
+        try:
+            if scan_path.exists():
+                scan_path.write_text("- - -\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    for controller in sorted(Path("/sys/class/nvme").glob("nvme*")):
+        rescan_path = controller / "rescan_controller"
+        try:
+            if rescan_path.exists():
+                rescan_path.write_text("1\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    for block in sorted(Path("/sys/class/block").iterdir()):
+        if (block / "partition").exists():
+            continue
+        rescan_path = block / "device" / "rescan"
+        try:
+            if rescan_path.exists():
+                rescan_path.write_text("1\n", encoding="utf-8")
+        except Exception:
+            pass
+
+    if udevadm:
+        subprocess.run([udevadm, "settle"], check=False, capture_output=True)
+
+
+def _parse_lsblk_payload(raw: str) -> List[Dict[str, Any]]:
+    if not raw:
+        return []
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+
+    out: List[Dict[str, Any]] = []
+
+    def walk(node: Dict[str, Any]) -> None:
+        mountpoints_raw = node.get("mountpoints")
+        if isinstance(mountpoints_raw, list):
+            mountpoints = [os.path.abspath(mp) for mp in mountpoints_raw if mp]
+        else:
+            mountpoint = str(node.get("mountpoint") or "").strip()
+            mountpoints = [os.path.abspath(mountpoint)] if mountpoint else []
+
+        entry = {
+            "name": node.get("name", ""),
+            "path": node.get("path", ""),
+            "type": node.get("type", ""),
+            "size": int(node.get("size") or 0),
+            "removable": bool(node.get("rm", False)),
+            "read_only": bool(node.get("ro", False)),
+            "transport": node.get("tran") or "",
+            "model": (node.get("model") or "").strip(),
+            "serial": (node.get("serial") or "").strip(),
+            "fstype": node.get("fstype") or "",
+            "label": node.get("label") or "",
+            "uuid": node.get("uuid") or "",
+            "partuuid": node.get("partuuid") or "",
+            "pkname": node.get("pkname") or "",
+            "partn": int(node.get("partn") or 0),
+            "mountpoints": mountpoints,
+        }
+        out.append(entry)
+        for child in node.get("children") or []:
+            walk(child)
+
+    for node in payload.get("blockdevices") or []:
+        walk(node)
+    return out
+
+
+def _sysfs_read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        return ""
+
+
+def list_block_devices_fallback() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    mountpoints_by_device = device_mountpoints_map()
+    sys_class = Path("/sys/class/block")
+    if not sys_class.exists():
+        return out
+
+    for sys_entry in sorted(sys_class.iterdir()):
+        name = sys_entry.name
+        if name.startswith(("loop", "ram", "zram", "sr")):
+            continue
+
+        devnode = Path("/dev") / name
+        if not (devnode.exists() or devnode.is_symlink()):
+            continue
+
+        path = str(devnode)
+        path_real = canonical_block_device_path(path)
+        part_text = _sysfs_read(sys_entry / "partition")
+        type_value = "part" if part_text.isdigit() else "disk"
+        size_text = _sysfs_read(sys_entry / "size")
+        size_value = int(size_text) * 512 if size_text.isdigit() else 0
+
+        out.append({
+            "name": name,
+            "path": path,
+            "type": type_value,
+            "size": size_value,
+            "removable": _sysfs_read(sys_entry / "removable") == "1",
+            "read_only": _sysfs_read(sys_entry / "ro") == "1",
+            "transport": "usb" if "/usb" in os.path.realpath(str(sys_entry / "device")) else "",
+            "model": _sysfs_read(sys_entry / "device" / "model"),
+            "serial": _sysfs_read(sys_entry / "device" / "serial"),
+            "fstype": blkid_value(path_real, "TYPE") if path_real else "",
+            "label": blkid_value(path_real, "LABEL") if path_real else "",
+            "uuid": blkid_value(path_real, "UUID") if path_real else "",
+            "partuuid": blkid_value(path_real, "PARTUUID") if path_real else "",
+            "pkname": run_command_optional(["lsblk", "-ndo", "PKNAME", path]).strip() if path else "",
+            "partn": int(part_text) if part_text.isdigit() else 0,
+            "mountpoints": mountpoints_by_device.get(path_real, []),
+        })
+
+    return out
+
+
+def list_block_devices(refresh: bool = False) -> List[Dict[str, Any]]:
+    if refresh:
+        refresh_block_device_inventory()
+
+    queries = [
+        [
+            "lsblk", "-J", "-b",
+            "-o",
+            "NAME,PATH,TYPE,SIZE,RM,RO,TRAN,MODEL,SERIAL,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,PARTN,MOUNTPOINTS",
+        ],
+        [
+            "lsblk", "-J", "-b",
+            "-o",
+            "NAME,PATH,TYPE,SIZE,RM,RO,FSTYPE,LABEL,UUID,PARTUUID,PKNAME,PARTN,MOUNTPOINT",
+        ],
+    ]
+
+    for cmd in queries:
+        items = _parse_lsblk_payload(run_command_optional(cmd))
+        if items:
+            return items
+
+    return list_block_devices_fallback()
+
+
+def list_disk_choices(
+    exclude_paths: Optional[Set[str]] = None,
+    removable_only: bool = False,
+    refresh: bool = False,
+) -> List[Dict[str, Any]]:
+    excluded = {
+        canonical_block_device_path(path) or str(path)
+        for path in (exclude_paths or set())
+        if path
+    }
+
+    items: List[Dict[str, Any]] = []
+    for entry in list_block_devices(refresh=refresh):
+        if entry.get("type") != "disk":
+            continue
+
+        entry_path = canonical_block_device_path(entry.get("path", "")) or entry.get("path", "")
+        if entry_path in excluded:
+            continue
+        if removable_only and not (entry.get("removable") or entry.get("transport") == "usb"):
+            continue
+
+        label = entry.get("model") or entry.get("serial") or entry.get("label") or entry.get("name")
+        items.append({
+            **entry,
+            "display": f"{entry.get('path')}  |  {label}  |  {human_bytes(int(entry.get('size') or 0))}",
+        })
+
+    return items
+
+
 def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds: int = 20) -> str:
     deadline = time.time() + max(1, timeout_seconds)
     last_seen_path = ""
@@ -1877,24 +2045,6 @@ def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
             return entry
     return None
 
-def list_disk_choices(exclude_paths: Optional[Set[str]] = None, removable_only: bool = False) -> List[Dict[str, Any]]:
-    exclude_paths = exclude_paths or set()
-    items: List[Dict[str, Any]] = []
-    for entry in list_block_devices():
-        if entry.get("type") != "disk":
-            continue
-        if entry.get("path") in exclude_paths:
-            continue
-        if removable_only and not (entry.get("removable") or entry.get("transport") == "usb"):
-            continue
-        label = entry.get("model") or entry.get("serial") or entry.get("name")
-        items.append({
-            **entry,
-            "display": f"{entry.get('path')}  |  {label}  |  {human_bytes(int(entry.get('size') or 0))}",
-        })
-    return items
-
-
 def discover_repo_candidates() -> List[str]:
     candidates: List[str] = []
     seen: Set[str] = set()
@@ -1927,25 +2077,57 @@ def unmount_device_tree(device: str) -> None:
 def auto_mount_recovery_sources() -> List[str]:
     if not is_recovery_environment():
         return []
+
+    refresh_block_device_inventory()
+
     mounted: List[str] = []
     root_disk = current_root_disk()
     AUTO_MOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+    seen: Set[str] = set()
+
     for entry in list_block_devices():
         if entry.get("type") != "part":
             continue
+
+        path = str(entry.get("path") or "").strip()
+        if not path or path in seen:
+            continue
+        seen.add(path)
+
         if entry.get("mountpoints"):
             continue
-        parent = device_parent_disk(entry.get("path", ""))
+
+        parent = device_parent_disk(path)
         if parent == root_disk:
             continue
-        fstype = entry.get("fstype") or ""
+
+        fstype = (entry.get("fstype") or "").strip()
         if not fstype or fstype in {"swap", "crypto_LUKS", "LVM2_member"}:
             continue
-        mountpoint = AUTO_MOUNT_ROOT / entry.get("name", "disk")
+
+        base_name = safe_mount_component(entry.get("label") or entry.get("name") or Path(path).name)
+        mountpoint = AUTO_MOUNT_ROOT / base_name
+
+        if mountpoint.exists() and mountpoint.is_mount():
+            mounted.append(str(mountpoint))
+            continue
+
+        suffix = 2
+        while mountpoint.exists():
+            mountpoint = AUTO_MOUNT_ROOT / f"{base_name}-{suffix}"
+            suffix += 1
+
         mountpoint.mkdir(parents=True, exist_ok=True)
-        result = subprocess.run(["mount", "-o", "ro", entry["path"], str(mountpoint)], capture_output=True, text=True)
+        result = subprocess.run(
+            ["mount", "-o", "ro", path, str(mountpoint)],
+            capture_output=True,
+            text=True,
+        )
         if result.returncode == 0:
             mounted.append(str(mountpoint))
+        else:
+            shutil.rmtree(mountpoint, ignore_errors=True)
+
     return mounted
 
 
@@ -3223,6 +3405,18 @@ def create_recovery_usb(device: str) -> None:
                 "ntfs-3g",
                 "exfatprogs",
                 "util-linux",
+                "udisks2",
+                "nvme-cli",
+                "cryptsetup",
+                "mdadm",
+                "lvm2",
+                "dmsetup",
+                "usbutils",
+                "pciutils",
+                "firmware-misc-nonfree",
+                "firmware-brcm80211",
+                "firmware-iwlwifi",
+                "firmware-realtek",
                 "sudo",
             ]
             try:
@@ -3292,6 +3486,7 @@ def create_recovery_usb(device: str) -> None:
             xinitrc = textwrap.dedent("""
                 #!/usr/bin/env bash
                 export AEGISVAULT_RECOVERY=1
+                /usr/bin/udevadm settle --timeout=10 || true
                 xsetroot -solid '#0e1116'
                 /usr/bin/openbox-session &
                 exec python3 /opt/aegisvault/aegisvault.py gui
@@ -4664,15 +4859,29 @@ def gui_main() -> int:
                 "Use Guided Full Restore from recovery media for disk-level recovery, or restore a Portable Migration backup into a running Linux install."
             )
             ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
-            ttk.Label(intro, text="Backups drive or folder").grid(row=2, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(intro, textvariable=self.repo_source_var, width=58).grid(row=2, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(intro, text="Choose Drive or Folder", command=lambda: self.browse_directory(self.repo_source_var)).grid(row=2, column=2, padx=(8, 0), pady=(12, 0))
-            ttk.Button(intro, text="Use This Location", command=self.use_repo_source_path).grid(row=2, column=3, padx=(8, 0), pady=(12, 0))
-            ttk.Button(intro, text="Scan for Backup Drives", command=lambda: self.scan_repository_candidates(auto_use=False)).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
-            ttk.Label(intro, text="Detected backup drives").grid(row=3, column=0, sticky="w", pady=(10, 0))
-            self.repo_candidate_combo = ttk.Combobox(intro, textvariable=self.repo_candidate_var, width=56, state="readonly")
-            self.repo_candidate_combo.grid(row=3, column=1, sticky="w", pady=(10, 0))
-            ttk.Button(intro, text="Use Selected", command=self.use_selected_repo_candidate).grid(row=3, column=2, padx=(8, 0), pady=(10, 0))
+            intro.grid_columnconfigure(1, weight=1)
+
+            ttk.Label(intro, text="Backup location").grid(row=2, column=0, sticky="w", pady=(12, 0))
+            repo_source_entry = ttk.Entry(
+                intro,
+                textvariable=self.repo_source_var,
+                width=72,
+                state="readonly",
+            )
+            repo_source_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(12, 0))
+
+            ttk.Button(
+                intro,
+                text="Choose Backup Drive or Folder",
+                command=self.choose_and_use_repo_source,
+            ).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
+
+            ttk.Label(
+                intro,
+                text="The chooser already handles mounted drives, unmounted drives, refresh, and folder browsing. Pick the backup location there.",
+                wraplength=1080,
+                style="Muted.TLabel",
+            ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
@@ -4922,6 +5131,14 @@ def gui_main() -> int:
             chosen = self.open_directory_chooser(start_path)
             if chosen:
                 variable.set(chosen)
+
+        def choose_and_use_repo_source(self) -> None:
+            start_path = self.repo_source_var.get().strip() or self.repo_path_var.get().strip() or "/"
+            chosen = self.open_directory_chooser(start_path)
+            if not chosen:
+                return
+            self.repo_source_var.set(chosen)
+            self.use_repo_source_path()
         
         def open_directory_chooser(self, start_path: str) -> Optional[str]:
             dialog = tk.Toplevel(self.root)
@@ -5021,7 +5238,7 @@ def gui_main() -> int:
                 seen_paths: Set[str] = set()
                 seen_devices: Set[str] = set()
                 root_disk = current_root_disk()
-                entries = list_block_devices()
+                entries = list_block_devices(refresh=True)
                 entries_by_path = {entry.get("path", ""): entry for entry in entries}
 
                 for entry in entries:
@@ -5046,7 +5263,7 @@ def gui_main() -> int:
                         or parent_entry.get("transport") == "usb"
                         or any(mp.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES) for mp in mountpoints)
                     )
-                    if not is_external:
+                    if not is_external and not self.recovery_mode:
                         continue
 
                     fstype = (entry.get("fstype") or "").strip()
@@ -5304,8 +5521,16 @@ def gui_main() -> int:
         def refresh_local_device_lists(self) -> None:
             try:
                 excluded = self.excluded_target_disks()
-                usb_choices = list_disk_choices(exclude_paths=excluded, removable_only=True)
-                guided_choices = list_disk_choices(exclude_paths=excluded, removable_only=False)
+                usb_choices = list_disk_choices(
+                    exclude_paths=excluded,
+                    removable_only=True,
+                    refresh=True,
+                )
+                guided_choices = list_disk_choices(
+                    exclude_paths=excluded,
+                    removable_only=False,
+                    refresh=True,
+                )
 
                 self.usb_choice_map = {item["display"]: item["path"] for item in usb_choices}
                 self.guided_disk_map = {item["display"]: item["path"] for item in guided_choices}
@@ -5319,6 +5544,11 @@ def gui_main() -> int:
                     self.recovery_usb_device_var.set(usb_choices[0]["display"])
                 if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
                     self.guided_target_disk_var.set(guided_choices[0]["display"])
+
+                if self.recovery_mode and not guided_choices:
+                    self.message_var.set(
+                        "No restore targets are visible yet. AegisVault asked Linux to rescan block devices, but the recovery environment still is not exposing any target disks."
+                    )
             except Exception as exc:
                 self.message_var.set(str(exc))
         
@@ -5589,6 +5819,8 @@ def gui_main() -> int:
                 self.message_var.set(str(exc))
 
         def periodic_refresh(self) -> None:
+            if self.recovery_mode:
+                self.refresh_local_device_lists()
             self.refresh_dashboard()
             self.root.after(2000, self.periodic_refresh)
 
