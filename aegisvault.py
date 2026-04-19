@@ -883,6 +883,20 @@ PORTABLE_PACKAGE_EXCLUDE_PATTERNS = [
     "zfs-dkms*",
 ]
 
+PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS = dedupe(PORTABLE_PACKAGE_EXCLUDE_PATTERNS + [
+    "bcmwl-kernel-source",
+])
+
+PORTABLE_HARDWARE_CONFIG_GLOBS = [
+    "etc/X11/xorg.conf",
+    "etc/X11/xorg.conf.d/*nvidia*",
+    "etc/modprobe.d/*nvidia*",
+    "lib/modprobe.d/*nvidia*",
+    "usr/lib/modprobe.d/*nvidia*",
+    "etc/modules-load.d/*nvidia*",
+    "lib/modules-load.d/*nvidia*",
+    "usr/lib/modules-load.d/*nvidia*",
+]
 
 def filter_portable_manual_packages(packages: List[str]) -> List[str]:
     filtered: List[str] = []
@@ -2921,17 +2935,72 @@ def safe_unlink_any(path: Path) -> None:
             path.unlink(missing_ok=True)
     except FileNotFoundError:
         pass
+def remove_globbed_target_paths(target: Path, patterns: List[str]) -> None:
+    for pattern in patterns:
+        for candidate in target.glob(pattern):
+            safe_unlink_any(candidate)
 
 
-def sanitize_guided_restore_target(target: Path) -> None:
-    # Guided restore currently creates a plain ext4 root + EFI partition.
-    # Old source-machine resume/crypto metadata can make initramfs wait for
-    # devices that do not exist on the restored disk and drop to BusyBox.
+def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
+    if not (target / "usr/bin/dpkg-query").exists():
+        return
+
+    result = run_chroot(target, ["/usr/bin/dpkg-query", "-W", "-f=${Package}\n"])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        log_line(f"Could not enumerate restored packages for portable scrub: {detail}")
+        return
+
+    installed = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    matches = dedupe([
+        pkg for pkg in installed
+        if any(fnmatch.fnmatch(pkg, pattern) for pattern in patterns)
+    ])
+
+    if not matches:
+        return
+
+    update_stage("Removing hardware-specific packages from portable restore")
+
+    for i in range(0, len(matches), 32):
+        group = matches[i:i + 32]
+        result = run_chroot(
+            target,
+            [
+                "/usr/bin/env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "purge",
+                "-y",
+                *group,
+            ],
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+            log_line(f"Portable hardware purge warning for {' '.join(group)}: {detail}")
+
+    run_chroot(
+        target,
+        [
+            "/usr/bin/env",
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "autoremove",
+            "-y",
+        ],
+    )
+
+
+def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
     for rel in [
         "etc/initramfs-tools/conf.d/resume",
+        "etc/initramfs-tools/conf.d/cryptroot",
         "etc/crypttab",
     ]:
         safe_unlink_any(target / rel)
+
+    if snapshot_kind == "portable_state":
+        remove_globbed_target_paths(target, PORTABLE_HARDWARE_CONFIG_GLOBS)
 
 
 def mounted_block_device_for_path(path: Path) -> str:
@@ -2953,25 +3022,6 @@ def current_target_root_partuuid(target: Path) -> str:
     if not root_partition.startswith("/dev/"):
         return ""
     return blkid_value(root_partition, "PARTUUID")
-
-
-def loader_entries_reference_current_root(target: Path) -> bool:
-    entries_dir = target / "boot/efi/loader/entries"
-    if not entries_dir.exists():
-        return False
-
-    root_uuid = current_target_root_uuid(target)
-    root_partuuid = current_target_root_partuuid(target)
-    needles = [f"root=UUID={root_uuid}"]
-    if root_partuuid:
-        needles.append(f"root=PARTUUID={root_partuuid}")
-
-    for conf in entries_dir.glob("*.conf"):
-        text = safe_read_text(str(conf))
-        if any(needle in text for needle in needles):
-            return True
-    return False
-
 
 def newest_restored_kernel_pair(target: Path) -> Tuple[Path, Path]:
     boot_dir = target / "boot"
@@ -3028,16 +3078,63 @@ def write_manual_systemd_boot_entry(target: Path) -> None:
     atomic_write(entries_dir / "aegis-restored.conf", entry.encode("utf-8"), mode=0o644)
 
 
+def loader_entry_references_current_root(entry_path: Path, target: Path) -> bool:
+    text = safe_read_text(str(entry_path))
+    root_uuid = current_target_root_uuid(target)
+    root_partuuid = current_target_root_partuuid(target)
+
+    needles = [f"root=UUID={root_uuid}"]
+    if root_partuuid:
+        needles.append(f"root=PARTUUID={root_partuuid}")
+
+    return any(needle in text for needle in needles)
+
+
+def systemd_boot_default_entry_references_current_root(target: Path) -> bool:
+    loader_conf = target / "boot/efi/loader/loader.conf"
+    if not loader_conf.exists():
+        return False
+
+    default_entry = ""
+    for raw in safe_read_text(str(loader_conf)).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("default "):
+            default_entry = line.split(None, 1)[1].strip()
+            break
+
+    if not default_entry:
+        return False
+
+    entry_path = target / "boot/efi/loader/entries" / default_entry
+    if not entry_path.exists():
+        return False
+
+    return loader_entry_references_current_root(entry_path, target)
+
+
 def grub_references_current_root(target: Path) -> bool:
     root_uuid = current_target_root_uuid(target)
+    root_partuuid = current_target_root_partuuid(target)
+
+    needles = [f"root=UUID={root_uuid}"]
+    if root_partuuid:
+        needles.append(f"root=PARTUUID={root_partuuid}")
+
     for candidate in [
         target / "boot/grub/grub.cfg",
         target / "boot/grub2/grub.cfg",
     ]:
-        if candidate.exists():
-            text = safe_read_text(str(candidate))
-            if root_uuid in text:
-                return True
+        if not candidate.exists():
+            continue
+
+        for raw in safe_read_text(str(candidate)).splitlines():
+            line = raw.strip()
+            if line.startswith("linux ") or line.startswith("linuxefi "):
+                if any(needle in line for needle in needles):
+                    return True
+
     return False
             
 def run_chroot_checked(target: Path, args: List[str], label: Optional[str] = None) -> subprocess.CompletedProcess:
@@ -3058,10 +3155,17 @@ def target_uses_kernelstub_boot(target: Path) -> bool:
         or "pop!_os" in os_release
     )
 
-def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[str] = None) -> None:
+def best_effort_full_restore_post_actions(
+    target: Path,
+    target_disk: Optional[str] = None,
+    snapshot_kind: str = "full_recovery",
+) -> None:
     use_kernelstub_boot = target_uses_kernelstub_boot(target)
 
     with mounted_chroot_bindings(target):
+        if snapshot_kind == "portable_state":
+            purge_matching_target_packages(target, PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS)
+
         if (target / "usr/sbin/update-initramfs").exists():
             run_chroot_checked(
                 target,
@@ -3100,12 +3204,12 @@ def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[st
                     detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
                     log_line(f"kernelstub refresh failed, falling back to manual loader entry: {detail}")
 
-            if not loader_entries_reference_current_root(target):
+            if not systemd_boot_default_entry_references_current_root(target):
                 write_manual_systemd_boot_entry(target)
 
-            if not loader_entries_reference_current_root(target):
+            if not systemd_boot_default_entry_references_current_root(target):
                 raise AegisError(
-                    "EFI loader entries do not reference the restored root partition after repair."
+                    "systemd-boot default entry does not reference the restored root partition."
                 )
             return
 
@@ -3139,9 +3243,8 @@ def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[st
 
         if not grub_references_current_root(target):
             raise AegisError(
-                "GRUB configuration does not reference the restored root UUID after repair."
+                "GRUB kernel entries do not reference the restored root UUID/PARTUUID."
             )
-
 
 def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], target: Path, member: Optional[str]) -> None:
     target.mkdir(parents=True, exist_ok=True)
@@ -3598,8 +3701,8 @@ def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_d
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
         extract_manifest_from_repo_to_target(repo, manifest, key, mount_root, None)
         write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
-        sanitize_guided_restore_target(mount_root)
-        best_effort_full_restore_post_actions(mount_root, layout["disk"])
+        sanitize_guided_restore_target(mount_root, manifest.kind)
+        best_effort_full_restore_post_actions(mount_root, layout["disk"], manifest.kind)
 
 
 def bundle_manifest_and_archive(bundle_path: Path, password: str) -> Tuple[SnapshotManifest, Path, tempfile.TemporaryDirectory]:
@@ -3628,7 +3731,8 @@ def guided_full_restore_from_bundle(bundle_path: Path, password: str, target_dis
             update_stage(f"Restoring bundle to {target_disk}")
             extract_archive_file_to_target(archive_path, mount_root, None)
             write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
-            best_effort_full_restore_post_actions(mount_root, layout["disk"])
+            sanitize_guided_restore_target(mount_root, manifest.kind)
+            best_effort_full_restore_post_actions(mount_root, layout["disk"], manifest.kind)
     finally:
         td.cleanup()
 
