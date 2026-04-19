@@ -2873,6 +2873,7 @@ def mounted_chroot_bindings(target: Path):
         (target / "proc").mkdir(parents=True, exist_ok=True)
         (target / "sys").mkdir(parents=True, exist_ok=True)
         (target / "dev").mkdir(parents=True, exist_ok=True)
+        (target / "dev/pts").mkdir(parents=True, exist_ok=True)
         (target / "run").mkdir(parents=True, exist_ok=True)
 
         run_command(["mount", "-t", "proc", "proc", str(target / "proc")], check=True, capture=True)
@@ -2881,6 +2882,7 @@ def mounted_chroot_bindings(target: Path):
         for source, dest in [
             ("/sys", target / "sys"),
             ("/dev", target / "dev"),
+            ("/dev/pts", target / "dev/pts"),
             ("/run", target / "run"),
         ]:
             run_command(["mount", "--rbind", source, str(dest)], check=True, capture=True)
@@ -2911,7 +2913,133 @@ def run_chroot(target: Path, args: List[str]) -> subprocess.CompletedProcess:
         text=True,
     )
 
+def safe_unlink_any(path: Path) -> None:
+    try:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+    except FileNotFoundError:
+        pass
 
+
+def sanitize_guided_restore_target(target: Path) -> None:
+    # Guided restore currently creates a plain ext4 root + EFI partition.
+    # Old source-machine resume/crypto metadata can make initramfs wait for
+    # devices that do not exist on the restored disk and drop to BusyBox.
+    for rel in [
+        "etc/initramfs-tools/conf.d/resume",
+        "etc/crypttab",
+    ]:
+        safe_unlink_any(target / rel)
+
+
+def mounted_block_device_for_path(path: Path) -> str:
+    return canonical_block_device_path(mount_source_for_path(str(path)))
+
+
+def current_target_root_uuid(target: Path) -> str:
+    root_partition = mounted_block_device_for_path(target)
+    if not root_partition.startswith("/dev/"):
+        raise AegisError("Could not determine restored root partition.")
+    root_uuid = blkid_value(root_partition, "UUID")
+    if not root_uuid:
+        raise AegisError("Could not determine restored root UUID.")
+    return root_uuid
+
+
+def current_target_root_partuuid(target: Path) -> str:
+    root_partition = mounted_block_device_for_path(target)
+    if not root_partition.startswith("/dev/"):
+        return ""
+    return blkid_value(root_partition, "PARTUUID")
+
+
+def loader_entries_reference_current_root(target: Path) -> bool:
+    entries_dir = target / "boot/efi/loader/entries"
+    if not entries_dir.exists():
+        return False
+
+    root_uuid = current_target_root_uuid(target)
+    root_partuuid = current_target_root_partuuid(target)
+    needles = [f"root=UUID={root_uuid}"]
+    if root_partuuid:
+        needles.append(f"root=PARTUUID={root_partuuid}")
+
+    for conf in entries_dir.glob("*.conf"):
+        text = safe_read_text(str(conf))
+        if any(needle in text for needle in needles):
+            return True
+    return False
+
+
+def newest_restored_kernel_pair(target: Path) -> Tuple[Path, Path]:
+    boot_dir = target / "boot"
+    pairs: List[Tuple[float, Path, Path]] = []
+
+    for kernel in boot_dir.glob("vmlinuz-*"):
+        version = kernel.name[len("vmlinuz-"):]
+        initrd = boot_dir / f"initrd.img-{version}"
+        if initrd.exists():
+            pairs.append((kernel.stat().st_mtime, kernel, initrd))
+
+    if not pairs:
+        raise AegisError("No kernel/initramfs pair was found in restored /boot.")
+
+    pairs.sort(key=lambda item: item[0], reverse=True)
+    _, kernel, initrd = pairs[0]
+    return kernel, initrd
+
+
+def write_manual_systemd_boot_entry(target: Path) -> None:
+    esp = target / "boot/efi"
+    if not esp.exists():
+        raise AegisError("EFI System Partition is not mounted at /boot/efi.")
+
+    root_uuid = current_target_root_uuid(target)
+    kernel, initrd = newest_restored_kernel_pair(target)
+
+    dest_dir = esp / "EFI" / "Aegis"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(kernel, dest_dir / "vmlinuz.efi")
+    shutil.copy2(initrd, dest_dir / "initrd.img")
+
+    loader_dir = esp / "loader"
+    entries_dir = loader_dir / "entries"
+    entries_dir.mkdir(parents=True, exist_ok=True)
+
+    for conf in entries_dir.glob("*.conf"):
+        conf.unlink(missing_ok=True)
+
+    loader_conf = "default aegis-restored.conf\ntimeout 3\neditor no\n"
+    atomic_write(loader_dir / "loader.conf", loader_conf.encode("utf-8"), mode=0o644)
+
+    os_release_text = safe_read_text(str(target / "etc/os-release")).lower()
+    title = "Pop!_OS (Aegis Restored)" if "pop" in os_release_text else "Linux (Aegis Restored)"
+
+    entry = textwrap.dedent(
+        f"""\
+        title {title}
+        linux /EFI/Aegis/vmlinuz.efi
+        initrd /EFI/Aegis/initrd.img
+        options root=UUID={root_uuid} ro quiet splash
+        """
+    )
+    atomic_write(entries_dir / "aegis-restored.conf", entry.encode("utf-8"), mode=0o644)
+
+
+def grub_references_current_root(target: Path) -> bool:
+    root_uuid = current_target_root_uuid(target)
+    for candidate in [
+        target / "boot/grub/grub.cfg",
+        target / "boot/grub2/grub.cfg",
+    ]:
+        if candidate.exists():
+            text = safe_read_text(str(candidate))
+            if root_uuid in text:
+                return True
+    return False
+            
 def run_chroot_checked(target: Path, args: List[str], label: Optional[str] = None) -> subprocess.CompletedProcess:
     result = run_chroot(target, args)
     if result.returncode != 0:
@@ -2943,37 +3071,47 @@ def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[st
 
         if use_kernelstub_boot:
             host_bootctl = shutil.which("bootctl")
-            if host_bootctl and (target / "boot/efi").exists():
-                result = subprocess.run(
-                    [host_bootctl, f"--path={target / 'boot/efi'}", "install"],
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                )
-                if result.returncode != 0:
-                    detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-                    raise AegisError(f"bootctl install failed: {detail}")
+            if not host_bootctl or not (target / "boot/efi").exists():
+                raise AegisError("Pop-style EFI restore requires bootctl and a mounted /boot/efi.")
+
+            result = subprocess.run(
+                [host_bootctl, f"--path={target / 'boot/efi'}", "install"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                raise AegisError(f"bootctl install failed: {detail}")
 
             if (target / "usr/bin/kernelstub").exists():
-                run_chroot_checked(
+                result = run_chroot(
                     target,
                     [
                         "/usr/bin/kernelstub",
                         "-v",
-                        "--esp-path",
-                        "/boot/efi",
-                        "--root-path",
-                        "/",
+                        "--esp-path", "/boot/efi",
+                        "--root-path", "/",
                         "--loader",
                         "--force-update",
                     ],
-                    "kernelstub refresh in restored system",
+                )
+                if result.returncode != 0:
+                    detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                    log_line(f"kernelstub refresh failed, falling back to manual loader entry: {detail}")
+
+            if not loader_entries_reference_current_root(target):
+                write_manual_systemd_boot_entry(target)
+
+            if not loader_entries_reference_current_root(target):
+                raise AegisError(
+                    "EFI loader entries do not reference the restored root partition after repair."
                 )
             return
 
         if target_disk and (target / "usr/sbin/grub-install").exists():
             if (target / "boot/efi").exists():
-                run_chroot(
+                run_chroot_checked(
                     target,
                     [
                         "/usr/sbin/grub-install",
@@ -2983,14 +3121,25 @@ def best_effort_full_restore_post_actions(target: Path, target_disk: Optional[st
                         "--recheck",
                         "--no-nvram",
                     ],
+                    "EFI grub-install in restored system",
                 )
-            run_chroot(target, ["/usr/sbin/grub-install", target_disk])
+
+            run_chroot_checked(
+                target,
+                ["/usr/sbin/grub-install", target_disk],
+                "disk grub-install in restored system",
+            )
 
         if (target / "usr/sbin/update-grub").exists():
             run_chroot_checked(
                 target,
                 ["/usr/sbin/update-grub"],
                 "update-grub in restored system",
+            )
+
+        if not grub_references_current_root(target):
+            raise AegisError(
+                "GRUB configuration does not reference the restored root UUID after repair."
             )
 
 
@@ -3449,6 +3598,7 @@ def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_d
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
         extract_manifest_from_repo_to_target(repo, manifest, key, mount_root, None)
         write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
+        sanitize_guided_restore_target(mount_root)
         best_effort_full_restore_post_actions(mount_root, layout["disk"])
 
 
