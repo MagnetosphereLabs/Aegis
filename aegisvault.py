@@ -2312,6 +2312,40 @@ def object_decode(payload: bytes, key: Optional[bytes]) -> bytes:
     return cipher.decrypt(nonce, body, None)
 
 
+def read_object_header(payload: bytes) -> Dict[str, Any]:
+    if not payload.startswith(OBJECT_MAGIC):
+        raise AegisError("Invalid object format.")
+    header_len = int.from_bytes(payload[len(OBJECT_MAGIC):len(OBJECT_MAGIC) + 4], "big")
+    offset = len(OBJECT_MAGIC) + 4
+    return json.loads(payload[offset:offset + header_len].decode("utf-8"))
+
+
+def manifest_archive_is_encrypted(repo: Path, manifest: SnapshotManifest) -> bool:
+    for ref in manifest.archive_refs:
+        obj_path = object_path(repo, manifest.machine_id, ref.hash)
+        if not obj_path.exists():
+            continue
+        header = read_object_header(obj_path.read_bytes())
+        return bool(header.get("encrypted", False))
+    return False
+
+
+def snapshot_restore_info(settings: Settings, snapshot_id: str) -> Dict[str, Any]:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    manifest = find_snapshot_manifest(repo, snapshot_id)
+    encrypted = manifest_archive_is_encrypted(repo, manifest)
+    needs_recovery_password = encrypted and not has_local_machine_key(manifest.machine_id)
+
+    return {
+        "id": manifest.id,
+        "kind": manifest.kind,
+        "machine_id": manifest.machine_id,
+        "machine_label": manifest.machine_label,
+        "created_at": manifest.created_at,
+        "encrypted": encrypted,
+        "needs_recovery_password": needs_recovery_password,
+    }
+
 class RepoWriter:
     def __init__(self, repo: Path, machine: str, chunk_size: int, key: Optional[bytes], io_yield_ms: int) -> None:
         self.repo = repo
@@ -2600,14 +2634,20 @@ def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManif
     objects_root = repo / "objects" / manifest.machine_id
     if not objects_root.exists():
         return None
+
     if has_local_machine_key(manifest.machine_id):
         return read_local_machine_key(manifest.machine_id)
+
+    encrypted = manifest_archive_is_encrypted(repo, manifest)
+    if not encrypted:
+        return None
+
     if recovery_password:
         envelope = load_key_envelope(repo, manifest.machine_id)
         return unwrap_machine_key(envelope, recovery_password)
-    raise AegisError(
-        f"No local key found for machine {manifest.machine_id}. Supply that machine's recovery password."
-    )
+
+    label = manifest.machine_label or manifest.machine_id
+    raise AegisError(f"This backup is encrypted. Enter the recovery password for {label}.")
 
 
 def stream_archive_from_repo(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], writer) -> str:
@@ -3922,6 +3962,14 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
             lambda: guided_full_restore_from_repo(load_settings(), snapshot_id, device, recovery_password),
         )
         return {"ok": True, "message": "Guided full restore started."}
+    if action == "get_snapshot_restore_info":
+        snapshot_id = str(request.get("snapshot") or "").strip()
+        if not snapshot_id:
+            raise AegisError("Choose a snapshot first.")
+        return {
+            "ok": True,
+            "info": snapshot_restore_info(load_settings(), snapshot_id),
+        }
     if action == "run_guided_restore_bundle":
         device = str(request.get("target_disk") or "").strip()
         bundle_path = str(request.get("bundle_path") or "").strip()
@@ -4413,6 +4461,7 @@ def gui_main() -> int:
             self.storage_choices: List[str] = []
             self.storage_choice_map: Dict[str, str] = {}
             self.activity_bar_running = False
+            self.last_seen_error = ""
 
             outer = ttk.Frame(self.root, padding=16)
             outer.pack(fill="both", expand=True)
@@ -4888,28 +4937,72 @@ def gui_main() -> int:
             helper = ttk.Frame(self.restore_tab)
             helper.pack(fill="x")
             if self.recovery_mode:
-                ttk.Label(helper, text="Guided Full Restore (recommended)", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-                ttk.Label(helper, text="Select the destination disk. AegisVault will wipe it, recreate a bootable layout, restore the Full Recovery snapshot, refresh initramfs, and reinstall the bootloader.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-                device_row = ttk.Frame(helper)
-                device_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
+                recovery = ttk.Frame(self.restore_tab)
+                recovery.pack(fill="both", expand=True, pady=(18, 0))
+                recovery.grid_columnconfigure(0, weight=1)
+                recovery.grid_rowconfigure(3, weight=1)
 
-                ttk.Label(device_row, text="Target disk").pack(side="left")
-                self.guided_disk_combo = ttk.Combobox(device_row, textvariable=self.guided_target_disk_var, width=54, state="readonly")
+                ttk.Label(recovery, text="1. Choose the backup drive or folder", style="Header.TLabel").grid(
+                    row=0, column=0, columnspan=3, sticky="w"
+                )
+
+                source_row = ttk.Frame(recovery)
+                source_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+                source_row.grid_columnconfigure(0, weight=1)
+
+                ttk.Entry(
+                    source_row,
+                    textvariable=self.repo_source_var,
+                    state="readonly",
+                    width=80,
+                ).grid(row=0, column=0, sticky="ew")
+
+                ttk.Button(
+                    source_row,
+                    text="Choose Backup Drive or Folder",
+                    command=self.choose_and_use_repo_source,
+                ).grid(row=0, column=1, padx=(8, 0))
+
+                ttk.Label(
+                    recovery,
+                    text="2. Choose the backup to restore",
+                    style="Header.TLabel",
+                ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
+
+                self.restore_context_var = tk.StringVar(
+                    value="Choose the Full Recovery backup you want to restore."
+                )
+                ttk.Label(
+                    recovery,
+                    textvariable=self.restore_context_var,
+                    wraplength=1080,
+                    style="Muted.TLabel",
+                ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 8))
+
+                self.restore_tree = self.build_snapshot_table(recovery)
+                self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 0))
+
+                target_row = ttk.Frame(recovery)
+                target_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(18, 0))
+
+                ttk.Label(target_row, text="3. Choose the destination disk").pack(side="left")
+                self.guided_disk_combo = ttk.Combobox(
+                    target_row,
+                    textvariable=self.guided_target_disk_var,
+                    width=54,
+                    state="readonly",
+                )
                 self.guided_disk_combo.pack(side="left", padx=(12, 8))
-                ttk.Button(device_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
+                ttk.Button(target_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
+
                 self.guided_restore_repo_button = ttk.Button(
-                    helper,
-                    text="Guided Full Restore\nSelected Backup to Disk",
+                    recovery,
+                    text="Restore Selected Backup to Selected Disk",
                     command=self.guided_restore_repo,
                 )
-                self.guided_restore_repo_button.grid(row=3, column=1, sticky="w", pady=(12, 0))
-
-                self.guided_restore_bundle_button = ttk.Button(
-                    helper,
-                    text="Guided Full Restore\nBundle or URL to Disk",
-                    command=self.guided_restore_bundle,
-                )
-                self.guided_restore_bundle_button.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(12, 0))
+                self.guided_restore_repo_button.grid(row=6, column=0, sticky="w", pady=(18, 0))
+                self.guided_restore_repo_button.state(["disabled"])
+                return
             else:
                 ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
                 ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. AegisVault will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
@@ -5673,6 +5766,8 @@ def gui_main() -> int:
                 self.refresh_local_device_lists()
                 self.settings_loaded = False
                 self.refresh_dashboard()
+                self.root.after(300, self.refresh_dashboard)
+                self.root.after(1200, self.refresh_dashboard)
             except Exception as exc:
                 self.message_var.set(str(exc))
 
@@ -5696,42 +5791,53 @@ def gui_main() -> int:
             return self.snapshot_by_id.get(self.selected_snapshot_id, {})
 
         def refresh_restore_actions(self) -> None:
-            if not hasattr(self, "repo_restore_button"):
-                return
-
             snapshot = self.selected_snapshot()
             kind = snapshot.get("kind", "")
 
             if not snapshot:
-                self.restore_context_var.set(
-                    "Select a backup. Full Recovery puts a whole system back. Portable Migration moves data onto different hardware."
-                )
-                self.repo_restore_button.state(["disabled"])
+                if hasattr(self, "restore_context_var"):
+                    self.restore_context_var.set(
+                        "Choose the backup to restore. On the recovery USB, only Full Recovery backups can be restored to a disk."
+                    )
+                if hasattr(self, "repo_restore_button"):
+                    self.repo_restore_button.state(["disabled"])
                 if hasattr(self, "guided_restore_repo_button"):
                     self.guided_restore_repo_button.state(["disabled"])
                 return
 
             if kind == "full_recovery":
-                if self.recovery_mode:
-                    self.restore_context_var.set(
-                        "Full Recovery backup selected. Use Guided Full Restore to wipe a target disk and rebuild the system."
-                    )
-                    self.repo_restore_button.state(["disabled"])
-                    if hasattr(self, "guided_restore_repo_button"):
-                        self.guided_restore_repo_button.state(["!disabled"])
-                else:
-                    self.restore_context_var.set(
-                        "Full Recovery backup selected. Live in-place restore is disabled for safety. Create and boot the recovery USB, then use Guided Full Restore."
-                    )
+                if hasattr(self, "restore_context_var"):
+                    if self.recovery_mode:
+                        self.restore_context_var.set(
+                            "Full Recovery backup selected. Choose the destination disk and click restore."
+                        )
+                    else:
+                        self.restore_context_var.set(
+                            "Full Recovery backup selected. Live in-place restore is disabled for safety. Boot the recovery USB and use Guided Full Restore."
+                        )
+                if hasattr(self, "guided_restore_repo_button"):
+                    self.guided_restore_repo_button.state(["!disabled"])
+                if hasattr(self, "repo_restore_button"):
                     self.repo_restore_button.state(["disabled"])
                 return
 
-            self.restore_context_var.set(
-                "Portable Migration backup selected. Restore it into a running Linux install or another mounted target folder."
-            )
-            self.repo_restore_button.state(["!disabled"])
+            if hasattr(self, "restore_context_var"):
+                if self.recovery_mode:
+                    self.restore_context_var.set(
+                        "Portable Migration backups are not restored from the recovery USB. Boot a normal Linux system to apply a portable restore."
+                    )
+                else:
+                    self.restore_context_var.set(
+                        "Portable Migration backup selected. Restore it into a running Linux install or another mounted target folder."
+                    )
+
             if hasattr(self, "guided_restore_repo_button"):
                 self.guided_restore_repo_button.state(["disabled"])
+            if hasattr(self, "repo_restore_button"):
+                if self.recovery_mode:
+                    self.repo_restore_button.state(["disabled"])
+                else:
+                    self.repo_restore_button.state(["!disabled"])
         
         def confirm_dangerous_action(self, title: str, message: str) -> bool:
             return messagebox.askyesno(title, message, icon="warning")
@@ -5753,24 +5859,59 @@ def gui_main() -> int:
 
         def guided_restore_repo(self) -> None:
             if not self.selected_snapshot_id:
-                self.message_var.set("Select a snapshot first.")
+                self.message_var.set("Select a backup first.")
                 return
+
             device = self.resolve_disk_path(self.guided_target_disk_var.get(), self.guided_disk_map)
             if not device:
                 self.message_var.set("Choose a target disk first.")
                 return
-            if not self.confirm_dangerous_action("Guided Full Restore", f"This will wipe {device} and restore the selected Full Recovery snapshot. Continue?"):
-                return
+
             try:
+                info = self.get_snapshot_restore_info(self.selected_snapshot_id)
+            except Exception as exc:
+                self.message_var.set(str(exc))
+                return
+
+            if info.get("kind") != "full_recovery":
+                self.message_var.set("Choose a Full Recovery backup for disk restore.")
+                return
+
+            recovery_password = self.repo_recovery_key_var.get().strip()
+            if info.get("needs_recovery_password") and not recovery_password:
+                label = info.get("machine_label") or info.get("machine_id") or "this backup"
+                entered = simpledialog.askstring(
+                    "Recovery password required",
+                    f"{label} is encrypted.\n\nEnter the recovery password to continue:",
+                    show="*",
+                    parent=self.root,
+                )
+                if entered is None:
+                    self.message_var.set("Restore canceled.")
+                    return
+                recovery_password = entered.strip()
+                self.repo_recovery_key_var.set(recovery_password)
+
+            if not self.confirm_dangerous_action(
+                "Guided Full Restore",
+                f"This will erase everything on {device} and restore the selected Full Recovery backup. Continue?",
+            ):
+                return
+
+            try:
+                self.mark_restore_started("Starting guided restore…")
                 response = send_daemon_request({
                     "action": "run_guided_restore_repo",
                     "snapshot": self.selected_snapshot_id,
                     "target_disk": device,
-                    "recovery_password": self.repo_recovery_key_var.get().strip(),
+                    "recovery_password": recovery_password,
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
+
                 self.message_var.set(response.get("message", "Guided full restore started."))
+                self.root.after(100, self.refresh_dashboard)
+                self.root.after(700, self.refresh_dashboard)
             except Exception as exc:
                 self.message_var.set(str(exc))
 
@@ -5810,6 +5951,22 @@ def gui_main() -> int:
                 raise AegisError(response.get("error", "Unknown daemon error"))
             return response["dashboard"]
 
+        def get_snapshot_restore_info(self, snapshot_id: str) -> Dict[str, Any]:
+            response = send_daemon_request({
+                "action": "get_snapshot_restore_info",
+                "snapshot": snapshot_id,
+            })
+            if not response.get("ok"):
+                raise AegisError(response.get("error", "Unknown daemon error"))
+            return dict(response.get("info") or {})
+
+        def mark_restore_started(self, message: str) -> None:
+            self.status_var.set(message)
+            self.message_var.set(message)
+            if not self.activity_bar_running:
+                self.activity_bar.start(10)
+                self.activity_bar_running = True
+        
         def refresh_dashboard(self) -> None:
             try:
                 payload = self.daemon_dashboard()
@@ -5840,14 +5997,29 @@ def gui_main() -> int:
                 f"{'Busy: ' + current_job['name'] + ' — ' + current_job['stage'] if current_job else 'Idle'}"
             )
 
+            last_error = (state.get("last_error") or "").strip()
+
             if current_job:
-                if not self.activity_bar_running:
+                stage_text = f"{current_job['name']} — {current_job['stage']}"
+                self.status_var.set(f"Busy: {stage_text}")
+                if self.activity_bar_running is False:
                     self.activity_bar.start(10)
                     self.activity_bar_running = True
+                self.message_var.set(stage_text)
             else:
+                self.status_var.set("Idle")
                 if self.activity_bar_running:
                     self.activity_bar.stop()
                     self.activity_bar_running = False
+
+                if last_error and last_error != self.last_seen_error:
+                    self.last_seen_error = last_error
+                    self.message_var.set(last_error)
+                    if self.recovery_mode:
+                        try:
+                            messagebox.showerror("Restore failed", last_error, parent=self.root)
+                        except Exception:
+                            pass
 
             self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
             self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
@@ -6001,20 +6173,46 @@ def gui_main() -> int:
         
         def restore_repo_snapshot(self) -> None:
             if not self.selected_snapshot_id:
-                self.message_var.set("Select a snapshot first.")
+                self.message_var.set("Select a backup first.")
                 return
+
             try:
+                info = self.get_snapshot_restore_info(self.selected_snapshot_id)
+            except Exception as exc:
+                self.message_var.set(str(exc))
+                return
+
+            recovery_password = self.repo_recovery_key_var.get().strip()
+            if info.get("needs_recovery_password") and not recovery_password:
+                label = info.get("machine_label") or info.get("machine_id") or "this backup"
+                entered = simpledialog.askstring(
+                    "Recovery password required",
+                    f"{label} is encrypted.\n\nEnter the recovery password to continue:",
+                    show="*",
+                    parent=self.root,
+                )
+                if entered is None:
+                    self.message_var.set("Restore canceled.")
+                    return
+                recovery_password = entered.strip()
+                self.repo_recovery_key_var.set(recovery_password)
+
+            try:
+                self.mark_restore_started("Starting restore…")
                 response = send_daemon_request({
                     "action": "run_restore_repo",
                     "snapshot": self.selected_snapshot_id,
                     "target": self.repo_restore_target_var.get().strip() or "/",
                     "member": self.repo_restore_path_var.get().strip(),
                     "apply_packages": bool(self.apply_packages_var.get()),
-                    "recovery_password": self.repo_recovery_key_var.get().strip(),
+                    "recovery_password": recovery_password,
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
+
                 self.message_var.set(response.get("message", "Restore started."))
+                self.root.after(100, self.refresh_dashboard)
+                self.root.after(700, self.refresh_dashboard)
             except Exception as exc:
                 self.message_var.set(str(exc))
 
