@@ -3166,7 +3166,6 @@ def guided_partition_disk(device: str) -> Dict[str, str]:
     identity = capture_block_device_identity(device)
     device = resolve_block_device_from_identity(identity, timeout_seconds=10)
 
-    ensure_recovery_builder_prereqs()
     ensure_device_tree_unmounted(device)
     swapoff_device_tree(device)
 
@@ -3486,6 +3485,7 @@ def create_recovery_usb(device: str) -> None:
                 "tar",
                 "parted",
                 "dosfstools",
+                "gdisk",
                 "e2fsprogs",
                 "btrfs-progs",
                 "xfsprogs",
