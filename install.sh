@@ -53,7 +53,7 @@ install_support_files() {
 
   cat > /etc/systemd/system/aegisvault.service <<'EOF'
 [Unit]
-Description=AegisVault backup daemon
+Description=Aegis backup daemon
 After=network-online.target
 Wants=network-online.target
 
@@ -75,7 +75,7 @@ EOF
   cat > /usr/share/applications/aegisvault.desktop <<'EOF'
 [Desktop Entry]
 Type=Application
-Name=AegisVault
+Name=Aegis
 Comment=Encrypted Linux backup, restore, and peer sync
 Exec=/usr/local/bin/aegisvault gui
 Icon=drive-harddisk
@@ -130,8 +130,8 @@ prompt_uninstall_mode() {
 
   echo >/dev/tty
   echo "Choose uninstall level:" >/dev/tty
-  echo "  1) Remove app files only (keep settings, encrypted credentials, and backups)" >/dev/tty
-  echo "  2) Remove app files and purge all local AegisVault data" >/dev/tty
+  echo "  1) Remove app only (keep settings, encrypted credentials, and backups)" >/dev/tty
+  echo "  2) Remove app files and purge all local Aegis data" >/dev/tty
   echo "  3) Cancel" >/dev/tty
   printf "Selection [1-3]: " >/dev/tty
 
@@ -150,6 +150,46 @@ prompt_uninstall_mode() {
   esac
 }
 
+read_configured_repo_path() {
+  local settings_path="/var/lib/aegisvault/settings.json"
+
+  [ -f "${settings_path}" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+
+  python3 - "${settings_path}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+
+repo = str(data.get("repo_path") or "").strip()
+if repo:
+    print(repo)
+PY
+}
+
+purge_repo_path_contents() {
+  local repo_path="${1:-}"
+
+  [ -n "${repo_path}" ] || return 0
+
+  case "${repo_path}" in
+    "/"|"." )
+      return 0
+      ;;
+  esac
+
+  if [ -d "${repo_path}" ]; then
+    rm -rf -- "${repo_path}/machines" "${repo_path}/objects"
+    rmdir --ignore-fail-on-non-empty -- "${repo_path}" 2>/dev/null || true
+  fi
+}
+
 do_install() {
   require_root
   apt_install
@@ -158,7 +198,7 @@ do_install() {
   initialise_app
 
   echo
-  echo "AegisVault installed."
+  echo "Aegis installed."
   echo "Command: ${BIN_PATH}"
   echo "Service: systemctl status aegisvault"
   echo "Desktop launcher installed."
@@ -172,12 +212,15 @@ do_update() {
   require_root
   install_app
   systemctl restart aegisvault.service
-  echo "AegisVault updated."
+  echo "Aegis updated."
 }
 
 do_uninstall() {
   require_root
   prompt_uninstall_mode
+
+  local configured_repo=""
+  configured_repo="$(read_configured_repo_path || true)"
 
   systemctl disable --now aegisvault.service || true
   rm -f /etc/systemd/system/aegisvault.service
@@ -190,16 +233,22 @@ do_uninstall() {
 
   if [ "${UNINSTALL_MODE}" = "purge" ]; then
     rm -rf /var/lib/aegisvault
-    rm -rf /var/backups/aegisvault
 
     if [ -d "${CREDSTORE_DIR}" ]; then
       find "${CREDSTORE_DIR}" -maxdepth 1 -type f -name "${CRED_NAME_PREFIX}*.cred" -delete
+      rmdir --ignore-fail-on-non-empty "${CREDSTORE_DIR}" 2>/dev/null || true
+    fi
+
+    purge_repo_path_contents "${configured_repo}"
+
+    if [ -z "${configured_repo}" ] || [ "${configured_repo}" != "/var/backups/aegisvault" ]; then
+      purge_repo_path_contents "/var/backups/aegisvault"
     fi
 
     groupdel aegisvault >/dev/null 2>&1 || true
-    echo "AegisVault fully removed, including settings, encrypted local unlock credentials, state, and local backup repository data."
+    echo "Aegis fully removed, including settings, encrypted local unlock credentials, state, and backup repository data."
   else
-    echo "AegisVault app files removed. Data under /var/lib/aegisvault, /var/backups/aegisvault, and ${CREDSTORE_DIR} was left in place."
+    echo "Aegis app files removed. Data under /var/lib/aegisvault, the configured backup repo, and ${CREDSTORE_DIR} was left in place."
   fi
 }
 
