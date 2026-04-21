@@ -886,6 +886,19 @@ PORTABLE_PACKAGE_EXCLUDE_PATTERNS = [
 
 PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS = PORTABLE_PACKAGE_EXCLUDE_PATTERNS + [
     "bcmwl-kernel-source",
+    "nvidia-driver*",
+    "nvidia-kernel-*",
+    "linux-modules-nvidia*",
+    "linux-objects-nvidia*",
+    "xserver-xorg-video-nvidia*",
+    "libnvidia*",
+    "system76-driver",
+    "system76-driver-*",
+    "system76-acpi-dkms",
+    "system76-dkms",
+    "system76-io-dkms",
+    "linux-system76",
+    "linux-system76-*",
 ]
 
 PORTABLE_HARDWARE_CONFIG_GLOBS = [
@@ -897,7 +910,28 @@ PORTABLE_HARDWARE_CONFIG_GLOBS = [
     "etc/modules-load.d/*nvidia*",
     "lib/modules-load.d/*nvidia*",
     "usr/lib/modules-load.d/*nvidia*",
+    "etc/modprobe.d/*system76*",
+    "lib/modprobe.d/*system76*",
+    "usr/lib/modprobe.d/*system76*",
+    "etc/modules-load.d/*system76*",
+    "lib/modules-load.d/*system76*",
+    "usr/lib/modules-load.d/*system76*",
+    "etc/modprobe.d/*broadcom*",
+    "lib/modprobe.d/*broadcom*",
+    "usr/lib/modprobe.d/*broadcom*",
 ]
+
+PORTABLE_DRACUT_DRIVER_NAMES = {
+    "system76",
+    "system76_acpi",
+    "system76_io",
+    "nvidia",
+    "nvidia_drm",
+    "nvidia_modeset",
+    "nvidia_uvm",
+    "wl",
+    "bcmwl",
+}
 
 def filter_portable_manual_packages(packages: List[str]) -> List[str]:
     filtered: List[str] = []
@@ -2998,7 +3032,177 @@ def remove_globbed_target_paths(target: Path, patterns: List[str]) -> None:
         for candidate in target.glob(pattern):
             safe_unlink_any(candidate)
 
+def rewrite_target_text_file(path: Path, transform) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
 
+    original = path.read_text(encoding="utf-8", errors="ignore")
+    updated = transform(original)
+    if updated == original:
+        return False
+
+    mode = stat.S_IMODE(path.stat().st_mode)
+    atomic_write(path, updated.encode("utf-8"), mode=mode or 0o644)
+    return True
+
+
+def strip_dracut_driver_tokens(text: str, forbidden: Set[str]) -> str:
+    out: List[str] = []
+
+    for raw in text.splitlines(keepends=True):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(raw)
+            continue
+
+        key = raw.split("=", 1)[0].strip().replace(" ", "")
+        if key not in {"add_drivers+", "add_drivers", "force_drivers+", "force_drivers", "drivers+", "drivers"}:
+            out.append(raw)
+            continue
+
+        rewritten = raw
+        for quote in ('"', "'"):
+            first = raw.find(quote)
+            last = raw.rfind(quote)
+            if first == -1 or last <= first:
+                continue
+
+            body = raw[first + 1:last]
+            tokens = body.split()
+            filtered = [token for token in tokens if token not in forbidden]
+            if filtered != tokens:
+                new_body = f"{quote}{' ' + ' '.join(filtered) + ' ' if filtered else ' '}{quote}"
+                rewritten = raw[:first] + new_body + raw[last + 1:]
+            break
+
+        out.append(rewritten)
+
+    return "".join(out)
+
+
+def strip_module_list_entries(text: str, forbidden: Set[str]) -> str:
+    out: List[str] = []
+
+    for raw in text.splitlines(keepends=True):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(raw)
+            continue
+
+        first_token = stripped.split()[0]
+        if first_token in forbidden:
+            continue
+
+        out.append(raw)
+
+    return "".join(out)
+
+
+def scrub_portable_dracut_configs(target: Path) -> None:
+    candidates: List[Path] = [target / "etc/dracut.conf"]
+    for pattern in (
+        "etc/dracut.conf.d/*.conf",
+        "usr/lib/dracut/dracut.conf.d/*.conf",
+        "lib/dracut/dracut.conf.d/*.conf",
+    ):
+        candidates.extend(target.glob(pattern))
+
+    seen: Set[str] = set()
+    changed: List[str] = []
+    for path in candidates:
+        path_text = str(path)
+        if path_text in seen or not path.exists():
+            continue
+        seen.add(path_text)
+
+        if rewrite_target_text_file(path, lambda text: strip_dracut_driver_tokens(text, PORTABLE_DRACUT_DRIVER_NAMES)):
+            changed.append(path_text)
+
+    if changed:
+        log_line("Portable restore scrubbed dracut driver config from: " + ", ".join(changed))
+
+
+def scrub_portable_module_lists(target: Path) -> None:
+    candidates: List[Path] = [
+        target / "etc/modules",
+        target / "etc/initramfs-tools/modules",
+    ]
+    for pattern in (
+        "etc/modules-load.d/*.conf",
+        "usr/lib/modules-load.d/*.conf",
+        "lib/modules-load.d/*.conf",
+    ):
+        candidates.extend(target.glob(pattern))
+
+    seen: Set[str] = set()
+    changed: List[str] = []
+    for path in candidates:
+        path_text = str(path)
+        if path_text in seen or not path.exists():
+            continue
+        seen.add(path_text)
+
+        if rewrite_target_text_file(path, lambda text: strip_module_list_entries(text, PORTABLE_DRACUT_DRIVER_NAMES)):
+            changed.append(path_text)
+
+    if changed:
+        log_line("Portable restore scrubbed module lists from: " + ", ".join(changed))
+
+
+def remove_portable_driver_artifacts(target: Path) -> None:
+    safe_unlink_any(target / "var/lib/dkms")
+    for pattern in (
+        "lib/modules/*/updates/dkms",
+        "lib/modules/*/updates/dkms/*",
+        "usr/lib/modules/*/updates/dkms",
+        "usr/lib/modules/*/updates/dkms/*",
+    ):
+        for candidate in target.glob(pattern):
+            safe_unlink_any(candidate)
+
+
+def scrub_portable_hardware_state(target: Path) -> None:
+    remove_globbed_target_paths(target, PORTABLE_HARDWARE_CONFIG_GLOBS)
+    scrub_portable_dracut_configs(target)
+    scrub_portable_module_lists(target)
+    remove_portable_driver_artifacts(target)
+
+
+def restored_primary_kernel_version(target: Path) -> str:
+    kernels: List[Tuple[float, str]] = []
+    for kernel in (target / "boot").glob("vmlinuz-*"):
+        version = kernel.name[len("vmlinuz-"):]
+        kernels.append((kernel.stat().st_mtime, version))
+
+    if not kernels:
+        raise AegisError("No restored kernel was found in /boot.")
+
+    kernels.sort(key=lambda item: item[0], reverse=True)
+    return kernels[0][1]
+
+
+def rebuild_restored_primary_initramfs(target: Path) -> None:
+    kernel_version = restored_primary_kernel_version(target)
+
+    if (target / "sbin/depmod").exists() or (target / "usr/sbin/depmod").exists():
+        update_stage(f"Refreshing module metadata for {kernel_version}")
+        run_chroot_checked(
+            target,
+            ["depmod", "-a", kernel_version],
+            f"depmod for {kernel_version} in restored system",
+        )
+
+    update_stage(f"Rebuilding initramfs for {kernel_version}")
+    result = run_chroot(target, ["update-initramfs", "-u", "-k", kernel_version])
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        log_line(f"update-initramfs -u failed for {kernel_version}, retrying with -c: {detail}")
+        run_chroot_checked(
+            target,
+            ["update-initramfs", "-c", "-k", kernel_version],
+            f"update-initramfs for {kernel_version} in restored system",
+        )
+            
 def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
     if not (target / "usr/bin/dpkg-query").exists():
         return
@@ -3018,8 +3222,6 @@ def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
     if not matches:
         return
 
-    update_stage("Removing hardware-specific packages from portable restore")
-
     for i in range(0, len(matches), 32):
         group = matches[i:i + 32]
         result = run_chroot(
@@ -3037,17 +3239,10 @@ def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
             detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
             log_line(f"Portable hardware purge warning for {' '.join(group)}: {detail}")
 
-    run_chroot(
-        target,
-        [
-            "/usr/bin/env",
-            "DEBIAN_FRONTEND=noninteractive",
-            "apt-get",
-            "autoremove",
-            "-y",
-        ],
-    )
-
+    # Do not run apt-get autoremove here.
+    # During a portable restore we first need a bootable kernel+initramfs.
+    # Autoremove at this stage can remove auto-installed kernel module packages,
+    # which is exactly the wrong time to do it.
 
 def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
     for rel in [
@@ -3358,19 +3553,12 @@ def best_effort_full_restore_post_actions(
             set_job_progress(93.0)
             purge_matching_target_packages(target, PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS)
 
-        if (target / "usr/sbin/update-initramfs").exists():
-            update_stage("Rebuilding initramfs in restored system")
-            set_job_progress(94.0)
-            result = run_chroot(target, ["/usr/sbin/update-initramfs", "-u", "-k", "all"])
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-                log_line(f"update-initramfs -u failed, retrying with -c: {detail}")
+            update_stage("Removing hardware-specific boot and module config from portable restore")
+            scrub_portable_hardware_state(target)
 
-                run_chroot_checked(
-                    target,
-                    ["/usr/sbin/update-initramfs", "-c", "-k", "all"],
-                    "update-initramfs in restored system",
-                )
+        if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
+            set_job_progress(94.0)
+            rebuild_restored_primary_initramfs(target)
 
         if use_kernelstub_boot:
             update_stage("Installing systemd-boot on restored disk")
