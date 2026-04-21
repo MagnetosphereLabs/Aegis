@@ -132,6 +132,7 @@ class JobState:
     name: str = ""
     stage: str = ""
     started_at: str = ""
+    progress: Optional[float] = None
 
 
 @dataclass
@@ -1254,6 +1255,16 @@ def update_stage(stage: str) -> None:
         if RUNTIME.current_job:
             RUNTIME.current_job.stage = stage
     log_line(stage)
+
+def set_job_progress(progress: Optional[float], stage: Optional[str] = None) -> None:
+    with RUNTIME.lock:
+        if RUNTIME.current_job:
+            if progress is None:
+                RUNTIME.current_job.progress = None
+            else:
+                RUNTIME.current_job.progress = max(0.0, min(100.0, float(progress)))
+            if stage is not None:
+                RUNTIME.current_job.stage = stage
 
 def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     try:
@@ -2710,8 +2721,12 @@ def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManif
     raise AegisError(f"This backup is encrypted. Enter the recovery password for {label}.")
 
 
-def stream_archive_from_repo(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], writer) -> str:
+def stream_archive_from_repo(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], writer, progress_callback=None) -> str:
     hasher = hashlib.sha256()
+    total_bytes = int(manifest.archive_plaintext_bytes or sum(ref.plain_len for ref in manifest.archive_refs))
+    written_bytes = 0
+    last_report_at = 0.0
+
     for ref in manifest.archive_refs:
         obj_path = object_path(repo, manifest.machine_id, ref.hash)
         if not obj_path.exists():
@@ -2720,8 +2735,17 @@ def stream_archive_from_repo(repo: Path, manifest: SnapshotManifest, key: Option
         plain = object_decode(payload, key)
         if len(plain) != ref.plain_len:
             raise AegisError(f"Chunk length mismatch for {ref.hash}")
+
         writer.write(plain)
         hasher.update(plain)
+        written_bytes += len(plain)
+
+        if progress_callback:
+            now = time.monotonic()
+            if written_bytes >= total_bytes or now - last_report_at >= 0.35:
+                progress_callback(written_bytes, total_bytes)
+                last_report_at = now
+
     return hasher.hexdigest()
 
 
@@ -2855,9 +2879,15 @@ def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Pat
 
 def after_restore_actions(target: Path, manifest: SnapshotManifest, apply_packages: bool) -> None:
     if manifest.kind == "portable_state" and apply_packages:
+        update_stage("Applying package selections from portable restore")
+        set_job_progress(95.0)
         apply_portable_post_restore(target, manifest.metadata)
+
     if manifest.kind == "full_recovery" and target.resolve() != Path("/"):
         best_effort_full_restore_post_actions(target)
+        return
+
+    set_job_progress(100.0, "Restore complete")
 
 
 def apply_portable_post_restore(target: Path, metadata: SnapshotMetadata) -> None:
@@ -3141,7 +3171,131 @@ def systemd_boot_default_entry_references_current_root(target: Path) -> bool:
 
     return loader_entry_references_current_root(entry_path, target)
 
+def target_efi_partition_is_mounted(target: Path) -> bool:
+    esp = target / "boot/efi"
+    if not esp.exists():
+        return False
+    source = canonical_block_device_path(mount_source_for_path(str(esp)))
+    return source.startswith("/dev/")
 
+
+def target_os_release_values(target: Path) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    os_release_path = target / "etc/os-release"
+    if not os_release_path.exists():
+        return data
+
+    for raw in safe_read_text(str(os_release_path)).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip().upper()] = value.strip().strip('"').strip("'")
+    return data
+
+
+def preferred_grub_bootloader_id(target: Path) -> str:
+    os_release = target_os_release_values(target)
+    distro_id = os_release.get("ID", "").strip().lower()
+    distro_like = os_release.get("ID_LIKE", "").strip().lower()
+
+    if distro_id == "debian":
+        return "debian"
+    if distro_id in {"ubuntu", "linuxmint", "elementary", "zorin", "neon", "pop", "pop_os", "pop!_os"}:
+        return "ubuntu"
+    if "ubuntu" in distro_like:
+        return "ubuntu"
+    if "debian" in distro_like:
+        return "debian"
+    return "AegisVault"
+
+
+def copy_if_exists(src: Path, dest: Path) -> bool:
+    if not src.exists():
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+    return True
+
+
+def ensure_efi_boot_fallback_loader(target: Path, bootloader_id: str) -> None:
+    if not target_efi_partition_is_mounted(target):
+        raise AegisError("EFI System Partition is not mounted at /boot/efi.")
+
+    esp = target / "boot/efi"
+    boot_dir = esp / "EFI" / "BOOT"
+    boot_dir.mkdir(parents=True, exist_ok=True)
+    fallback_loader = boot_dir / "BOOTX64.EFI"
+
+    candidate_dirs: List[Path] = []
+    for name in [bootloader_id, "ubuntu", "debian", "AegisVault", "BOOT"]:
+        candidate = esp / "EFI" / name
+        if candidate.exists() and candidate not in candidate_dirs:
+            candidate_dirs.append(candidate)
+
+    for candidate_dir in candidate_dirs:
+        shim = candidate_dir / "shimx64.efi"
+        grub = candidate_dir / "grubx64.efi"
+        if shim.exists() and grub.exists():
+            copy_if_exists(shim, fallback_loader)
+            copy_if_exists(grub, boot_dir / "grubx64.efi")
+            copy_if_exists(candidate_dir / "mmx64.efi", boot_dir / "mmx64.efi")
+            copy_if_exists(candidate_dir / "fbx64.efi", boot_dir / "fbx64.efi")
+            copy_if_exists(candidate_dir / "grub.cfg", boot_dir / "grub.cfg")
+            break
+    else:
+        for candidate_dir in candidate_dirs:
+            grub = candidate_dir / "grubx64.efi"
+            if grub.exists():
+                copy_if_exists(grub, fallback_loader)
+                copy_if_exists(candidate_dir / "grub.cfg", boot_dir / "grub.cfg")
+                break
+
+    if not fallback_loader.exists():
+        raise AegisError(
+            "UEFI fallback loader /EFI/BOOT/BOOTX64.EFI is missing from the restored EFI System Partition."
+        )
+
+
+def uefi_fallback_loader_exists(target: Path) -> bool:
+    if not target_efi_partition_is_mounted(target):
+        return False
+    return (target / "boot/efi/EFI/BOOT/BOOTX64.EFI").exists()
+
+
+def install_grub_uefi_for_restored_target(target: Path) -> None:
+    bootloader_id = preferred_grub_bootloader_id(target)
+
+    run_chroot_checked(
+        target,
+        [
+            "/usr/sbin/grub-install",
+            "--target=x86_64-efi",
+            "--efi-directory=/boot/efi",
+            "--boot-directory=/boot",
+            f"--bootloader-id={bootloader_id}",
+            "--recheck",
+            "--no-nvram",
+        ],
+        "UEFI grub-install in restored system",
+    )
+
+    run_chroot_checked(
+        target,
+        [
+            "/usr/sbin/grub-install",
+            "--target=x86_64-efi",
+            "--efi-directory=/boot/efi",
+            "--boot-directory=/boot",
+            "--removable",
+            "--recheck",
+            "--no-nvram",
+        ],
+        "UEFI fallback grub-install in restored system",
+    )
+
+    ensure_efi_boot_fallback_loader(target, bootloader_id)
+            
 def grub_references_current_root(target: Path) -> bool:
     root_uuid = current_target_root_uuid(target)
     root_partuuid = current_target_root_partuuid(target)
@@ -3183,24 +3337,35 @@ def target_uses_kernelstub_boot(target: Path) -> bool:
         or "pop!_os" in os_release
     )
 
+def flush_and_unmount(path: Path) -> None:
+    subprocess.run(["sync"], check=False, capture_output=True)
+    result = subprocess.run(["umount", str(path)], check=False, capture_output=True)
+    if result.returncode != 0:
+        subprocess.run(["umount", "-lf", str(path)], check=False, capture_output=True)
+
 def best_effort_full_restore_post_actions(
     target: Path,
     target_disk: Optional[str] = None,
     snapshot_kind: str = "full_recovery",
 ) -> None:
     ensure_restored_runtime_dirs(target)
-    use_kernelstub_boot = target_uses_kernelstub_boot(target)
+    has_mounted_efi = target_efi_partition_is_mounted(target)
+    use_kernelstub_boot = has_mounted_efi and target_uses_kernelstub_boot(target)
 
     with mounted_chroot_bindings(target):
         if snapshot_kind == "portable_state":
+            update_stage("Removing hardware-specific packages from portable restore")
+            set_job_progress(93.0)
             purge_matching_target_packages(target, PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS)
 
         if (target / "usr/sbin/update-initramfs").exists():
+            update_stage("Rebuilding initramfs in restored system")
+            set_job_progress(94.0)
             result = run_chroot(target, ["/usr/sbin/update-initramfs", "-u", "-k", "all"])
             if result.returncode != 0:
                 detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
                 log_line(f"update-initramfs -u failed, retrying with -c: {detail}")
-        
+
                 run_chroot_checked(
                     target,
                     ["/usr/sbin/update-initramfs", "-c", "-k", "all"],
@@ -3208,8 +3373,11 @@ def best_effort_full_restore_post_actions(
                 )
 
         if use_kernelstub_boot:
+            update_stage("Installing systemd-boot on restored disk")
+            set_job_progress(97.0)
+
             host_bootctl = shutil.which("bootctl")
-            if not host_bootctl or not (target / "boot/efi").exists():
+            if not host_bootctl:
                 raise AegisError("Pop-style EFI restore requires bootctl and a mounted /boot/efi.")
 
             result = subprocess.run(
@@ -3223,6 +3391,8 @@ def best_effort_full_restore_post_actions(
                 raise AegisError(f"bootctl install failed: {detail}")
 
             if (target / "usr/bin/kernelstub").exists():
+                update_stage("Refreshing Pop!_OS kernel and initramfs on the ESP")
+                set_job_progress(98.0)
                 result = run_chroot(
                     target,
                     [
@@ -3239,29 +3409,29 @@ def best_effort_full_restore_post_actions(
                     log_line(f"kernelstub refresh failed, falling back to manual loader entry: {detail}")
 
             if not systemd_boot_default_entry_references_current_root(target):
+                update_stage("Writing fallback systemd-boot entry for restored disk")
                 write_manual_systemd_boot_entry(target)
 
+            update_stage("Validating restored systemd-boot configuration")
+            set_job_progress(99.0)
             if not systemd_boot_default_entry_references_current_root(target):
                 raise AegisError(
                     "systemd-boot default entry does not reference the restored root partition."
                 )
+            if not uefi_fallback_loader_exists(target):
+                raise AegisError("systemd-boot did not place a fallback BOOTX64.EFI on the restored ESP.")
+
+            set_job_progress(100.0, "Restore complete")
             return
 
-        if target_disk and (target / "usr/sbin/grub-install").exists():
-            if (target / "boot/efi").exists():
-                run_chroot_checked(
-                    target,
-                    [
-                        "/usr/sbin/grub-install",
-                        "--target=x86_64-efi",
-                        "--efi-directory=/boot/efi",
-                        "--bootloader-id=AegisVault",
-                        "--recheck",
-                        "--no-nvram",
-                    ],
-                    "EFI grub-install in restored system",
-                )
+        if has_mounted_efi and (target / "usr/sbin/grub-install").exists():
+            update_stage("Installing UEFI GRUB on restored disk")
+            set_job_progress(97.0)
+            install_grub_uefi_for_restored_target(target)
 
+        if target_disk and (target / "usr/sbin/grub-install").exists():
+            update_stage("Installing BIOS GRUB on restored disk")
+            set_job_progress(98.0)
             run_chroot_checked(
                 target,
                 ["/usr/sbin/grub-install", target_disk],
@@ -3269,29 +3439,58 @@ def best_effort_full_restore_post_actions(
             )
 
         if (target / "usr/sbin/update-grub").exists():
+            update_stage("Generating restored GRUB menu")
+            set_job_progress(99.0)
             run_chroot_checked(
                 target,
                 ["/usr/sbin/update-grub"],
                 "update-grub in restored system",
             )
 
+        if has_mounted_efi and not uefi_fallback_loader_exists(target):
+            raise AegisError("UEFI fallback loader /EFI/BOOT/BOOTX64.EFI is missing after GRUB installation.")
+
         if not grub_references_current_root(target):
             raise AegisError(
                 "GRUB kernel entries do not reference the restored root UUID/PARTUUID."
             )
 
+        set_job_progress(100.0, "Restore complete")
+
 def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], target: Path, member: Optional[str]) -> None:
     target.mkdir(parents=True, exist_ok=True)
     proc = build_tar_restore_command(target, member)
     assert proc.stdin is not None
-    digest = stream_archive_from_repo(repo, manifest, key, proc.stdin)
+
+    label = "Restoring files"
+    if member:
+        label = f"Restoring {normalize_member_path(member)}"
+
+    def report_progress(done_bytes: int, total_bytes: int) -> None:
+        if total_bytes <= 0:
+            set_job_progress(None, f"{label} — streaming data")
+            return
+        percent = (done_bytes / total_bytes) * 90.0
+        stage = f"{label} — {percent:.1f}% ({human_bytes(done_bytes)} / {human_bytes(total_bytes)})"
+        set_job_progress(percent, stage)
+
+    digest = stream_archive_from_repo(
+        repo,
+        manifest,
+        key,
+        proc.stdin,
+        progress_callback=report_progress,
+    )
     proc.stdin.close()
+
     stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
     returncode = proc.wait()
     if returncode != 0:
         raise AegisError(f"tar extraction failed: {stderr_data.strip() or returncode}")
     if digest != manifest.archive_sha256:
         raise AegisError("Archive integrity mismatch during restore.")
+
+    set_job_progress(90.0, "Restore payload extracted")
 
 
 def extract_archive_file_to_target(archive_file: Path, target: Path, member: Optional[str]) -> None:
@@ -3716,8 +3915,8 @@ def mounted_guided_target(device: str):
         mount_block_device_with_retry(layout["efi"], mount_root / "boot/efi", attempts=3)
         yield layout, mount_root
     finally:
-        subprocess.run(["umount", "-lf", str(mount_root / "boot/efi")], check=False, capture_output=True)
-        subprocess.run(["umount", "-lf", str(mount_root)], check=False, capture_output=True)
+        flush_and_unmount(mount_root / "boot/efi")
+        flush_and_unmount(mount_root)
         shutil.rmtree(mount_root, ignore_errors=True)
 
 
@@ -4184,8 +4383,12 @@ def run_job(name: str, func):
     with RUNTIME.lock:
         if RUNTIME.current_job is not None:
             raise AegisError("Another job is already running.")
-        RUNTIME.current_job = JobState(name=name, stage="Queued", started_at=now_rfc3339())
+        RUNTIME.current_job = JobState(name=name, stage="Queued", started_at=now_rfc3339(), progress=None)
     log_line(f"{name} queued")
+
+    state = load_state()
+    state.last_error = ""
+    save_state(state)
 
     is_backup_job = "backup" in name.lower()
     try:
@@ -4201,6 +4404,9 @@ def run_job(name: str, func):
     def worker():
         try:
             func()
+            state = load_state()
+            state.last_error = ""
+            save_state(state)
             log_line(f"{name} finished successfully")
             if is_backup_job and notifications_enabled:
                 send_desktop_notification("Backup finished", f"{name} completed successfully.", urgency="low")
@@ -4861,6 +5067,7 @@ def gui_main() -> int:
             self.storage_choice_map: Dict[str, str] = {}
             self.activity_bar_running = False
             self.last_seen_error = ""
+            self.previous_running_job_name = ""
 
             outer = ttk.Frame(self.root, padding=16)
             outer.pack(fill="both", expand=True)
@@ -6374,8 +6581,11 @@ def gui_main() -> int:
             return dict(response.get("info") or {})
 
         def mark_restore_started(self, message: str) -> None:
+            self.last_seen_error = ""
             self.status_var.set(message)
             self.message_var.set(message)
+            if str(self.activity_bar.cget("mode")) != "indeterminate":
+                self.activity_bar.configure(mode="indeterminate")
             if not self.activity_bar_running:
                 self.activity_bar.start(10)
                 self.activity_bar_running = True
@@ -6415,17 +6625,35 @@ def gui_main() -> int:
             if current_job:
                 stage_text = f"{current_job['name']} — {current_job['stage']}"
                 self.status_var.set(f"Busy: {stage_text}")
-                if self.activity_bar_running is False:
-                    self.activity_bar.start(10)
-                    self.activity_bar_running = True
+                self.previous_running_job_name = current_job["name"]
+            
+                progress_value = current_job.get("progress")
+                if progress_value is None:
+                    if str(self.activity_bar.cget("mode")) != "indeterminate":
+                        self.activity_bar.configure(mode="indeterminate")
+                    if self.activity_bar_running is False:
+                        self.activity_bar.start(10)
+                        self.activity_bar_running = True
+                else:
+                    if self.activity_bar_running:
+                        self.activity_bar.stop()
+                        self.activity_bar_running = False
+                    if str(self.activity_bar.cget("mode")) != "determinate":
+                        self.activity_bar.configure(mode="determinate", maximum=100)
+                    self.activity_bar["value"] = max(0.0, min(100.0, float(progress_value)))
+            
                 self.message_var.set(stage_text)
             else:
                 self.status_var.set("Idle")
                 if self.activity_bar_running:
                     self.activity_bar.stop()
                     self.activity_bar_running = False
-
-                if last_error and last_error != self.last_seen_error:
+                if str(self.activity_bar.cget("mode")) != "indeterminate":
+                    self.activity_bar.configure(mode="indeterminate")
+                self.activity_bar["value"] = 0
+            
+                error_was_new = bool(last_error and last_error != self.last_seen_error)
+                if error_was_new:
                     self.last_seen_error = last_error
                     self.message_var.set(last_error)
                     if self.recovery_mode:
@@ -6433,6 +6661,17 @@ def gui_main() -> int:
                             messagebox.showerror("Restore failed", last_error, parent=self.root)
                         except Exception:
                             pass
+                elif self.previous_running_job_name:
+                    finished_name = self.previous_running_job_name
+                    self.previous_running_job_name = ""
+                    if "restore" in finished_name.lower():
+                        completion = "Restore complete. Reboot, unplug the recovery USB and any other external media, then boot from the restored drive."
+                        self.message_var.set(completion)
+                        if self.recovery_mode:
+                            try:
+                                messagebox.showinfo("Restore complete", completion, parent=self.root)
+                            except Exception:
+                                pass
 
             self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
             self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
