@@ -3270,7 +3270,49 @@ def preferred_restored_kernel_pair(
     _, kernel, initrd = pairs[0]
     return kernel, initrd
 
+
 def rebuild_restored_primary_initramfs(
+    target: Path,
+    allow_dhcpcd_hook_workaround: bool = False,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> None:
+    kernel_version = restored_primary_kernel_version(target, metadata)
+
+    if (target / "sbin/depmod").exists() or (target / "usr/sbin/depmod").exists():
+        update_stage(f"Refreshing module metadata for {kernel_version}")
+        run_chroot_checked(
+            target,
+            ["depmod", "-a", kernel_version],
+            f"depmod for {kernel_version} in restored system",
+        )
+
+    def run_update(mode: str) -> subprocess.CompletedProcess:
+        return run_chroot(target, ["update-initramfs", mode, "-k", kernel_version])
+
+    def maybe_retry_without_dhcpcd(result: subprocess.CompletedProcess, mode: str) -> subprocess.CompletedProcess:
+        if not allow_dhcpcd_hook_workaround or result.returncode == 0:
+            return result
+
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        if "/usr/share/initramfs-tools/hooks/dhcpcd" not in detail and "/etc/initramfs-tools/hooks/dhcpcd" not in detail:
+            return result
+
+        update_stage("Disabling initramfs DHCP hook after restore failure")
+        if not disable_dhcpcd_initramfs_hooks(target, "dhcpcd hook failed during restore"):
+            return result
+        return run_update(mode)
+
+    update_stage(f"Rebuilding initramfs for {kernel_version}")
+    result = maybe_retry_without_dhcpcd(run_update("-u"), "-u")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        log_line(f"update-initramfs -u failed for {kernel_version}, retrying with -c: {detail}")
+        result = maybe_retry_without_dhcpcd(run_update("-c"), "-c")
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+            raise AegisError(f"update-initramfs for {kernel_version} in restored system failed: {detail}")
+
+
     target: Path,
     allow_dhcpcd_hook_workaround: bool = False,
     metadata: Optional[SnapshotMetadata] = None,
