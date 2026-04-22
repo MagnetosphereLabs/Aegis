@@ -2902,16 +2902,46 @@ def ensure_target_disk_is_not_source_disk(target_disk: str, source_path: str, la
             f"Refusing to overwrite the disk that currently holds the {label}. Choose another target disk."
         )
 
-def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Path, member: Optional[str], apply_packages: bool, recovery_password: Optional[str]) -> None:
+def restore_snapshot_from_repo(
+    settings: Settings,
+    snapshot_id: str,
+    target: Path,
+    member: Optional[str],
+    apply_packages: bool,
+    recovery_password: Optional[str],
+) -> None:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     manifest = find_snapshot_manifest(repo, snapshot_id)
     validate_restore_target(target, manifest.kind)
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
     extract_manifest_from_repo_to_target(repo, manifest, key, target, member)
-    after_restore_actions(target, manifest, apply_packages)
+    after_restore_actions(target, manifest, apply_packages, member)
 
 
-def after_restore_actions(target: Path, manifest: SnapshotManifest, apply_packages: bool) -> None:
+def restore_plain_archive_file(
+    archive_file: Path,
+    manifest: SnapshotManifest,
+    target: Path,
+    member: Optional[str],
+    apply_packages: bool,
+) -> None:
+    validate_restore_target(target, manifest.kind)
+    if manifest.archive_sha256 and sha256_file(archive_file) != manifest.archive_sha256:
+        raise AegisError("Bundle archive integrity mismatch.")
+    extract_archive_file_to_target(archive_file, target, member)
+    after_restore_actions(target, manifest, apply_packages, member)
+
+
+def after_restore_actions(
+    target: Path,
+    manifest: SnapshotManifest,
+    apply_packages: bool,
+    member: Optional[str] = None,
+) -> None:
+    if member:
+        set_job_progress(100.0, f"Selective restore complete: {normalize_member_path(member)}")
+        return
+
     if manifest.kind == "portable_state" and apply_packages and target.resolve() == Path("/"):
         update_stage("Applying package selections from portable restore")
         set_job_progress(95.0)
@@ -3289,12 +3319,18 @@ def rebuild_restored_primary_initramfs(
     def run_update(mode: str) -> subprocess.CompletedProcess:
         return run_chroot(target, ["update-initramfs", mode, "-k", kernel_version])
 
-    def maybe_retry_without_dhcpcd(result: subprocess.CompletedProcess, mode: str) -> subprocess.CompletedProcess:
+    def maybe_retry_without_dhcpcd(
+        result: subprocess.CompletedProcess,
+        mode: str,
+    ) -> subprocess.CompletedProcess:
         if not allow_dhcpcd_hook_workaround or result.returncode == 0:
             return result
 
         detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-        if "/usr/share/initramfs-tools/hooks/dhcpcd" not in detail and "/etc/initramfs-tools/hooks/dhcpcd" not in detail:
+        if (
+            "/usr/share/initramfs-tools/hooks/dhcpcd" not in detail
+            and "/etc/initramfs-tools/hooks/dhcpcd" not in detail
+        ):
             return result
 
         update_stage("Disabling initramfs DHCP hook after restore failure")
@@ -3310,22 +3346,9 @@ def rebuild_restored_primary_initramfs(
         result = maybe_retry_without_dhcpcd(run_update("-c"), "-c")
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-            raise AegisError(f"update-initramfs for {kernel_version} in restored system failed: {detail}")
-
-
-    target: Path,
-    allow_dhcpcd_hook_workaround: bool = False,
-    metadata: Optional[SnapshotMetadata] = None,
-) -> None:
-    kernel_version = restored_primary_kernel_version(target, metadata)
-
-    if (target / "sbin/depmod").exists() or (target / "usr/sbin/depmod").exists():
-        update_stage(f"Refreshing module metadata for {kernel_version}")
-        run_chroot_checked(
-            target,
-            ["depmod", "-a", kernel_version],
-            f"depmod for {kernel_version} in restored system",
-        )
+            raise AegisError(
+                f"update-initramfs for {kernel_version} in restored system failed: {detail}"
+            )
 
     def run_update(mode: str) -> subprocess.CompletedProcess:
         return run_chroot(target, ["update-initramfs", mode, "-k", kernel_version])
