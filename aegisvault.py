@@ -3653,8 +3653,90 @@ def copy_if_exists(src: Path, dest: Path) -> bool:
     if not src.exists():
         return False
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        try:
+            if os.path.samefile(src, dest):
+                return True
+        except OSError:
+            pass
     shutil.copyfile(src, dest)
     return True
+
+
+def systemd_boot_binary_candidates(target: Path) -> List[Path]:
+    esp = target / "boot/efi"
+    candidates: List[Path] = []
+
+    preferred = [
+        Path("/usr/lib/systemd/boot/efi/systemd-bootx64.efi"),
+        Path("/lib/systemd/boot/efi/systemd-bootx64.efi"),
+        target / "usr/lib/systemd/boot/efi/systemd-bootx64.efi",
+        target / "lib/systemd/boot/efi/systemd-bootx64.efi",
+        esp / "EFI/systemd/systemd-bootx64.efi",
+        esp / "EFI/BOOT/BOOTX64.EFI",
+    ]
+    for candidate in preferred:
+        if candidate.exists() and candidate not in candidates:
+            candidates.append(candidate)
+
+    efi_root = esp / "EFI"
+    if efi_root.exists():
+        for pattern in ("**/systemd-bootx64.efi", "**/BOOTX64.EFI", "**/bootx64.efi"):
+            for candidate in sorted(efi_root.glob(pattern)):
+                if candidate.exists() and candidate not in candidates:
+                    candidates.append(candidate)
+
+    return candidates
+
+
+def stage_systemd_boot_loader_files(target: Path) -> bool:
+    if not target_efi_partition_is_mounted(target):
+        return False
+
+    esp = target / "boot/efi"
+    systemd_dir = esp / "EFI/systemd"
+    boot_dir = esp / "EFI/BOOT"
+    systemd_dir.mkdir(parents=True, exist_ok=True)
+    boot_dir.mkdir(parents=True, exist_ok=True)
+
+    for candidate in systemd_boot_binary_candidates(target):
+        copied_any = False
+        copied_any |= copy_if_exists(candidate, systemd_dir / "systemd-bootx64.efi")
+        copied_any |= copy_if_exists(candidate, boot_dir / "BOOTX64.EFI")
+        if copied_any:
+            return True
+
+    return uefi_fallback_loader_exists(target)
+
+
+def install_or_stage_systemd_boot_for_restored_target(target: Path) -> None:
+    if not target_efi_partition_is_mounted(target):
+        raise AegisError("EFI System Partition is not mounted at /boot/efi.")
+
+    host_bootctl = shutil.which("bootctl")
+    if host_bootctl:
+        result = subprocess.run(
+            [host_bootctl, f"--path={target / 'boot/efi'}", "install"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            stage_systemd_boot_loader_files(target)
+            return
+
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        log_line(f"bootctl install failed, falling back to staged loader files: {detail}")
+    else:
+        log_line("bootctl is not available; trying to reuse or stage existing systemd-boot loader files.")
+
+    if stage_systemd_boot_loader_files(target):
+        return
+
+    raise AegisError(
+        "Could not install or stage systemd-boot on the restored EFI System Partition. "
+        "Make sure /boot/efi is mounted and the restored system or host provides systemd-bootx64.efi."
+    )
 
 
 def ensure_efi_boot_fallback_loader(target: Path, bootloader_id: str) -> None:
@@ -3793,36 +3875,28 @@ def best_effort_full_restore_post_actions(
     use_kernelstub_boot = has_mounted_efi and target_uses_kernelstub_boot(target)
     portable_local_restore = snapshot_kind == "portable_state"
 
+    if portable_local_restore:
+        sanitize_guided_restore_target(target, snapshot_kind)
+        scrub_portable_hardware_state(target)
+        prepare_portable_initramfs_for_local_disk_restore(target)
+
     with mounted_chroot_bindings(target):
-        if portable_local_restore:
-            update_stage("Using restored kernel and initramfs from backup")
+        if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
+            if portable_local_restore:
+                update_stage("Rebuilding portable initramfs for restored hardware")
             set_job_progress(94.0)
-        else:
-            if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
-                set_job_progress(94.0)
-                rebuild_restored_primary_initramfs(
-                    target,
-                    allow_dhcpcd_hook_workaround=True,
-                    metadata=metadata,
-                )
+            rebuild_restored_primary_initramfs(
+                target,
+                allow_dhcpcd_hook_workaround=True,
+                metadata=metadata,
+            )
+        elif portable_local_restore:
+            log_line("Portable restore skipped initramfs rebuild because update-initramfs is missing in the restored system.")
 
         if use_kernelstub_boot:
             update_stage("Installing systemd-boot on restored disk")
             set_job_progress(97.0)
-
-            host_bootctl = shutil.which("bootctl")
-            if not host_bootctl:
-                raise AegisError("Pop-style EFI restore requires bootctl and a mounted /boot/efi.")
-
-            result = subprocess.run(
-                [host_bootctl, f"--path={target / 'boot/efi'}", "install"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-                raise AegisError(f"bootctl install failed: {detail}")
+            install_or_stage_systemd_boot_for_restored_target(target)
 
             if not portable_local_restore and (target / "usr/bin/kernelstub").exists():
                 update_stage("Refreshing Pop!_OS kernel and initramfs on the ESP")
