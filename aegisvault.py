@@ -2912,13 +2912,20 @@ def restore_snapshot_from_repo(settings: Settings, snapshot_id: str, target: Pat
 
 
 def after_restore_actions(target: Path, manifest: SnapshotManifest, apply_packages: bool) -> None:
-    if manifest.kind == "portable_state" and apply_packages:
+    if manifest.kind == "portable_state" and apply_packages and target.resolve() == Path("/"):
         update_stage("Applying package selections from portable restore")
         set_job_progress(95.0)
         apply_portable_post_restore(target, manifest.metadata)
 
-    if manifest.kind == "full_recovery" and target.resolve() != Path("/"):
-        best_effort_full_restore_post_actions(target)
+    if target.resolve() != Path("/") and manifest.kind in {"full_recovery", "portable_state"}:
+        target_source = canonical_block_device_path(mount_source_for_path(str(target)))
+        target_disk = device_parent_disk(target_source) if target_source.startswith("/dev/") else None
+        best_effort_full_restore_post_actions(
+            target,
+            target_disk,
+            manifest.kind,
+            manifest.metadata,
+        )
         return
 
     set_job_progress(100.0, "Restore complete")
@@ -3222,21 +3229,61 @@ def prepare_portable_initramfs_for_local_disk_restore(target: Path) -> None:
     force_local_disk_initramfs_config(target)
     disable_dhcpcd_initramfs_hooks(target, "not needed for local-disk portable restore")
             
-def restored_primary_kernel_version(target: Path) -> str:
-    kernels: List[Tuple[float, str]] = []
-    for kernel in (target / "boot").glob("vmlinuz-*"):
+def restored_primary_kernel_version(target: Path, metadata: Optional[SnapshotMetadata] = None) -> str:
+    kernel, _ = preferred_restored_kernel_pair(target, metadata)
+    return kernel.name[len("vmlinuz-"):]
+
+
+def current_target_root_partuuid(target: Path) -> str:
+    root_partition = mounted_block_device_for_path(target)
+    if not root_partition.startswith("/dev/"):
+        return ""
+    return blkid_value(root_partition, "PARTUUID")
+
+
+def preferred_restored_kernel_pair(
+    target: Path,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> Tuple[Path, Path]:
+    boot_dir = target / "boot"
+
+    preferred_version = ""
+    if metadata and metadata.kernel_release:
+        preferred_version = metadata.kernel_release.strip()
+        if preferred_version:
+            kernel = boot_dir / f"vmlinuz-{preferred_version}"
+            initrd = boot_dir / f"initrd.img-{preferred_version}"
+            if kernel.exists() and initrd.exists():
+                return kernel, initrd
+
+    pairs: List[Tuple[float, Path, Path]] = []
+    for kernel in boot_dir.glob("vmlinuz-*"):
         version = kernel.name[len("vmlinuz-"):]
-        kernels.append((kernel.stat().st_mtime, version))
+        initrd = boot_dir / f"initrd.img-{version}"
+        if initrd.exists():
+            pairs.append((kernel.stat().st_mtime, kernel, initrd))
 
-    if not kernels:
-        raise AegisError("No restored kernel was found in /boot.")
+    if not pairs:
+        raise AegisError("No kernel/initramfs pair was found in restored /boot.")
 
-    kernels.sort(key=lambda item: item[0], reverse=True)
-    return kernels[0][1]
+    pairs.sort(key=lambda item: item[0], reverse=True)
+    _, kernel, initrd = pairs[0]
+    return kernel, initrd
 
 
-def rebuild_restored_primary_initramfs(target: Path, allow_dhcpcd_hook_workaround: bool = False) -> None:
-    kernel_version = restored_primary_kernel_version(target)
+def rebuild_restored_primary_initramfs(
+    target: Path,
+    allow_dhcpcd_hook_workaround: bool = False,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> None:
+
+
+def rebuild_restored_primary_initramfs(
+    target: Path,
+    allow_dhcpcd_hook_workaround: bool = False,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> None:
+    kernel_version = restored_primary_kernel_version(target, metadata)
 
     if (target / "sbin/depmod").exists() or (target / "usr/sbin/depmod").exists():
         update_stage(f"Refreshing module metadata for {kernel_version}")
@@ -3313,7 +3360,44 @@ def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
     # Autoremove at this stage can remove auto-installed kernel module packages,
     # which is exactly the wrong time to do it.
 
+def ensure_restored_identity_files(target: Path) -> None:
+    etc_dir = target / "etc"
+    etc_dir.mkdir(parents=True, exist_ok=True)
+
+    hostname_path = etc_dir / "hostname"
+    hostname_value = ""
+    if hostname_path.exists():
+        hostname_value = hostname_path.read_text(encoding="utf-8", errors="ignore").strip()
+
+    if not hostname_value:
+        hostname_value = "aegis-restored"
+        atomic_write(hostname_path, f"{hostname_value}\n".encode("utf-8"), mode=0o644)
+
+    hosts_path = etc_dir / "hosts"
+    if not hosts_path.exists():
+        hosts_text = f"127.0.0.1 localhost\n127.0.1.1 {hostname_value}\n"
+        atomic_write(hosts_path, hosts_text.encode("utf-8"), mode=0o644)
+
+    machine_id_path = etc_dir / "machine-id"
+    if not machine_id_path.exists():
+        atomic_write(machine_id_path, b"", mode=0o644)
+
+    dbus_dir = target / "var/lib/dbus"
+    dbus_dir.mkdir(parents=True, exist_ok=True)
+    dbus_machine_id = dbus_dir / "machine-id"
+    if not dbus_machine_id.exists():
+        try:
+            os.symlink("/etc/machine-id", dbus_machine_id)
+        except FileExistsError:
+            pass
+        except OSError:
+            atomic_write(dbus_machine_id, b"", mode=0o644)
+
+
 def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
+    if snapshot_kind != "portable_state":
+        return
+
     for rel in [
         "etc/initramfs-tools/conf.d/resume",
         "etc/initramfs-tools/conf.d/cryptroot",
@@ -3321,8 +3405,7 @@ def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
     ]:
         safe_unlink_any(target / rel)
 
-    if snapshot_kind == "portable_state":
-        remove_globbed_target_paths(target, PORTABLE_HARDWARE_CONFIG_GLOBS)
+    ensure_restored_identity_files(target)
 
 
 def mounted_block_device_for_path(path: Path) -> str:
@@ -3363,13 +3446,16 @@ def newest_restored_kernel_pair(target: Path) -> Tuple[Path, Path]:
     return kernel, initrd
 
 
-def write_manual_systemd_boot_entry(target: Path) -> None:
+def write_manual_systemd_boot_entry(
+    target: Path,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> None:
     esp = target / "boot/efi"
     if not esp.exists():
         raise AegisError("EFI System Partition is not mounted at /boot/efi.")
 
     root_uuid = current_target_root_uuid(target)
-    kernel, initrd = newest_restored_kernel_pair(target)
+    kernel, initrd = preferred_restored_kernel_pair(target, metadata)
 
     dest_dir = esp / "EFI" / "Aegis"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -3399,6 +3485,38 @@ def write_manual_systemd_boot_entry(target: Path) -> None:
     )
     atomic_write(entries_dir / "aegis-restored.conf", entry.encode("utf-8"), mode=0o644)
 
+def write_manual_grub_cfg(
+    target: Path,
+    metadata: Optional[SnapshotMetadata] = None,
+) -> None:
+    root_uuid = current_target_root_uuid(target)
+    kernel, initrd = preferred_restored_kernel_pair(target, metadata)
+
+    os_release_text = safe_read_text(str(target / "etc/os-release")).lower()
+    title = "Pop!_OS (Aegis Restored)" if "pop" in os_release_text else "Linux (Aegis Restored)"
+
+    grub_cfg = textwrap.dedent(
+        f"""\
+        set default=0
+        set timeout=3
+
+        insmod part_gpt
+        insmod part_msdos
+        insmod ext2
+        insmod search_fs_uuid
+
+        search --no-floppy --fs-uuid --set=root {root_uuid}
+
+        menuentry '{title}' {{
+            linux /boot/{kernel.name} root=UUID={root_uuid} ro quiet splash
+            initrd /boot/{initrd.name}
+        }}
+        """
+    )
+
+    for path in [target / "boot/grub/grub.cfg", target / "boot/grub2/grub.cfg"]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(path, grub_cfg.encode("utf-8"), mode=0o644)
 
 def loader_entry_references_current_root(entry_path: Path, target: Path) -> bool:
     text = safe_read_text(str(entry_path))
@@ -3611,28 +3729,25 @@ def best_effort_full_restore_post_actions(
     target: Path,
     target_disk: Optional[str] = None,
     snapshot_kind: str = "full_recovery",
+    metadata: Optional[SnapshotMetadata] = None,
 ) -> None:
     ensure_restored_runtime_dirs(target)
     has_mounted_efi = target_efi_partition_is_mounted(target)
     use_kernelstub_boot = has_mounted_efi and target_uses_kernelstub_boot(target)
+    portable_local_restore = snapshot_kind == "portable_state"
 
     with mounted_chroot_bindings(target):
-        portable_local_restore = snapshot_kind == "portable_state"
-
         if portable_local_restore:
-            update_stage("Removing hardware-specific packages from portable restore")
-            set_job_progress(93.0)
-            purge_matching_target_packages(target, PORTABLE_HARDWARE_PACKAGE_PURGE_PATTERNS)
-
-            update_stage("Removing hardware-specific boot and module config from portable restore")
-            scrub_portable_hardware_state(target)
-
-            update_stage("Forcing local-disk initramfs configuration for portable restore")
-            prepare_portable_initramfs_for_local_disk_restore(target)
-
-        if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
+            update_stage("Using restored kernel and initramfs from backup")
             set_job_progress(94.0)
-            rebuild_restored_primary_initramfs(target, allow_dhcpcd_hook_workaround=True)
+        else:
+            if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
+                set_job_progress(94.0)
+                rebuild_restored_primary_initramfs(
+                    target,
+                    allow_dhcpcd_hook_workaround=True,
+                    metadata=metadata,
+                )
 
         if use_kernelstub_boot:
             update_stage("Installing systemd-boot on restored disk")
@@ -3652,7 +3767,7 @@ def best_effort_full_restore_post_actions(
                 detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
                 raise AegisError(f"bootctl install failed: {detail}")
 
-            if (target / "usr/bin/kernelstub").exists():
+            if not portable_local_restore and (target / "usr/bin/kernelstub").exists():
                 update_stage("Refreshing Pop!_OS kernel and initramfs on the ESP")
                 set_job_progress(98.0)
                 result = run_chroot(
@@ -3670,9 +3785,8 @@ def best_effort_full_restore_post_actions(
                     detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
                     log_line(f"kernelstub refresh failed, falling back to manual loader entry: {detail}")
 
-            if not systemd_boot_default_entry_references_current_root(target):
-                update_stage("Writing fallback systemd-boot entry for restored disk")
-                write_manual_systemd_boot_entry(target)
+            update_stage("Writing systemd-boot entry for restored disk")
+            write_manual_systemd_boot_entry(target, metadata)
 
             update_stage("Validating restored systemd-boot configuration")
             set_job_progress(99.0)
@@ -3700,7 +3814,11 @@ def best_effort_full_restore_post_actions(
                 "disk grub-install in restored system",
             )
 
-        if (target / "usr/sbin/update-grub").exists():
+        if portable_local_restore:
+            update_stage("Writing GRUB menu for restored disk")
+            set_job_progress(99.0)
+            write_manual_grub_cfg(target, metadata)
+        elif (target / "usr/sbin/update-grub").exists():
             update_stage("Generating restored GRUB menu")
             set_job_progress(99.0)
             run_chroot_checked(
@@ -4197,7 +4315,12 @@ def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_d
         extract_manifest_from_repo_to_target(repo, manifest, key, mount_root, None)
         write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
         sanitize_guided_restore_target(mount_root, manifest.kind)
-        best_effort_full_restore_post_actions(mount_root, layout["disk"], manifest.kind)
+        best_effort_full_restore_post_actions(
+            mount_root,
+            layout["disk"],
+            manifest.kind,
+            manifest.metadata,
+        )
 
 
 def bundle_manifest_and_archive(bundle_path: Path, password: str) -> Tuple[SnapshotManifest, Path, tempfile.TemporaryDirectory]:
@@ -4227,7 +4350,12 @@ def guided_full_restore_from_bundle(bundle_path: Path, password: str, target_dis
             extract_archive_file_to_target(archive_path, mount_root, None)
             write_guided_restore_fstab(mount_root, layout["root"], layout["efi"])
             sanitize_guided_restore_target(mount_root, manifest.kind)
-            best_effort_full_restore_post_actions(mount_root, layout["disk"], manifest.kind)
+            best_effort_full_restore_post_actions(
+                mount_root,
+                layout["disk"],
+                manifest.kind,
+                manifest.metadata,
+            )
     finally:
         td.cleanup()
 
@@ -6917,13 +7045,14 @@ def gui_main() -> int:
                 error_was_new = bool(last_error and last_error != self.last_seen_error)
                 if error_was_new:
                     self.last_seen_error = last_error
+                    self.previous_running_job_name = ""
                     self.message_var.set(last_error)
                     if self.recovery_mode:
                         try:
                             messagebox.showerror("Restore failed", last_error, parent=self.root)
                         except Exception:
                             pass
-                elif self.previous_running_job_name:
+                elif self.previous_running_job_name and not last_error:
                     finished_name = self.previous_running_job_name
                     self.previous_running_job_name = ""
                     if "restore" in finished_name.lower():
