@@ -3270,14 +3270,6 @@ def preferred_restored_kernel_pair(
     _, kernel, initrd = pairs[0]
     return kernel, initrd
 
-
-def rebuild_restored_primary_initramfs(
-    target: Path,
-    allow_dhcpcd_hook_workaround: bool = False,
-    metadata: Optional[SnapshotMetadata] = None,
-) -> None:
-
-
 def rebuild_restored_primary_initramfs(
     target: Path,
     allow_dhcpcd_hook_workaround: bool = False,
