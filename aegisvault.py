@@ -3349,32 +3349,6 @@ def rebuild_restored_primary_initramfs(
             raise AegisError(
                 f"update-initramfs for {kernel_version} in restored system failed: {detail}"
             )
-
-    def run_update(mode: str) -> subprocess.CompletedProcess:
-        return run_chroot(target, ["update-initramfs", mode, "-k", kernel_version])
-
-    def maybe_retry_without_dhcpcd(result: subprocess.CompletedProcess, mode: str) -> subprocess.CompletedProcess:
-        if not allow_dhcpcd_hook_workaround or result.returncode == 0:
-            return result
-
-        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-        if "/usr/share/initramfs-tools/hooks/dhcpcd" not in detail and "/etc/initramfs-tools/hooks/dhcpcd" not in detail:
-            return result
-
-        update_stage("Disabling initramfs DHCP hook after restore failure")
-        if not disable_dhcpcd_initramfs_hooks(target, "dhcpcd hook failed during restore"):
-            return result
-        return run_update(mode)
-
-    update_stage(f"Rebuilding initramfs for {kernel_version}")
-    result = maybe_retry_without_dhcpcd(run_update("-u"), "-u")
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-        log_line(f"update-initramfs -u failed for {kernel_version}, retrying with -c: {detail}")
-        result = maybe_retry_without_dhcpcd(run_update("-c"), "-c")
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-            raise AegisError(f"update-initramfs for {kernel_version} in restored system failed: {detail}")
             
 def purge_matching_target_packages(target: Path, patterns: List[str]) -> None:
     if not (target / "usr/bin/dpkg-query").exists():
@@ -3452,9 +3426,9 @@ def ensure_restored_identity_files(target: Path) -> None:
 
 
 def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
-    if snapshot_kind != "portable_state":
-        return
-
+    # A guided restore creates a fresh unencrypted disk without swap.
+    # We must wipe dead LUKS and swap UUIDs even for full_recovery, 
+    # otherwise update-initramfs will fail with exit code 1.
     for rel in [
         "etc/initramfs-tools/conf.d/resume",
         "etc/initramfs-tools/conf.d/cryptroot",
@@ -3462,7 +3436,8 @@ def sanitize_guided_restore_target(target: Path, snapshot_kind: str) -> None:
     ]:
         safe_unlink_any(target / rel)
 
-    ensure_restored_identity_files(target)
+    if snapshot_kind == "portable_state":
+        ensure_restored_identity_files(target)
 
 
 def mounted_block_device_for_path(path: Path) -> str:
