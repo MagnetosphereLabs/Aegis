@@ -5784,7 +5784,15 @@ def gui_main() -> int:
             )
 
             style.configure("TCheckbutton", background="#0e1116", foreground="#e6edf3", font=base_font)
+            style.map("TCheckbutton", 
+                      background=[("active", "#0e1116")], 
+                      foreground=[("active", "#ffffff")])
+            
             style.configure("TRadiobutton", background="#0e1116", foreground="#e6edf3", font=base_font)
+            style.map("TRadiobutton", 
+                      background=[("active", "#0e1116")], 
+                      foreground=[("active", "#ffffff")])
+            
             style.configure("TEntry", fieldbackground="#151b23", foreground="#e6edf3", insertcolor="#e6edf3", font=base_font)
 
             style.configure(
