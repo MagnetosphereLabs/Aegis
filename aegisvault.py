@@ -3217,12 +3217,23 @@ def disable_target_initramfs_hook(target: Path, relative_path: str, reason: str 
     if disabled_path.exists():
         if hook_path.exists():
             hook_path.unlink(missing_ok=True)
+        # Ensure the disabled file is not executable, or mkinitramfs will still run it
+        try:
+            os.chmod(disabled_path, 0o644)
+        except OSError:
+            pass
         return True
 
     if not hook_path.exists():
         return False
 
     hook_path.rename(disabled_path)
+    # Strip execute permissions so the system actually ignores it
+    try:
+        os.chmod(disabled_path, 0o644)
+    except OSError:
+        pass
+    
     note = f" ({reason})" if reason else ""
     log_line(f"Disabled initramfs hook {relative_path}{note}")
     return True
