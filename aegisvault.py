@@ -196,6 +196,7 @@ class Dashboard:
     snapshots: List[Dict[str, Any]]
     warnings: List[str]
     logs: List[str]
+    repo_size_bytes: int = 0
 
 
 DEFAULT_FULL_EXCLUDES_BASE = [
@@ -4935,7 +4936,6 @@ def sync_peers(settings: Settings) -> None:
     state.last_sync_at = now_rfc3339()
     save_state(state)
 
-
 def dashboard() -> Dashboard:
     settings = load_settings()
     state = load_state()
@@ -4958,9 +4958,18 @@ def dashboard() -> Dashboard:
         warnings.append("Encryption is enabled but the local unlock credential is missing.")
     if settings.peers_enabled and not settings.peers:
         warnings.append("Constellation mode is enabled but no peers are configured.")
+        
     with RUNTIME.lock:
         current_job = dataclasses.replace(RUNTIME.current_job) if RUNTIME.current_job else None
         logs = list(RUNTIME.logs)
+        
+    repo_size = 0
+    try:
+        if settings.repo_path and Path(settings.repo_path).exists():
+            repo_size = get_repo_size_bytes(Path(settings.repo_path))
+    except Exception:
+        pass
+
     return Dashboard(
         settings=settings,
         persistent=state,
@@ -4968,6 +4977,7 @@ def dashboard() -> Dashboard:
         snapshots=list_snapshots(settings),
         warnings=warnings,
         logs=logs,
+        repo_size_bytes=repo_size,
     )
 
 
@@ -5605,9 +5615,6 @@ def sync_peers_command(direct: bool) -> int:
         return 1
 
 
-# ---------------- GUI ----------------
-
-
 def gui_main() -> int:
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -5675,6 +5682,13 @@ def gui_main() -> int:
             self.last_seen_error = ""
             self.previous_running_job_name = ""
 
+            self.recovery_usb_device_var = tk.StringVar(value="")
+            self.guided_target_disk_var = tk.StringVar(value="")
+            
+            self.repo_size_var = tk.StringVar(value="Total Combined Size on Disk: Calculating...") # <-- ADD THIS
+
+            self.peer_label_var = tk.StringVar()
+            
             outer = ttk.Frame(self.root, padding=16)
             outer.pack(fill="both", expand=True)
 
@@ -5861,6 +5875,14 @@ def gui_main() -> int:
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
+        def format_timestamp(self, ts: str) -> str:
+            try:
+                # Converts "2026-04-23T10:24:12Z" to "April 23, 2026 at 10:24 AM"
+                t = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+                return time.strftime("%B %d, %Y at %I:%M %p", t).replace(" 0", " ")
+            except Exception:
+                return ts
+        
         def prompt_new_recovery_password(self) -> Optional[str]:
             first = self.ask_string_dialog(
                 "Create recovery password",
@@ -6124,22 +6146,6 @@ def gui_main() -> int:
             self.logs_text.pack(fill="both", expand=True, pady=(8, 0))
             self.style_scrolled_text(self.logs_text)
 
-        def build_snapshot_table(self, parent: ttk.Frame) -> ttk.Treeview:
-            columns = ("created_at", "machine_label", "kind", "bytes", "id")
-            tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse", height=10)
-            tree.heading("created_at", text="Created")
-            tree.heading("machine_label", text="Machine")
-            tree.heading("kind", text="Kind")
-            tree.heading("bytes", text="Size")
-            tree.heading("id", text="Backup ID")
-            tree.column("created_at", width=160, anchor="w")
-            tree.column("machine_label", width=180, anchor="w")
-            tree.column("kind", width=180, anchor="w")
-            tree.column("bytes", width=120, anchor="e")
-            tree.column("id", width=320, anchor="w")
-            tree.bind("<<TreeviewSelect>>", self.on_snapshot_select)
-            return tree
-
         def build_backup_tab(self) -> None:
             controls = ttk.Frame(self.backup_tab)
             controls.pack(fill="x")
@@ -6181,126 +6187,65 @@ def gui_main() -> int:
             ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=3, column=1, sticky="w", pady=(14, 0))
 
         def build_restore_tab(self) -> None:
-            intro = ttk.Frame(self.restore_tab)
-            intro.pack(fill="x")
-            ttk.Label(intro, text="Restore and recovery", style="Header.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
-            intro_text = (
-                "Full Recovery is for putting the whole machine back after SSD failure or same hardware disaster recovery. "
-                "Portable Migration is for moving files, apps, and settings onto different hardware without dragging hardware specific drivers along. "
-                "Use Guided Full Restore from recovery media for disk level recovery, or restore a Portable Migration backup into a running Linux install."
-            )
-            ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
-            intro.grid_columnconfigure(1, weight=1)
-
-            ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
-
-            helper = ttk.Frame(self.restore_tab)
-            helper.pack(fill="x")
-                
             
-            # The Step-By-Step Guided Recovery Wizard UI
             if self.recovery_mode:
-                recovery = ttk.Frame(self.restore_tab)
-                recovery.pack(fill="both", expand=True, pady=(18, 0))
-                recovery.grid_columnconfigure(0, weight=1)
-                recovery.grid_rowconfigure(5, weight=1)
+                wizard = ttk.Frame(self.restore_tab, padding=16)
+                wizard.pack(fill="both", expand=True)
+                wizard.grid_columnconfigure(0, weight=1)
+                wizard.grid_rowconfigure(5, weight=1)
 
-                ttk.Label(recovery, text="Bare-Metal Recovery Wizard", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-                ttk.Label(recovery, text="Follow these 3 steps to completely restore your machine from a backup.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
+                ttk.Label(wizard, text="Aegis Time Machine", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+                ttk.Label(wizard, text="Select a point in time below to completely revert your system.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
+                
+                # Backup source
+                source_row = ttk.Frame(wizard)
+                source_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+                ttk.Entry(source_row, textvariable=self.repo_source_var, state="readonly", width=60).pack(side="left")
+                ttk.Button(source_row, text="Choose Backup Drive", command=self.choose_and_use_repo_source).pack(side="left", padx=(8, 0))
 
-                ttk.Label(recovery, text="Step 1: Choose the backup drive or folder", style="Header.TLabel").grid(
-                    row=2, column=0, columnspan=3, sticky="w"
-                )
+                ttk.Label(wizard, textvariable=self.repo_size_var, foreground="#9fb3c8", font=("TkDefaultFont", 10, "italic")).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 18))
+                
+                # The Timeline
+                self.restore_tree = self.build_snapshot_table(wizard)
+                self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 18))
 
-                source_row = ttk.Frame(recovery)
-                source_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
-                source_row.grid_columnconfigure(0, weight=1)
-
-                ttk.Entry(
-                    source_row,
-                    textvariable=self.repo_source_var,
-                    state="readonly",
-                    width=80,
-                ).grid(row=0, column=0, sticky="ew")
-
-                ttk.Button(
-                    source_row,
-                    text="Choose Backup Drive or Folder",
-                    command=self.choose_and_use_repo_source,
-                ).grid(row=0, column=1, padx=(8, 0))
-
-                ttk.Label(
-                    recovery,
-                    text="Step 2: Choose the backup to restore",
-                    style="Header.TLabel",
-                ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(18, 0))
-
-                self.restore_context_var = tk.StringVar(
-                    value="Choose the Full Recovery or Portable Migration backup you want to restore."
-                )
-                ttk.Label(
-                    recovery,
-                    textvariable=self.restore_context_var,
-                    wraplength=1080,
-                    style="Muted.TLabel",
-                ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 8))
-
-                self.restore_tree = self.build_snapshot_table(recovery)
-                self.restore_tree.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 0))
-
-                target_row = ttk.Frame(recovery)
-                target_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(18, 0))
-
-                ttk.Label(target_row, text="Step 3: Choose the destination disk", style="Header.TLabel").pack(side="left")
-                self.guided_disk_combo = ttk.Combobox(
-                    target_row,
-                    textvariable=self.guided_target_disk_var,
-                    width=54,
-                    state="readonly",
-                )
+                # Target Disk
+                target_row = ttk.Frame(wizard)
+                target_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 0))
+                ttk.Label(target_row, text="Destination disk:", style="Header.TLabel").pack(side="left")
+                self.guided_disk_combo = ttk.Combobox(target_row, textvariable=self.guided_target_disk_var, width=54, state="readonly")
                 self.guided_disk_combo.pack(side="left", padx=(12, 8))
                 ttk.Button(target_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
 
-                self.guided_restore_repo_button = ttk.Button(
-                    recovery,
-                    text="Start Full Disk Restore",
-                    command=self.guided_restore_repo,
-                )
-                self.guided_restore_repo_button.grid(row=8, column=0, sticky="w", pady=(24, 0))
+                self.guided_restore_repo_button = ttk.Button(wizard, text="Restore Machine to Selected Timeline", command=self.guided_restore_repo)
+                self.guided_restore_repo_button.grid(row=6, column=0, sticky="w", pady=(24, 0))
                 self.guided_restore_repo_button.state(["disabled"])
-                return
 
-            desktop_ui = ttk.Frame(self.restore_tab)
-            desktop_ui.pack(fill="both", expand=True, pady=(18, 0))
-            desktop_ui.grid_columnconfigure(0, weight=1)
-            desktop_ui.grid_rowconfigure(6, weight=1)
+            else:
+                desktop = ttk.Frame(self.restore_tab, padding=16)
+                desktop.pack(fill="both", expand=True)
+                desktop.grid_columnconfigure(0, weight=1)
+                desktop.grid_rowconfigure(5, weight=1)
 
-            ttk.Label(desktop_ui, text="Create Recovery USB", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(desktop_ui, text="Boot from this USB if your computer fails. It opens a recovery environment to do a bare-metal disk restore.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 8))
+                ttk.Label(desktop, text="Disaster Recovery Preparation", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+                ttk.Label(desktop, text="Aegis strictly enforces full restores from the recovery media to protect your running system. Create your recovery USB below, then boot from it when disaster strikes.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
 
-            usb_row = ttk.Frame(desktop_ui)
-            usb_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 18))
-            self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
-            self.recovery_usb_combo.pack(side="left")
-            ttk.Button(usb_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left", padx=(8, 0))
-            ttk.Button(usb_row, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).pack(side="left", padx=(8, 0))
+                usb_row = ttk.Frame(desktop)
+                usb_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 24))
+                self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
+                self.recovery_usb_combo.pack(side="left")
+                ttk.Button(usb_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left", padx=(8, 0))
+                ttk.Button(usb_row, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).pack(side="left", padx=(8, 0))
+                
+                ttk.Separator(desktop, orient="horizontal").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 18))
 
-            ttk.Label(desktop_ui, text="Restore Files or Migration State", style="Header.TLabel").grid(row=3, column=0, columnspan=3, sticky="w")
-            self.restore_context_var = tk.StringVar(value="Select a specific backup date from the list below.")
-            ttk.Label(desktop_ui, textvariable=self.restore_context_var, style="Muted.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 8))
+                ttk.Label(desktop, text="Backup Timeline (View Only)", style="Header.TLabel").grid(row=4, column=0, columnspan=3, sticky="w")
+                ttk.Label(desktop, text="Aegis uses heavy deduplication. The total combined size below is the real footprint on your disk, while the 'Restore Size' in the table is how much data you get back for that specific point in time.", wraplength=1080, style="Muted.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 4))
+                
+                ttk.Label(desktop, textvariable=self.repo_size_var, foreground="#165dcb", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
-            restore_opts = ttk.Frame(desktop_ui)
-            restore_opts.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
-            ttk.Label(restore_opts, text="Restore target path:").pack(side="left")
-            ttk.Entry(restore_opts, textvariable=self.repo_restore_target_var, width=24).pack(side="left", padx=(8, 16))
-            ttk.Label(restore_opts, text="Recovery Password (if foreign machine):").pack(side="left")
-            ttk.Entry(restore_opts, textvariable=self.repo_recovery_key_var, show="*", width=20).pack(side="left", padx=(8, 16))
-            self.repo_restore_button = ttk.Button(restore_opts, text="Restore Selected Snapshot", command=self.restore_repo_snapshot)
-            self.repo_restore_button.pack(side="left")
-            self.repo_restore_button.state(["disabled"])
-
-            self.restore_tree = self.build_snapshot_table(desktop_ui)
-            self.restore_tree.grid(row=6, column=0, columnspan=3, sticky="nsew")
+                self.restore_tree = self.build_snapshot_table(desktop)
+                self.restore_tree.grid(row=7, column=0, columnspan=3, sticky="nsew")
 
         def build_constellation_tab(self) -> None:
             info = ttk.Frame(self.constellation_tab)
@@ -6461,6 +6406,44 @@ def gui_main() -> int:
                 return
             self.repo_source_var.set(chosen)
             self.use_repo_source_path()
+
+        def build_snapshot_table(self, parent: ttk.Frame) -> ttk.Treeview:
+            columns = ("created_at", "machine_label", "kind", "bytes", "id")
+            tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse", height=10)
+            
+            tree.heading("created_at", text="Created")
+            tree.heading("machine_label", text="Machine")
+            tree.heading("kind", text="Kind")
+            tree.heading("bytes", text="Restore Size")
+            tree.heading("id", text="Backup ID")
+            
+            tree.column("created_at", width=220, anchor="w")
+            tree.column("machine_label", width=160, anchor="w")
+            tree.column("kind", width=180, anchor="w")
+            tree.column("bytes", width=120, anchor="w") 
+            tree.column("id", width=240, anchor="w")
+            
+            tree.bind("<<TreeviewSelect>>", self.on_snapshot_select)
+            return tree
+
+        def fill_snapshot_tree(self, tree: ttk.Treeview, snapshots: List[Dict[str, Any]]) -> None:
+            existing_selection = self.selected_snapshot_id
+            for item in tree.get_children():
+                tree.delete(item)
+            for snap in snapshots:
+                raw_id = snap.get("id", "")
+                short_id = raw_id[:16] + "..." if len(raw_id) > 16 else raw_id
+                
+                values = (
+                    self.format_timestamp(snap.get("created_at", "")),
+                    snap.get("machine_label", ""),
+                    kind_label(snap.get("kind", "")),
+                    human_bytes(int(snap.get("archive_bytes", 0))),
+                    short_id,
+                )
+                item_id = tree.insert("", "end", iid=raw_id, values=values)
+                if raw_id == existing_selection:
+                    tree.selection_set(item_id)
         
         def open_directory_chooser(self, start_path: str) -> Optional[str]:
             dialog = tk.Toplevel(self.root)
@@ -7235,6 +7218,10 @@ def gui_main() -> int:
 
             self.snapshot_by_id = {snap.get("id", ""): snap for snap in snapshots if snap.get("id")}
 
+            total_disk = payload.get("repo_size_bytes", 0)
+            if hasattr(self, "repo_size_var"):
+                self.repo_size_var.set(f"Total Combined Size on Disk: {human_bytes(total_disk)}")
+            
             self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
 
             self.status_var.set(
@@ -7336,21 +7323,6 @@ def gui_main() -> int:
                 self.settings_loaded = True
             self.refresh_restore_actions()
 
-        def fill_snapshot_tree(self, tree: ttk.Treeview, snapshots: List[Dict[str, Any]]) -> None:
-            existing_selection = self.selected_snapshot_id
-            for item in tree.get_children():
-                tree.delete(item)
-            for snap in snapshots:
-                values = (
-                    snap.get("created_at", ""),
-                    snap.get("machine_label", ""),
-                    kind_label(snap.get("kind", "")),
-                    human_bytes(int(snap.get("archive_bytes", 0))),
-                    snap.get("id", ""),
-                )
-                item_id = tree.insert("", "end", iid=snap.get("id", ""), values=values)
-                if snap.get("id") == existing_selection:
-                    tree.selection_set(item_id)
 
         def fill_peers_tree(self, tree: ttk.Treeview, peers: List[Dict[str, Any]], settings_mode: bool = False) -> None:
             for item in tree.get_children():
