@@ -1,4 +1,4 @@
-This software is in pre-alpha v1 and is not ready to install on your device. Coming soon ™️
+This software is in alpha and is not ready to install on your device. Coming soon ™️
 
 # Aegis
 
