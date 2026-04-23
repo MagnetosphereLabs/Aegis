@@ -50,7 +50,7 @@ SECURE_TMP_DIR = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 BUNDLE_MAGIC = b"AGBND1"
 OBJECT_MAGIC = b"AGOBJ1"
 DEFAULT_REPO = "/var/backups/aegisvault"
-DEFAULT_CHUNK_MIB = 4
+DEFAULT_CHUNK_MIB = 300
 BUFFER_SIZE = 1024 * 1024
 LOG_LIMIT = 250
 RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
@@ -110,6 +110,7 @@ class Settings:
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     chunk_size_mib: int = DEFAULT_CHUNK_MIB
     io_yield_ms: int = 2
+    max_repo_size_gb: int = 0  # 0 means unlimited
     apply_packages_on_portable_restore: bool = True
     full_excludes: List[str] = field(default_factory=list)
     portable_includes: List[str] = field(default_factory=list)
@@ -1195,6 +1196,7 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
         ),
         chunk_size_mib=int(data.get("chunk_size_mib", DEFAULT_CHUNK_MIB)),
         io_yield_ms=int(data.get("io_yield_ms", 2)),
+        max_repo_size_gb=int(data.get("max_repo_size_gb", 0)),
         apply_packages_on_portable_restore=bool(data.get("apply_packages_on_portable_restore", True)),
         full_excludes=list(data.get("full_excludes") or []),
         portable_includes=list(data.get("portable_includes") or []),
@@ -2798,6 +2800,102 @@ def file_lock(path: Path):
         finally:
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
+
+def get_repo_size_bytes(repo_path: Path) -> int:
+    total = 0
+    for dirpath, _, filenames in os.walk(repo_path):
+        for f in filenames:
+            fp = os.path.join(dirpath, f)
+            if not os.path.islink(fp):
+                total += os.path.getsize(fp)
+    return total
+
+def enforce_repo_size_limit(settings: Settings) -> None:
+    if settings.max_repo_size_gb <= 0:
+        return
+    
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    limit_bytes = settings.max_repo_size_gb * 1024 * 1024 * 1024
+    
+    while get_repo_size_bytes(repo) > limit_bytes:
+        snaps = list_snapshots(settings)
+        if len(snaps) <= 1:
+            # Safety catch: Never delete the last remaining backup
+            break
+            
+        oldest_id = snaps[-1]["id"]
+        update_stage(f"Auto-pruning oldest backup ({oldest_id}) to stay under size limit")
+        delete_snapshot_from_repo(settings, oldest_id)
+
+def perform_backup(settings: Settings, profile: str) -> List[str]:
+    start_stamp = now_rfc3339()
+    state = load_state()
+    state.last_run_at = start_stamp
+    state.last_error = ""
+    save_state(state)
+
+    materialize_settings(settings)
+    created: List[str] = []
+    chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
+    machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
+    with file_lock(LOCK_PATH):
+        run_id = f"{utc_tag()}-{random_suffix(3)}"
+        kinds = ["full_recovery", "portable_state"] if profile == "both" else [profile]
+        for kind in kinds:
+            update_stage(f"Collecting metadata for {kind_label(kind)}")
+            metadata = collect_snapshot_metadata(kind)
+            includes = build_include_paths(settings, kind)
+            excludes = build_exclude_paths(settings, kind)
+            update_stage(f"Capturing {kind_label(kind)}")
+            writer = RepoWriter(Path(settings.repo_path), settings.machine_id, chunk_size, machine_key_value, settings.io_yield_ms)
+            cmd = build_tar_backup_command(includes, excludes)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(BUFFER_SIZE)
+                if not chunk:
+                    break
+                writer.write(chunk)
+            stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+            returncode = proc.wait()
+            if returncode != 0:
+                raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
+            refs, total_bytes, archive_sha = writer.finish()
+            manifest = SnapshotManifest(
+                version=1,
+                id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
+                run_id=run_id,
+                machine_id=settings.machine_id,
+                machine_label=settings.machine_label,
+                hostname=hostname(),
+                created_at=now_rfc3339(),
+                kind=kind,
+                source_paths=includes,
+                exclude_paths=excludes,
+                chunk_size=chunk_size,
+                archive_refs=refs,
+                archive_plaintext_bytes=total_bytes,
+                archive_sha256=archive_sha,
+                metadata=metadata,
+                notes=list(metadata.notes),
+            )
+            write_manifest(settings, manifest)
+            created.append(manifest.id)
+            
+        if settings.peers_enabled and settings.peers:
+            update_stage("Syncing peers")
+            sync_peers(settings)
+
+        update_stage("Checking repository size limits")
+        enforce_repo_size_limit(settings)
+
+        state = load_state()
+        state.last_run_at = start_stamp
+        state.last_success_at = now_rfc3339()
+        state.last_error = ""
+        save_state(state)
+
+    return created
 
 def perform_backup(settings: Settings, profile: str) -> List[str]:
     start_stamp = now_rfc3339()
@@ -5536,6 +5634,7 @@ def gui_main() -> int:
             self.schedule_preset_var = tk.StringVar(value="manual")
             self.schedule_custom_var = tk.StringVar(value="60")
             self.io_yield_var = tk.StringVar(value="2")
+            self.max_repo_size_var = tk.StringVar(value="0")
             self.apply_packages_var = tk.BooleanVar(value=True)
             self.peers_enabled_var = tk.BooleanVar(value=False)
 
@@ -5640,6 +5739,11 @@ def gui_main() -> int:
         def configure_theme(self) -> None:
             self.root.configure(bg="#0e1116")
 
+            # Declare base font scaling
+            base_font = ("TkDefaultFont", 12)
+            header_font = ("TkDefaultFont", 14, "bold")
+
+            self.root.option_add("*font", base_font)
             self.root.option_add("*TCombobox*Listbox*Background", "#151b23")
             self.root.option_add("*TCombobox*Listbox*Foreground", "#e6edf3")
             self.root.option_add("*TCombobox*Listbox*selectBackground", "#1a2330")
@@ -5648,6 +5752,7 @@ def gui_main() -> int:
             self.root.option_add("*Listbox*Foreground", "#e6edf3")
             self.root.option_add("*Listbox*selectBackground", "#1a2330")
             self.root.option_add("*Listbox*selectForeground", "#ffffff")
+            self.root.option_add("*Listbox*Font", base_font)
 
             style = ttk.Style()
             try:
@@ -5655,11 +5760,11 @@ def gui_main() -> int:
             except Exception:
                 pass
 
-            style.configure(".", background="#0e1116", foreground="#e6edf3", fieldbackground="#151b23")
+            style.configure(".", background="#0e1116", foreground="#e6edf3", fieldbackground="#151b23", font=base_font)
             style.configure("TFrame", background="#0e1116")
-            style.configure("TLabel", background="#0e1116", foreground="#e6edf3")
-            style.configure("Header.TLabel", background="#0e1116", foreground="#e6edf3", font=("TkDefaultFont", 11, "bold"))
-            style.configure("Muted.TLabel", background="#0e1116", foreground="#9fb3c8")
+            style.configure("TLabel", background="#0e1116", foreground="#e6edf3", font=base_font)
+            style.configure("Header.TLabel", background="#0e1116", foreground="#e6edf3", font=header_font)
+            style.configure("Muted.TLabel", background="#0e1116", foreground="#9fb3c8", font=base_font)
 
             style.configure(
                 "TButton",
@@ -5669,6 +5774,7 @@ def gui_main() -> int:
                 relief="flat",
                 borderwidth=0,
                 focusthickness=0,
+                font=base_font,
             )
             style.map(
                 "TButton",
@@ -5677,9 +5783,9 @@ def gui_main() -> int:
                 relief=[("pressed", "flat"), ("active", "flat")],
             )
 
-            style.configure("TCheckbutton", background="#0e1116", foreground="#e6edf3")
-            style.configure("TRadiobutton", background="#0e1116", foreground="#e6edf3")
-            style.configure("TEntry", fieldbackground="#151b23", foreground="#e6edf3", insertcolor="#e6edf3")
+            style.configure("TCheckbutton", background="#0e1116", foreground="#e6edf3", font=base_font)
+            style.configure("TRadiobutton", background="#0e1116", foreground="#e6edf3", font=base_font)
+            style.configure("TEntry", fieldbackground="#151b23", foreground="#e6edf3", insertcolor="#e6edf3", font=base_font)
 
             style.configure(
                 "TCombobox",
@@ -5693,6 +5799,7 @@ def gui_main() -> int:
                 insertcolor="#e6edf3",
                 selectbackground="#1a2330",
                 selectforeground="#ffffff",
+                font=base_font,
             )
             style.map(
                 "TCombobox",
@@ -5707,14 +5814,15 @@ def gui_main() -> int:
                 background="#151b23",
                 fieldbackground="#151b23",
                 foreground="#e6edf3",
-                rowheight=24,
+                rowheight=28,  # Increased from 24 to match the larger font
                 borderwidth=0,
+                font=base_font,
             )
             style.map("Treeview", background=[("selected", "#1a2330")], foreground=[("selected", "#ffffff")])
-            style.configure("Treeview.Heading", background="#11161d", foreground="#e6edf3", borderwidth=0)
+            style.configure("Treeview.Heading", background="#11161d", foreground="#e6edf3", borderwidth=0, font=base_font)
 
             style.configure("TNotebook", background="#0e1116", borderwidth=0, tabmargins=(0, 0, 0, 0))
-            style.configure("TNotebook.Tab", background="#11161d", foreground="#d7e0ea", padding=(16, 10), borderwidth=0)
+            style.configure("TNotebook.Tab", background="#11161d", foreground="#d7e0ea", padding=(16, 10), borderwidth=0, font=base_font)
             style.map(
                 "TNotebook.Tab",
                 background=[("selected", "#1a2330"), ("active", "#141b24"), ("!selected", "#11161d")],
@@ -6241,22 +6349,25 @@ def gui_main() -> int:
             ttk.Label(schedule, text="I/O yield milliseconds per chunk").grid(row=4, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(schedule, text="Default backup plan").grid(row=5, column=0, sticky="w", pady=(10, 0))
+            ttk.Label(schedule, text="Max backup size limit (GB, 0 for unlimited)").grid(row=5, column=0, sticky="w", pady=(10, 0))
+            ttk.Entry(schedule, textvariable=self.max_repo_size_var, width=12).grid(row=5, column=1, sticky="w", pady=(10, 0))
+
+            ttk.Label(schedule, text="Default backup plan").grid(row=6, column=0, sticky="w", pady=(10, 0))
             profile_row = ttk.Frame(schedule)
-            profile_row.grid(row=5, column=1, sticky="w", pady=(10, 0))
+            profile_row.grid(row=6, column=1, sticky="w", pady=(10, 0))
             ttk.Radiobutton(profile_row, text="Full machine", variable=self.default_backup_profile_var, value="full_recovery").pack(side="left")
             ttk.Radiobutton(profile_row, text="Portable", variable=self.default_backup_profile_var, value="portable_state").pack(side="left", padx=(12, 0))
             ttk.Radiobutton(profile_row, text="Both", variable=self.default_backup_profile_var, value="both").pack(side="left", padx=(12, 0))
 
             ttk.Checkbutton(schedule, text="Show desktop notifications", variable=self.notifications_enabled_var).grid(
-                row=6, column=0, columnspan=2, sticky="w", pady=(10, 0)
+                row=7, column=0, columnspan=2, sticky="w", pady=(10, 0)
             )
             ttk.Label(
                 schedule,
                 text="Desktop notifications warn about starts, finishes, and problems such as missing backup drives.",
                 wraplength=420,
                 style="Muted.TLabel",
-            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
             excludes = ttk.Frame(left)
             excludes.pack(fill="both", expand=True, pady=(24, 0))
@@ -7189,6 +7300,7 @@ def gui_main() -> int:
                 self.schedule_preset_var.set(schedule.get("preset", "manual"))
                 self.schedule_custom_var.set(str(schedule.get("custom_minutes", 60)))
                 self.io_yield_var.set(str(settings.get("io_yield_ms", 2)))
+                self.max_repo_size_var.set(str(settings.get("max_repo_size_gb", 0)))
                 self.apply_packages_var.set(bool(settings.get("apply_packages_on_portable_restore", True)))
                 self.peers_enabled_var.set(bool(settings.get("peers_enabled", False)))
                 self.fill_text(self.full_excludes_text, "\n".join(settings.get("full_excludes", [])))
@@ -7480,6 +7592,7 @@ def gui_main() -> int:
                 },
                 "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
                 "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
+                "max_repo_size_gb": int(self.max_repo_size_var.get().strip() or "0"),
                 "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
                 "full_excludes": full_excludes,
                 "portable_includes": portable_includes,
