@@ -6185,43 +6185,20 @@ def gui_main() -> int:
             intro.pack(fill="x")
             ttk.Label(intro, text="Restore and recovery", style="Header.TLabel").grid(row=0, column=0, columnspan=5, sticky="w")
             intro_text = (
-                "Full Recovery is for putting the whole machine back after SSD failure or same-hardware disaster recovery. "
-                "Portable Migration is for moving files, apps, and settings onto different hardware without dragging hardware-specific drivers along. "
-                "Use Guided Full Restore from recovery media for disk-level recovery, or restore a Portable Migration backup into a running Linux install."
+                "Full Recovery is for putting the whole machine back after SSD failure or same hardware disaster recovery. "
+                "Portable Migration is for moving files, apps, and settings onto different hardware without dragging hardware specific drivers along. "
+                "Use Guided Full Restore from recovery media for disk level recovery, or restore a Portable Migration backup into a running Linux install."
             )
             ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
             intro.grid_columnconfigure(1, weight=1)
-
-            # Prevent the duplicate repo chooser by only showing it in standard desktop mode
-            if not self.recovery_mode:
-                ttk.Label(intro, text="Backup location").grid(row=2, column=0, sticky="w", pady=(12, 0))
-                repo_source_entry = ttk.Entry(
-                    intro,
-                    textvariable=self.repo_source_var,
-                    width=72,
-                    state="readonly",
-                )
-                repo_source_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(12, 0))
-
-                ttk.Button(
-                    intro,
-                    text="Choose Backup Drive or Folder",
-                    command=self.choose_and_use_repo_source,
-                ).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
-
-                ttk.Label(
-                    intro,
-                    text="The chooser already handles mounted drives, unmounted drives, refresh, and folder browsing. Pick the backup location there.",
-                    wraplength=1080,
-                    style="Muted.TLabel",
-                ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
             helper = ttk.Frame(self.restore_tab)
             helper.pack(fill="x")
+                
             
-            # The new Step-By-Step Guided Recovery Wizard UI
+            # The Step-By-Step Guided Recovery Wizard UI
             if self.recovery_mode:
                 recovery = ttk.Frame(self.restore_tab)
                 recovery.pack(fill="both", expand=True, pady=(18, 0))
@@ -6292,6 +6269,38 @@ def gui_main() -> int:
                 self.guided_restore_repo_button.grid(row=8, column=0, sticky="w", pady=(24, 0))
                 self.guided_restore_repo_button.state(["disabled"])
                 return
+
+            desktop_ui = ttk.Frame(self.restore_tab)
+            desktop_ui.pack(fill="both", expand=True, pady=(18, 0))
+            desktop_ui.grid_columnconfigure(0, weight=1)
+            desktop_ui.grid_rowconfigure(6, weight=1)
+
+            ttk.Label(desktop_ui, text="Create Recovery USB", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Label(desktop_ui, text="Boot from this USB if your computer fails. It opens a recovery environment to do a bare-metal disk restore.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+            usb_row = ttk.Frame(desktop_ui)
+            usb_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 18))
+            self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
+            self.recovery_usb_combo.pack(side="left")
+            ttk.Button(usb_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left", padx=(8, 0))
+            ttk.Button(usb_row, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).pack(side="left", padx=(8, 0))
+
+            ttk.Label(desktop_ui, text="Restore Files or Migration State", style="Header.TLabel").grid(row=3, column=0, columnspan=3, sticky="w")
+            self.restore_context_var = tk.StringVar(value="Select a specific backup date from the list below.")
+            ttk.Label(desktop_ui, textvariable=self.restore_context_var, style="Muted.TLabel").grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+            restore_opts = ttk.Frame(desktop_ui)
+            restore_opts.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+            ttk.Label(restore_opts, text="Restore target path:").pack(side="left")
+            ttk.Entry(restore_opts, textvariable=self.repo_restore_target_var, width=24).pack(side="left", padx=(8, 16))
+            ttk.Label(restore_opts, text="Recovery Password (if foreign machine):").pack(side="left")
+            ttk.Entry(restore_opts, textvariable=self.repo_recovery_key_var, show="*", width=20).pack(side="left", padx=(8, 16))
+            self.repo_restore_button = ttk.Button(restore_opts, text="Restore Selected Snapshot", command=self.restore_repo_snapshot)
+            self.repo_restore_button.pack(side="left")
+            self.repo_restore_button.state(["disabled"])
+
+            self.restore_tree = self.build_snapshot_table(desktop_ui)
+            self.restore_tree.grid(row=6, column=0, columnspan=3, sticky="nsew")
 
         def build_constellation_tab(self) -> None:
             info = ttk.Frame(self.constellation_tab)
