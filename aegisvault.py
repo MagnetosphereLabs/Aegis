@@ -2857,7 +2857,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
                 if not chunk:
                     break
                 writer.write(chunk)
-            stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+            
             returncode = proc.wait()
             if returncode != 0:
                 raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
@@ -2929,7 +2929,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
                 writer.write(chunk)
             stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
             returncode = proc.wait()
-            if returncode != 0:
+            if returncode not in (0, 1):
                 raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
             refs, total_bytes, archive_sha = writer.finish()
             manifest = SnapshotManifest(
