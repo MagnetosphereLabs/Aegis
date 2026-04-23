@@ -5736,19 +5736,18 @@ def gui_main() -> int:
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
 
         def prompt_new_recovery_password(self) -> Optional[str]:
-            first = simpledialog.askstring(
+            first = self.ask_string_dialog(
                 "Create recovery password",
-                "Choose the recovery password for encrypted restores.\n\n"
-                "You will need this to restore on another machine or after a full reset.",
-                show="*",
+                "Choose the recovery password for encrypted restores.\n\nYou will need this to restore on another machine or after a full reset.",
+                show="*"
             )
             if first is None:
                 return None
 
-            second = simpledialog.askstring(
+            second = self.ask_string_dialog(
                 "Confirm recovery password",
                 "Re-enter the recovery password.",
-                show="*",
+                show="*"
             )
             if second is None:
                 return None
@@ -5786,10 +5785,11 @@ def gui_main() -> int:
             frame.pack(fill="both", expand=True)
             frame.grid_columnconfigure(1, weight=1)
 
-            ttk.Label(frame, text="Initial setup", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Label(frame, text="Welcome to Aegis", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Label(
                 frame,
-                text="Finish the core configuration once before exposing backup, restore, peer sync, and advanced settings. You can fine-tune excludes and peer sync later.",
+                text="Let's get your backup environment configured. Aegis creates space-efficient, fully encrypted backups of your entire system and personal files.\n\n"
+                     "Finish this initial setup once to unlock the main dashboard, where you can run backups, restore data, and sync with peers.",
                 wraplength=1020,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -5921,6 +5921,49 @@ def gui_main() -> int:
             except Exception:
                 pass
 
+        def ask_string_dialog(self, title: str, prompt: str, show: str = "") -> Optional[str]:
+            dialog = tk.Toplevel(self.root)
+            dialog.title(title)
+            dialog.geometry("500x220")
+            dialog.configure(bg="#0e1116")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            result = []
+
+            # Center window over parent
+            dialog.update_idletasks()
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 250
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 110
+            dialog.geometry(f"+{x}+{y}")
+
+            ttk.Label(dialog, text=prompt, wraplength=460, style="Muted.TLabel").pack(pady=(20, 10), padx=20, fill="x")
+            
+            var = tk.StringVar()
+            entry = ttk.Entry(dialog, textvariable=var, width=50)
+            if show:
+                entry.configure(show=show)
+            entry.pack(pady=10, padx=20)
+            entry.focus_set()
+
+            def submit(event=None):
+                result.append(var.get())
+                dialog.destroy()
+
+            def cancel(event=None):
+                dialog.destroy()
+
+            entry.bind("<Return>", submit)
+            entry.bind("<Escape>", cancel)
+
+            btn_frame = ttk.Frame(dialog)
+            btn_frame.pack(pady=10)
+            ttk.Button(btn_frame, text="OK", command=submit).pack(side="left", padx=5)
+            ttk.Button(btn_frame, text="Cancel", command=cancel).pack(side="left", padx=5)
+
+            dialog.wait_window()
+            return result[0] if result else None
+
         def build_overview_tab(self) -> None:
             summary = ttk.Frame(self.overview_tab)
             summary.pack(fill="x")
@@ -6023,44 +6066,51 @@ def gui_main() -> int:
             ttk.Label(intro, text=intro_text, wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
             intro.grid_columnconfigure(1, weight=1)
 
-            ttk.Label(intro, text="Backup location").grid(row=2, column=0, sticky="w", pady=(12, 0))
-            repo_source_entry = ttk.Entry(
-                intro,
-                textvariable=self.repo_source_var,
-                width=72,
-                state="readonly",
-            )
-            repo_source_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(12, 0))
+            # Prevent the duplicate repo chooser by only showing it in standard desktop mode
+            if not self.recovery_mode:
+                ttk.Label(intro, text="Backup location").grid(row=2, column=0, sticky="w", pady=(12, 0))
+                repo_source_entry = ttk.Entry(
+                    intro,
+                    textvariable=self.repo_source_var,
+                    width=72,
+                    state="readonly",
+                )
+                repo_source_entry.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(12, 0))
 
-            ttk.Button(
-                intro,
-                text="Choose Backup Drive or Folder",
-                command=self.choose_and_use_repo_source,
-            ).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
+                ttk.Button(
+                    intro,
+                    text="Choose Backup Drive or Folder",
+                    command=self.choose_and_use_repo_source,
+                ).grid(row=2, column=4, padx=(8, 0), pady=(12, 0))
 
-            ttk.Label(
-                intro,
-                text="The chooser already handles mounted drives, unmounted drives, refresh, and folder browsing. Pick the backup location there.",
-                wraplength=1080,
-                style="Muted.TLabel",
-            ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
+                ttk.Label(
+                    intro,
+                    text="The chooser already handles mounted drives, unmounted drives, refresh, and folder browsing. Pick the backup location there.",
+                    wraplength=1080,
+                    style="Muted.TLabel",
+                ).grid(row=3, column=0, columnspan=5, sticky="w", pady=(6, 0))
 
             ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
 
             helper = ttk.Frame(self.restore_tab)
             helper.pack(fill="x")
+            
+            # The new Step-By-Step Guided Recovery Wizard UI
             if self.recovery_mode:
                 recovery = ttk.Frame(self.restore_tab)
                 recovery.pack(fill="both", expand=True, pady=(18, 0))
                 recovery.grid_columnconfigure(0, weight=1)
-                recovery.grid_rowconfigure(3, weight=1)
+                recovery.grid_rowconfigure(5, weight=1)
 
-                ttk.Label(recovery, text="1. Choose the backup drive or folder", style="Header.TLabel").grid(
-                    row=0, column=0, columnspan=3, sticky="w"
+                ttk.Label(recovery, text="Bare-Metal Recovery Wizard", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+                ttk.Label(recovery, text="Follow these 3 steps to completely restore your machine from a backup.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
+
+                ttk.Label(recovery, text="Step 1: Choose the backup drive or folder", style="Header.TLabel").grid(
+                    row=2, column=0, columnspan=3, sticky="w"
                 )
 
                 source_row = ttk.Frame(recovery)
-                source_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+                source_row.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
                 source_row.grid_columnconfigure(0, weight=1)
 
                 ttk.Entry(
@@ -6078,9 +6128,9 @@ def gui_main() -> int:
 
                 ttk.Label(
                     recovery,
-                    text="2. Choose the backup to restore",
+                    text="Step 2: Choose the backup to restore",
                     style="Header.TLabel",
-                ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(18, 0))
+                ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(18, 0))
 
                 self.restore_context_var = tk.StringVar(
                     value="Choose the Full Recovery or Portable Migration backup you want to restore."
@@ -6090,15 +6140,15 @@ def gui_main() -> int:
                     textvariable=self.restore_context_var,
                     wraplength=1080,
                     style="Muted.TLabel",
-                ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 8))
+                ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 8))
 
                 self.restore_tree = self.build_snapshot_table(recovery)
-                self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 0))
+                self.restore_tree.grid(row=6, column=0, columnspan=3, sticky="nsew", pady=(0, 0))
 
                 target_row = ttk.Frame(recovery)
-                target_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(18, 0))
+                target_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(18, 0))
 
-                ttk.Label(target_row, text="3. Choose the destination disk").pack(side="left")
+                ttk.Label(target_row, text="Step 3: Choose the destination disk", style="Header.TLabel").pack(side="left")
                 self.guided_disk_combo = ttk.Combobox(
                     target_row,
                     textvariable=self.guided_target_disk_var,
@@ -6110,84 +6160,12 @@ def gui_main() -> int:
 
                 self.guided_restore_repo_button = ttk.Button(
                     recovery,
-                    text="Restore Selected Backup to Selected Disk",
+                    text="Start Full Disk Restore",
                     command=self.guided_restore_repo,
                 )
-                self.guided_restore_repo_button.grid(row=6, column=0, sticky="w", pady=(18, 0))
+                self.guided_restore_repo_button.grid(row=8, column=0, sticky="w", pady=(24, 0))
                 self.guided_restore_repo_button.state(["disabled"])
                 return
-            else:
-                ttk.Label(helper, text="Create Recovery USB for Full Recovery snapshots", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-                ttk.Label(helper, text="Plug in an empty 8–16 GB USB drive. Aegis will build a bootable Debian-based recovery environment that starts straight into the restore UI so a casual user can click through a full-machine restore.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-                device_row = ttk.Frame(helper)
-                device_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 0))
-
-                ttk.Label(device_row, text="Recovery USB device").pack(side="left")
-                self.recovery_usb_combo = ttk.Combobox(device_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
-                self.recovery_usb_combo.pack(side="left", padx=(12, 8))
-                ttk.Button(device_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
-
-                ttk.Button(helper, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).grid(row=3, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
-
-            repo_section = ttk.Frame(self.restore_tab)
-            repo_section.pack(fill="x")
-            ttk.Label(repo_section, text="Restore from saved backup", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-
-            self.restore_context_var = tk.StringVar(
-                value="Select a backup. Full Recovery puts a whole system back. Portable Migration moves data onto different hardware."
-            )
-            ttk.Label(
-                repo_section,
-                textvariable=self.restore_context_var,
-                wraplength=1080,
-                style="Muted.TLabel",
-            ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-
-            self.restore_tree = self.build_snapshot_table(repo_section)
-            self.restore_tree.grid(row=2, column=0, columnspan=4, sticky="nsew", pady=(8, 0))
-            repo_section.grid_columnconfigure(0, weight=1)
-            repo_section.grid_rowconfigure(2, weight=1)
-
-            ttk.Label(repo_section, text="Target path").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_restore_target_var, width=46).grid(row=3, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(repo_section, text="Browse", command=lambda: self.browse_directory(self.repo_restore_target_var)).grid(row=3, column=2, padx=(8, 0), pady=(12, 0))
-
-            ttk.Label(repo_section, text="Only restore this path (optional)").grid(row=4, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_restore_path_var, width=46).grid(row=4, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Label(repo_section, text="Recovery password (only needed for other machine snapshots)").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(repo_section, textvariable=self.repo_recovery_key_var, width=46).grid(row=5, column=1, sticky="w", pady=(12, 0))
-
-            self.repo_restore_button = ttk.Button(
-                repo_section,
-                text="Restore Selected\nBackup",
-                width=20,
-                command=self.restore_repo_snapshot,
-            )
-            self.repo_restore_button.grid(row=6, column=1, sticky="w", pady=(14, 0))
-
-            ttk.Separator(self.restore_tab, orient="horizontal").pack(fill="x", pady=18)
-
-            bundle_section = ttk.Frame(self.restore_tab)
-            bundle_section.pack(fill="x")
-            ttk.Label(bundle_section, text="Restore from encrypted single-file bundle or hosted URL", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
-            ttk.Label(bundle_section, text="Bundle file").grid(row=1, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(bundle_section, textvariable=self.bundle_file_var, width=60).grid(row=1, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(bundle_section, text="Browse", command=lambda: self.browse_file(self.bundle_file_var)).grid(row=1, column=2, padx=(8, 0), pady=(12, 0))
-            ttk.Label(bundle_section, text="Hosted URL").grid(row=2, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(bundle_section, textvariable=self.bundle_url_var, width=60).grid(row=2, column=1, sticky="w", pady=(12, 0))
-            ttk.Label(bundle_section, text="Bundle password").grid(row=3, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(bundle_section, textvariable=self.bundle_password_var, show="*", width=42).grid(row=3, column=1, sticky="w", pady=(12, 0))
-            ttk.Label(bundle_section, text="Target path").grid(row=4, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(bundle_section, textvariable=self.bundle_restore_target_var, width=42).grid(row=4, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(bundle_section, text="Browse", command=lambda: self.browse_directory(self.bundle_restore_target_var)).grid(row=4, column=2, padx=(8, 0), pady=(12, 0))
-            ttk.Label(bundle_section, text="Selective path inside snapshot").grid(row=5, column=0, sticky="w", pady=(12, 0))
-            ttk.Entry(bundle_section, textvariable=self.bundle_restore_path_var, width=42).grid(row=5, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(bundle_section, text="Restore Bundle", command=self.restore_bundle).grid(row=5, column=2, padx=(8, 0), pady=(12, 0))
-            if self.recovery_mode:
-                ttk.Button(bundle_section, text="Guided Full Restore Bundle to Disk", command=self.guided_restore_bundle).grid(row=5, column=3, padx=(8, 0), pady=(12, 0))
 
         def build_constellation_tab(self) -> None:
             info = ttk.Frame(self.constellation_tab)
@@ -6629,10 +6607,9 @@ def gui_main() -> int:
 
             def create_current_folder() -> None:
                 parent_path = current_path_var.get().strip() or "/"
-                folder_name = simpledialog.askstring(
+                folder_name = self.ask_string_dialog(
                     "Create Folder",
-                    f"New folder name inside:\n{parent_path}",
-                    parent=dialog,
+                    f"New folder name inside:\n{parent_path}"
                 )
                 if folder_name is None:
                     return
@@ -7007,11 +6984,10 @@ def gui_main() -> int:
             recovery_password = self.repo_recovery_key_var.get().strip()
             if info.get("needs_recovery_password") and not recovery_password:
                 label = info.get("machine_label") or info.get("machine_id") or "this backup"
-                entered = simpledialog.askstring(
+                entered = self.ask_string_dialog(
                     "Recovery password required",
                     f"{label} is encrypted.\n\nEnter the recovery password to continue:",
-                    show="*",
-                    parent=self.root,
+                    show="*"
                 )
                 if entered is None:
                     self.message_var.set("Restore canceled.")
@@ -7345,11 +7321,10 @@ def gui_main() -> int:
             recovery_password = self.repo_recovery_key_var.get().strip()
             if info.get("needs_recovery_password") and not recovery_password:
                 label = info.get("machine_label") or info.get("machine_id") or "this backup"
-                entered = simpledialog.askstring(
+                entered = self.ask_string_dialog(
                     "Recovery password required",
                     f"{label} is encrypted.\n\nEnter the recovery password to continue:",
-                    show="*",
-                    parent=self.root,
+                    show="*"
                 )
                 if entered is None:
                     self.message_var.set("Restore canceled.")
