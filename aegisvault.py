@@ -109,7 +109,7 @@ class Settings:
     default_backup_profile: str = "both"
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     chunk_size_mib: int = DEFAULT_CHUNK_MIB
-    io_yield_ms: int = 2
+    io_yield_ms: int = 50
     max_repo_size_gb: int = 0  # 0 means unlimited
     apply_packages_on_portable_restore: bool = True
     full_excludes: List[str] = field(default_factory=list)
@@ -5633,7 +5633,7 @@ def gui_main() -> int:
             self.schedule_enabled_var = tk.BooleanVar(value=False)
             self.schedule_preset_var = tk.StringVar(value="manual")
             self.schedule_custom_var = tk.StringVar(value="60")
-            self.io_yield_var = tk.StringVar(value="2")
+            self.io_yield_var = tk.StringVar(value="50")
             self.max_repo_size_var = tk.StringVar(value="0")
             self.apply_packages_var = tk.BooleanVar(value=True)
             self.peers_enabled_var = tk.BooleanVar(value=False)
@@ -7591,7 +7591,7 @@ def gui_main() -> int:
                     "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
                 },
                 "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
-                "io_yield_ms": int(self.io_yield_var.get().strip() or "2"),
+                "io_yield_ms": int(self.io_yield_var.get().strip() or "50"),
                 "max_repo_size_gb": int(self.max_repo_size_var.get().strip() or "0"),
                 "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
                 "full_excludes": full_excludes,
