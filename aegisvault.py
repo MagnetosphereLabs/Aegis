@@ -2454,7 +2454,10 @@ class RepoWriter:
     def __init__(self, repo: Path, machine: str, chunk_size: int, key: Optional[bytes], io_yield_ms: int) -> None:
         self.repo = repo
         self.machine = machine
-        self.chunk_size = chunk_size
+        # Ensure chunk size is perfectly aligned to 512-byte tar blocks
+        self.chunk_size = (chunk_size // 512) * 512
+        # Target an 80% threshold to search for natural file boundaries
+        self.flush_threshold = int(self.chunk_size * 0.8)
         self.key = key
         self.io_yield_ms = max(0, io_yield_ms)
         self.buffer = bytearray()
@@ -2464,6 +2467,21 @@ class RepoWriter:
 
     def write(self, data: bytes) -> None:
         self.buffer.extend(data)
+        
+        # Look for file boundaries to prevent "Tar Shift" deduplication failure.
+        if len(self.buffer) >= self.flush_threshold:
+            search_start = ((self.flush_threshold + 511) // 512) * 512
+            view = memoryview(self.buffer)
+            
+            for i in range(search_start, len(self.buffer) - 262, 512):
+                # Byte 257 of a tar header block is always 'ustar'
+                if view[i+257:i+262] == b"ustar":
+                    piece = bytes(self.buffer[:i])
+                    del self.buffer[:i]
+                    self._store_chunk(piece)
+                    break
+                    
+        # If no boundary is found (e.g. inside a massive file), force a cut.
         while len(self.buffer) >= self.chunk_size:
             piece = bytes(self.buffer[:self.chunk_size])
             del self.buffer[:self.chunk_size]
@@ -2828,6 +2846,18 @@ def enforce_repo_size_limit(settings: Settings) -> None:
         update_stage(f"Auto-pruning oldest backup ({oldest_id}) to stay under size limit")
         delete_snapshot_from_repo(settings, oldest_id)
 
+def read_exact(pipe, size: int) -> bytes:
+    """Read exactly `size` bytes to maintain 512-byte block alignment for CDC."""
+    buf = bytearray(size)
+    view = memoryview(buf)
+    pos = 0
+    while pos < size:
+        read_bytes = pipe.readinto(view[pos:])
+        if not read_bytes:
+            return bytes(buf[:pos])  # EOF
+        pos += read_bytes
+    return bytes(buf)
+
 def perform_backup(settings: Settings, profile: str) -> List[str]:
     start_stamp = now_rfc3339()
     state = load_state()
@@ -2853,7 +2883,8 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             assert proc.stdout is not None
             while True:
-                chunk = proc.stdout.read(BUFFER_SIZE)
+                # Use read_exact to ensure tar blocks are never misaligned in the buffer
+                chunk = read_exact(proc.stdout, BUFFER_SIZE)
                 if not chunk:
                     break
                 writer.write(chunk)
