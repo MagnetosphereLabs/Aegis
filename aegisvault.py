@@ -5682,8 +5682,8 @@ def gui_main() -> int:
         def __init__(self, root: tk.Tk) -> None:
             self.root = root
             self.root.title(APP_NAME)
-            self.root.geometry("1220x820")
-            self.root.minsize(1020, 700)
+            self.root.geometry("1220x902")
+            self.root.minsize(1020, 770)
             self.configure_theme()
 
             self.message_var = tk.StringVar(value="")
@@ -5704,7 +5704,6 @@ def gui_main() -> int:
             self.peers_enabled_var = tk.BooleanVar(value=False)
 
             self.export_password_var = tk.StringVar()
-            self.export_recovery_key_var = tk.StringVar(value="")
             self.repo_restore_target_var = tk.StringVar(value="/")
             self.repo_restore_path_var = tk.StringVar(value="")
             self.repo_recovery_key_var = tk.StringVar(value="")
@@ -5743,7 +5742,7 @@ def gui_main() -> int:
             self.recovery_usb_device_var = tk.StringVar(value="")
             self.guided_target_disk_var = tk.StringVar(value="")
             
-            self.repo_size_var = tk.StringVar(value="Total Combined Size on Disk: Calculating...") # <-- ADD THIS
+            self.repo_size_var = tk.StringVar(value="Unique Repository Size: Calculating...")
 
             self.peer_label_var = tk.StringVar()
             
@@ -6235,14 +6234,10 @@ def gui_main() -> int:
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
             ttk.Label(export, text="Export selected backup as an encrypted file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-
-            ttk.Label(export, text="Bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Label(export, text="New bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Label(export, text="Recovery password for foreign machine snapshot (optional)").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(export, textvariable=self.export_recovery_key_var, width=34).grid(row=2, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=3, column=1, sticky="w", pady=(14, 0))
+            
+            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=2, column=1, sticky="w", pady=(14, 0))
 
         def build_restore_tab(self) -> None:
             
@@ -6298,7 +6293,7 @@ def gui_main() -> int:
                 ttk.Separator(desktop, orient="horizontal").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 18))
 
                 ttk.Label(desktop, text="Backup Timeline (View Only)", style="Header.TLabel").grid(row=4, column=0, columnspan=3, sticky="w")
-                ttk.Label(desktop, text="Aegis uses heavy deduplication. The total combined size below is the real footprint on your disk, while the 'Restore Size' in the table is how much data you get back for that specific point in time.", wraplength=1080, style="Muted.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 4))
+                ttk.Label(desktop, text="Aegis deduplicates backup chunks. The repository size below is the unique stored backup data, while 'Restore Size' is how much data that point-in-time backup would stream back during restore.", wraplength=1080, style="Muted.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 4))
                 
                 ttk.Label(desktop, textvariable=self.repo_size_var, foreground="#165dcb", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
@@ -6469,11 +6464,11 @@ def gui_main() -> int:
             columns = ("created_at", "machine_label", "kind", "bytes", "id")
             tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse", height=10)
             
-            tree.heading("created_at", text="Created")
-            tree.heading("machine_label", text="Machine")
-            tree.heading("kind", text="Kind")
-            tree.heading("bytes", text="Restore Size")
-            tree.heading("id", text="Backup ID")
+            tree.heading("created_at", text="Created", anchor="w")
+            tree.heading("machine_label", text="Machine", anchor="w")
+            tree.heading("kind", text="Kind", anchor="w")
+            tree.heading("bytes", text="Restore Size", anchor="w")
+            tree.heading("id", text="Backup ID", anchor="w")
             
             tree.column("created_at", width=220, anchor="w")
             tree.column("machine_label", width=160, anchor="w")
@@ -7278,7 +7273,7 @@ def gui_main() -> int:
 
             total_disk = payload.get("repo_size_bytes", 0)
             if hasattr(self, "repo_size_var"):
-                self.repo_size_var.set(f"Total Combined Size on Disk: {human_bytes(total_disk)}")
+                self.repo_size_var.set(f"Unique Repository Size: {human_bytes(total_disk)}")
             
             self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
 
@@ -7433,20 +7428,45 @@ def gui_main() -> int:
             if not self.selected_snapshot_id:
                 self.message_var.set("Select a snapshot first.")
                 return
+        
             password = self.export_password_var.get().strip()
             if not password:
                 self.message_var.set("Enter a bundle password first.")
                 return
-            output = filedialog.asksaveasfilename(defaultextension=".avb", filetypes=[("Aegis bundle", "*.avb"), ("All files", "*.*")])
+        
+            recovery_password = ""
+            try:
+                info = self.get_snapshot_restore_info(self.selected_snapshot_id)
+                if info.get("needs_recovery_password"):
+                    label = info.get("machine_label") or info.get("machine_id") or "this backup"
+                    entered = self.ask_string_dialog(
+                        "Recovery password required",
+                        f"{label} is encrypted and this machine does not have its local unlock key.\n\n"
+                        "Enter that machine's recovery password to export this backup:",
+                        show="*",
+                    )
+                    if entered is None:
+                        self.message_var.set("Bundle export canceled.")
+                        return
+                    recovery_password = entered.strip()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+                return
+        
+            output = filedialog.asksaveasfilename(
+                defaultextension=".avb",
+                filetypes=[("Aegis bundle", "*.avb"), ("All files", "*.*")]
+            )
             if not output:
                 return
+        
             try:
                 response = send_daemon_request({
                     "action": "run_export",
                     "snapshot": self.selected_snapshot_id,
                     "output": output,
                     "password": password,
-                    "recovery_password": self.export_recovery_key_var.get().strip(),
+                    "recovery_password": recovery_password,
                 })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
