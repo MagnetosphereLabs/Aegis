@@ -2867,6 +2867,7 @@ def read_exact(pipe, size: int) -> bytes:
         pos += read_bytes
     return bytes(buf)
 
+
 def perform_backup(settings: Settings, profile: str) -> List[str]:
     start_stamp = now_rfc3339()
     state = load_state()
@@ -2878,9 +2879,13 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
     created: List[str] = []
     chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
     machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
+    
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
-        kinds = ["full_recovery", "portable_state"] if profile == "both" else [profile]
+        
+        is_both = profile == "both"
+        kinds = ["full_recovery"] if is_both else [profile]
+        
         for kind in kinds:
             update_stage(f"Collecting metadata for {kind_label(kind)}")
             metadata = collect_snapshot_metadata(kind)
@@ -2891,6 +2896,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
             cmd = build_tar_backup_command(includes, excludes)
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             assert proc.stdout is not None
+            
             while True:
                 # Use read_exact to ensure tar blocks are never misaligned in the buffer
                 chunk = read_exact(proc.stdout, BUFFER_SIZE)
@@ -2898,10 +2904,13 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
                     break
                 writer.write(chunk)
             
+            stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
             returncode = proc.wait()
-            if returncode != 0:
+            if returncode not in (0, 1):
                 raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
+            
             refs, total_bytes, archive_sha = writer.finish()
+            
             manifest = SnapshotManifest(
                 version=1,
                 id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
@@ -2923,6 +2932,33 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
             write_manifest(settings, manifest)
             created.append(manifest.id)
             
+            if is_both and kind == "full_recovery":
+                update_stage("Synthesizing Portable Migration Backup")
+                port_meta = collect_snapshot_metadata("portable_state")
+                port_includes = build_include_paths(settings, "portable_state")
+                port_excludes = build_exclude_paths(settings, "portable_state")
+                
+                port_manifest = SnapshotManifest(
+                    version=1,
+                    id=f"{utc_tag()}-{short_machine(settings.machine_id)}-portable",
+                    run_id=run_id,
+                    machine_id=settings.machine_id,
+                    machine_label=settings.machine_label,
+                    hostname=hostname(),
+                    created_at=now_rfc3339(),
+                    kind="portable_state",
+                    source_paths=port_includes,
+                    exclude_paths=port_excludes,
+                    chunk_size=chunk_size,
+                    archive_refs=refs,
+                    archive_plaintext_bytes=total_bytes,
+                    archive_sha256=archive_sha,
+                    metadata=port_meta,
+                    notes=["Virtual snapshot generated from full backup pass."] + list(port_meta.notes),
+                )
+                write_manifest(settings, port_manifest)
+                created.append(port_manifest.id)
+                
         if settings.peers_enabled and settings.peers:
             update_stage("Syncing peers")
             sync_peers(settings)
@@ -2938,75 +2974,19 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
 
     return created
 
-def perform_backup(settings: Settings, profile: str) -> List[str]:
-    start_stamp = now_rfc3339()
-    state = load_state()
-    state.last_run_at = start_stamp
-    state.last_error = ""
-    save_state(state)
-
-    materialize_settings(settings)
-    created: List[str] = []
-    chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
-    machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
-    with file_lock(LOCK_PATH):
-        run_id = f"{utc_tag()}-{random_suffix(3)}"
-        kinds = ["full_recovery", "portable_state"] if profile == "both" else [profile]
-        for kind in kinds:
-            update_stage(f"Collecting metadata for {kind_label(kind)}")
-            metadata = collect_snapshot_metadata(kind)
-            includes = build_include_paths(settings, kind)
-            excludes = build_exclude_paths(settings, kind)
-            update_stage(f"Capturing {kind_label(kind)}")
-            writer = RepoWriter(Path(settings.repo_path), settings.machine_id, chunk_size, machine_key_value, settings.io_yield_ms)
-            cmd = build_tar_backup_command(includes, excludes)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            assert proc.stdout is not None
-            while True:
-                chunk = proc.stdout.read(BUFFER_SIZE)
-                if not chunk:
-                    break
-                writer.write(chunk)
-            stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
-            returncode = proc.wait()
-            if returncode not in (0, 1):
-                raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
-            refs, total_bytes, archive_sha = writer.finish()
-            manifest = SnapshotManifest(
-                version=1,
-                id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
-                run_id=run_id,
-                machine_id=settings.machine_id,
-                machine_label=settings.machine_label,
-                hostname=hostname(),
-                created_at=now_rfc3339(),
-                kind=kind,
-                source_paths=includes,
-                exclude_paths=excludes,
-                chunk_size=chunk_size,
-                archive_refs=refs,
-                archive_plaintext_bytes=total_bytes,
-                archive_sha256=archive_sha,
-                metadata=metadata,
-                notes=list(metadata.notes),
-            )
-            write_manifest(settings, manifest)
-            created.append(manifest.id)
-        state = load_state()
-        state.last_run_at = start_stamp
-        state.last_success_at = now_rfc3339()
-        state.last_error = ""
-        save_state(state)
-    if settings.peers_enabled and settings.peers:
-        update_stage("Syncing peers")
-        sync_peers(settings)
-    return created
-
-
-def build_tar_restore_command(target: Path, member: Optional[str]) -> subprocess.Popen:
+def build_tar_restore_command(target: Path, member: Optional[str], excludes: Optional[List[str]] = None, includes: Optional[List[str]] = None) -> subprocess.Popen:
     cmd = ["tar", "--xattrs", "--acls", "--numeric-owner", "-xpf", "-", "-C", str(target)]
+    
+    # Apply exclusions from the manifest
+    for ex in (excludes or []):
+        cmd.append(f"--exclude={ex}")
+        
+    # If restoring a specific file, only extract that. Otherwise, apply includes.
     if member:
         cmd.append(normalize_member_path(member))
+    elif includes and includes != ["."]:
+        cmd.extend(includes)
+        
     return subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
@@ -4095,7 +4075,7 @@ def best_effort_full_restore_post_actions(
 
 def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], target: Path, member: Optional[str]) -> None:
     target.mkdir(parents=True, exist_ok=True)
-    proc = build_tar_restore_command(target, member)
+    proc = build_tar_restore_command(target, member, manifest.exclude_paths, manifest.source_paths)
     assert proc.stdin is not None
 
     label = "Restoring files"
