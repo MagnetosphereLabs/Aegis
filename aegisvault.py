@@ -36,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 import getpass
+import re
 
 
 APP_NAME = "Aegis"
@@ -313,7 +314,7 @@ def normalize_backup_profile(value: str) -> str:
 
 def mounted_targets() -> List[str]:
     raw = run_command_optional(["findmnt", "-rn", "-o", "TARGET"])
-    return [line.strip() for line in raw.splitlines() if line.strip()]
+    return [unescape_findmnt_value(line) for line in raw.splitlines() if line.strip()]
 
 
 def is_external_backup_path(repo_path: str) -> bool:
@@ -366,12 +367,16 @@ def nearest_existing_path(path: str) -> str:
 
 def mount_target_for_path(path: str) -> str:
     query = nearest_existing_path(path)
-    return run_command_optional(["findmnt", "-nro", "TARGET", "--target", query]).strip()
+    return unescape_findmnt_value(
+        run_command_optional(["findmnt", "-nro", "TARGET", "--target", query])
+    )
 
 
 def mount_source_for_path(path: str) -> str:
     query = nearest_existing_path(path)
-    return run_command_optional(["findmnt", "-nro", "SOURCE", "--target", query]).strip()
+    return unescape_findmnt_value(
+        run_command_optional(["findmnt", "-nro", "SOURCE", "--target", query])
+    )
 
 
 def refresh_repo_locator(settings: Settings, repo_path: Optional[str] = None) -> None:
@@ -1322,7 +1327,15 @@ def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: O
         cmd_text = " ".join(exc.cmd)
         raise AegisError(f"{cmd_text} failed: {detail or f'exit status {exc.returncode}'}") from exc
 
+_FINDMNT_HEX_ESCAPE = re.compile(r"\\x([0-9A-Fa-f]{2})")
 
+
+def unescape_findmnt_value(value: str) -> str:
+    return _FINDMNT_HEX_ESCAPE.sub(
+        lambda match: chr(int(match.group(1), 16)),
+        str(value or "").strip(),
+    )
+        
 def run_command_optional(cmd: List[str]) -> str:
     try:
         result = run_command(cmd, check=True, capture=True)
@@ -1836,11 +1849,16 @@ def device_mountpoints_map() -> Dict[str, List[str]]:
         parts = line.strip().split(None, 1)
         if len(parts) != 2:
             continue
-        source, target = parts
+
+        source = unescape_findmnt_value(parts[0])
+        target = unescape_findmnt_value(parts[1])
+
         source_real = canonical_block_device_path(source)
         if not source_real.startswith("/dev/"):
             continue
+
         mapping.setdefault(source_real, []).append(os.path.abspath(target))
+
     return {key: dedupe(value) for key, value in mapping.items()}
 
 
