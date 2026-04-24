@@ -5067,14 +5067,34 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     if action == "save_settings":
         previous_settings = load_settings()
         settings = settings_from_dict(request["settings"])
-
+    
+        previous_repo_path = os.path.abspath(previous_settings.repo_path or DEFAULT_REPO)
+        requested_repo_path = os.path.abspath(settings.repo_path or DEFAULT_REPO)
+        repo_path_changed = requested_repo_path != previous_repo_path
+    
+        if repo_path_changed:
+            # The UI may still be carrying locator metadata for the old repo.
+            # Do not let stale UUID/PARTUUID/label/subpath resolve the newly chosen
+            # folder back to the previous/default backup location.
+            settings.repo_path = requested_repo_path
+            settings.repo_device_uuid = ""
+            settings.repo_device_partuuid = ""
+            settings.repo_device_label = ""
+            settings.repo_mount_subpath = ""
+    
+            # Saving an explicit folder should either use that exact folder or fail
+            # clearly if the external drive is unavailable. It should not silently
+            # redirect to a discovered/default repository.
+            ensure_repo_path_ready(settings.repo_path)
+            refresh_repo_locator(settings, settings.repo_path)
+    
         if (
-            settings.repo_path != previous_settings.repo_path
+            repo_path_changed
             and settings.full_excludes == previous_settings.full_excludes
             and previous_settings.full_excludes == default_full_excludes(previous_settings.repo_path)
         ):
             settings.full_excludes = default_full_excludes(settings.repo_path)
-
+    
         recovery_password = request.get("recovery_password") or None
         created_new_envelope = materialize_settings(settings, recovery_password=recovery_password)
         save_settings(settings)
@@ -7590,17 +7610,22 @@ def gui_main() -> int:
             schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
             if not schedule_enabled:
                 schedule_preset = "manual"
-
+            
+            loaded_settings = self.dashboard_payload.get("settings", {})
+            requested_repo_path = os.path.abspath(self.repo_path_var.get().strip() or DEFAULT_REPO)
+            loaded_repo_path = os.path.abspath(str(loaded_settings.get("repo_path") or DEFAULT_REPO))
+            repo_path_changed = requested_repo_path != loaded_repo_path
+            
             return {
                 "version": 2,
                 "onboarding_complete": onboarding_complete,
-                "machine_id": self.dashboard_payload.get("settings", {}).get("machine_id", machine_id()),
+                "machine_id": loaded_settings.get("machine_id", machine_id()),
                 "machine_label": self.machine_label_var.get().strip() or hostname(),
-                "repo_path": self.repo_path_var.get().strip() or DEFAULT_REPO,
-                "repo_device_uuid": self.dashboard_payload.get("settings", {}).get("repo_device_uuid", ""),
-                "repo_device_partuuid": self.dashboard_payload.get("settings", {}).get("repo_device_partuuid", ""),
-                "repo_device_label": self.dashboard_payload.get("settings", {}).get("repo_device_label", ""),
-                "repo_mount_subpath": self.dashboard_payload.get("settings", {}).get("repo_mount_subpath", ""),
+                "repo_path": requested_repo_path,
+                "repo_device_uuid": "" if repo_path_changed else loaded_settings.get("repo_device_uuid", ""),
+                "repo_device_partuuid": "" if repo_path_changed else loaded_settings.get("repo_device_partuuid", ""),
+                "repo_device_label": "" if repo_path_changed else loaded_settings.get("repo_device_label", ""),
+                "repo_mount_subpath": "" if repo_path_changed else loaded_settings.get("repo_mount_subpath", ""),
                 "encryption_enabled": bool(self.encryption_var.get()),
                 "notifications_enabled": bool(self.notifications_enabled_var.get()),
                 "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
