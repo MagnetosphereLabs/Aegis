@@ -1,42 +1,46 @@
 # Aegis
 
-This software is in alpha, and has been tested on Debian based systems like Ubuntu, Linux Mint, and Pop!_OS. The backup and restore features, including the recovery USB, are foundationally complete, getting mostly UI updates and QOL improvments. Constellation Mode is still being developed. I "put my money where my mouth is" because I use this software myself to backup my own Linux PC. But even though I use this myself, I cannot 100% guarantee that this will work on your system. If you have very important things to backup, I strongly recommend that you keep multiple copies of it on multiple devices.
+This software is currently in Alpha. The core backup, restore, and recovery USB features are foundationally complete and tested on Debian based systems (Ubuntu, Mint, Pop!_OS). Constellation Mode remains in active development and is not ready yet.
+
+I built Aegis to protect my own Linux workstation, and I use it daily. However, because system configurations vary wildly, this software is provided "as is" without absolute guarantees. Please be smart with your critical data and always maintain multiple backups across multiple physical devices. We are not liable for any data loss.
 
 
-## What is it?
-Aegis is a compact, monolithic Linux backup application designed specifically for Debian based systems (like Linux Mint, Ubuntu, and Pop!_OS). It handles secure system snapshots, bare metal recovery, and hardware agnostic OS migrations.
+## What This Software Is
+
+Aegis is a compact, highly autonomous, and comprehensive disaster recovery and backup suite engineered specifically for Debian based Linux systems (such as Ubuntu, Linux Mint, and Pop!_OS). 
+
+Designed with an extreme focus on portability and self sufficiency, the entire application is contained within a single Python file. Despite its standalone nature, it features a graphical user interface, a command line interface, a background scheduling daemon, a deduplicating cryptographic backup engine, a peer to peer synchronization protocol, and a custom recovery operating system builder. 
 
 ## What It Can Do
 
-* **Two-Tiered Backup Profiles:**
-    * **Full Recovery:** Captures the entire filesystem for a 1:1 bare-metal restore onto the same hardware or a replacement drive.
-    * **Portable Migration:** Captures your OS, user data, and package lists, but explicitly excludes hardware-specific driver state (like DKMS, proprietary Nvidia/System76 drivers, and persistent network rules). This allows you to restore your OS onto a completely different computer and have it boot cleanly with your apps and data.
-* **Encrypted, Deduplicated Storage:** Backups are chunked, hashed (SHA256) to prevent duplicate data storage, and encrypted at rest using AES-GCM with Scrypt key derivation.
-* **Integrated Bare Metal Recovery:** Aegis can dynamically build a custom, bootable Debian recovery environment onto a USB drive using `debootstrap`. Booting from this USB opens the Aegis GUI directly for system restoration.
-* **Guided Full Restore:** Aegis handles the entire drive recovery process automatically. It partitions the target disk (GPT, EFI, Root), formats the filesystems, extracts the data, generates a new `fstab`, and seamlessly installs/repairs the bootloader (supporting both GRUB and `systemd-boot`).
-* **Constellation Mode (Peer Sync):** Securely mirrors your backups to remote machines or servers using `rsync` over SSH.
-* **Portable Bundles (`.avb`):** Exports specific snapshots into standalone, encrypted archive bundles. These can be loaded via URL or local file and restored on foreign machines.
-* **Background Daemon & Scheduling:** Runs automatically in the background via a systemd service, honoring custom schedules, storage size limits, and I/O yield constraints to prevent system slowdowns.
+Aegis is built to handle everything from daily file protection to complete hardware migrations and bare metal disaster recovery. Its primary capabilities include:
+
+* **Dual Profile Snapshots:**
+    * **Full Recovery:** Captures an exact 1:1 state of the machine for restoring to identical hardware or recovering from catastrophic drive failure.
+    * **Portable Migration:** Captures user data, configurations, and installed applications, while intentionally omitting hardware specific drivers and static networking configurations to allow seamless migration to completely different hardware.
+* **Automated Bare Metal Restores:** Orchestrates the entire disk restore process, including wiping targets, generating GPT partition layouts, formatting file systems, and configuring bootloaders (GRUB or systemd-boot).
+* **Recovery Media Bootstrapping:** Builds a bootable Debian Live environment directly to a target USB drive using `debootstrap`, injecting the Aegis GUI directly into the live session for immediate disaster recovery.
+* **Constellation Mode:** Securely mirrors encrypted backup repositories across a network of configured peers using SSH and `rsync`.
+* **Standalone Bundle Export:** Compiles a specific point in time backup into a single, password protected `.avb` (Aegis Vault Bundle) archive file for easy off site storage.
+* **Automated Background Daemon:** Runs silently as a systemd service, executing scheduled backups, enforcing repository size limits, and triggering native desktop notifications for job statuses.
 
 ## How It Works
 
-Aegis operates via a unified architecture where the GUI, CLI, daemon, and extraction engines all live inside a single Python script. 
+Aegis abstracts complex Linux system administration tasks into an automated pipeline:
 
-1.  **Capture Engine:** When a backup starts, Aegis uses `tar` to accurately capture the filesystem, preserving permissions, ACLs, and extended attributes.
-2.  **Data Pipeline:** The raw `tar` stream is ingested by Aegis's internal chunking engine. The data is sliced into chunks, hashed, encrypted, and written to the backup destination as raw objects.
-3.  **Metadata Manifests:** Alongside the raw data, Aegis saves a rich JSON manifest. This file records the exact state of the machine at the time of backup, including installed `apt` packages, Flatpaks, Snaps, kernel versions, partition layouts, and OS release data.
-4.  **Secure Local Unlocking:** To facilitate unattended, encrypted backups, Aegis integrates directly with `systemd-creds`. It securely encrypts and stores the machine's local unlock key via the systemd credential store, avoiding plaintext passwords sitting in config files.
-5.  **IPC / Privilege Separation:** The user-facing Tkinter GUI communicates with the root-level background daemon via a local UNIX socket (`/run/aegisvault/daemon.sock`). When a user interacts with the GUI, Aegis securely escalates privileges using `pkexec` to authorize socket access.
-6.  **Active Restoration:** During a restore (especially a Portable Migration), Aegis doesn't just copy files. It actively `chroot`s into the restored target to scrub hardware-specific configs (like dracut configs and module load lists), reinstalls necessary packages, and generates a fresh initramfs tailored to the new hardware.
+* **Architecture:** The software operates in a client server model over a local UNIX socket (`/run/aegisvault/daemon.sock`). The root privileged background daemon handles all heavy lifting, while the CLI and GUI act as unprivileged clients that issue JSON-RPC commands to the daemon.
+* **Chunking & Deduplication Engine:** During a backup, Aegis pipes the filesystem into a `tar` stream. To maximize deduplication and prevent "tar shift" (where a single changed byte alters the entire subsequent stream), Aegis actively scans the byte stream for 512 byte `ustar` tar header boundaries, cutting chunks cleanly at natural file limits.
+* **Encryption Security:** All data chunks are individually encrypted using AES-GCM. The machine specific encryption keys are wrapped using Scrypt derived user passwords and stored natively within the host's encrypted `systemd-creds` store, ensuring plaintext keys are never exposed on the disk.
+* **System Metadata Capture:** Alongside file data, Aegis generates comprehensive metadata manifests. It records package states (APT, Flatpak, Snap), kernel versions, partition tables, `fstab` layouts, and hardware configurations to intelligently reconstruct the environment later.
 
-## How Aegis is Different
+## How It Is Unique
 
-Typical Linux backup tools are generally categorized as either file level archivers or snapshot managers. Aegis blurs these lines and introduces several unique paradigms:
+Aegis diverges significantly from traditional Linux backup tools (like Timeshift, Deja Dup, Borg, or Clonezilla) by bridging the gap between file level versioning and block-level cloning.
 
-* **The "Portable Migration" Concept:** Standard backup tools fail catastrophically if you restore a backup containing Nvidia drivers and custom X11 configs onto a laptop with Intel graphics. Aegis solves this by actively sanitizing the restored OS. It strips out proprietary drivers, DKMS modules, and hardcoded machine IDs, making your Linux install completely hardware-agnostic during a move.
-* **Single File Monolith:** Aegis does not rely on a fragmented stack of frontends, backends, and wrapper scripts. The daemon, the graphical interface, the command-line tool, and the recovery OS bootstrapper are all packaged into one single `aegisvault.py` file.
-* **It Builds Its Own Recovery Media:** Instead of requiring you to download a live ISO and figure out how to install your backup software onto it, Aegis builds its own live environment. Give it a USB stick, and it bootstraps a minimal Debian OS with Aegis pre-configured to launch on boot.
-* **Smart Bootloader Healing:** Restoring a Linux system usually requires manual `chroot` gymnastics to fix GRUB or `systemd-boot` so the BIOS can actually find the OS. Aegis completely automates this. It maps the new UUIDs, writes the EFI variables, configures the bootloader, and generates the initramfs silently in the background.
+* **Hardware Agnostic Migration:** This is Aegis's standout feature. Unlike Clonezilla (which clones block by block) or Timeshift (which blindly restores root file systems), Aegis's "Portable Migration" actively scrubs incompatible hardware states during a restore. It automatically removes proprietary kernel modules (Nvidia, System76, Broadcom), scrubs `initramfs` hooks, clears static network rules, and regenerates `fstab`. This allows you to back up an Intel/Nvidia desktop and restore it directly onto an AMD laptop without encountering kernel panics or boot loops.
+* **Intelligent Bootloader Reconstruction:** File level deduplicating backup tools typically leave the user to manually format target drives, `chroot` into the restored environment, and reinstall the bootloader. Aegis's "Guided Restore" automates this. It maps new UUIDs, writes fresh EFI partition tables, and executes complex `chroot` logic to reinstall UEFI/BIOS GRUB or `systemd-boot`/`kernelstub` automatically.
+* **Monolith:** Traditional disaster recovery requires a fragmented stack: a frontend GUI, a backend archiver, and a separate bootable ISO flashed via a third party tool. Aegis consolidates the scheduler, the GUI, the chunking backend, and the recovery OS generator into one script.
+* **Native Systemd Integration:** Aegis does not rely on plaintext key files or custom cron jobs. It generates its own systemd service units, utilizes systemd credential management for cryptographic keys, and manages background scheduling entirely through modern Linux daemon standards.
 
 ## Install
 
