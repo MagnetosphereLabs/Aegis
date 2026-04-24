@@ -2471,15 +2471,24 @@ class RepoWriter:
         # Look for file boundaries to prevent "Tar Shift" deduplication failure.
         if len(self.buffer) >= self.flush_threshold:
             search_start = ((self.flush_threshold + 511) // 512) * 512
-            view = memoryview(self.buffer)
+            cut_index = -1
             
+            # Create the memory view to search quickly
+            view = memoryview(self.buffer)
             for i in range(search_start, len(self.buffer) - 262, 512):
                 # Byte 257 of a tar header block is always 'ustar'
                 if view[i+257:i+262] == b"ustar":
-                    piece = bytes(self.buffer[:i])
-                    del self.buffer[:i]
-                    self._store_chunk(piece)
+                    cut_index = i
                     break
+            
+            # Release the memory lock before modifying the bytearray
+            view.release()
+            
+            # If we found a boundary, safely cut and store it now that the lock is gone
+            if cut_index != -1:
+                piece = bytes(self.buffer[:cut_index])
+                del self.buffer[:cut_index]
+                self._store_chunk(piece)
                     
         # If no boundary is found (e.g. inside a massive file), force a cut.
         while len(self.buffer) >= self.chunk_size:
