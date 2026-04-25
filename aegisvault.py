@@ -5816,8 +5816,8 @@ def gui_main() -> int:
         def __init__(self, root: tk.Tk) -> None:
             self.root = root
             self.root.title(APP_NAME)
-            self.root.geometry("1220x902")
-            self.root.minsize(1020, 770)
+            self.root.geometry("1320x940")
+            self.root.minsize(1120, 780)
             self.configure_theme()
 
             self.message_var = tk.StringVar(value="")
@@ -5856,6 +5856,24 @@ def gui_main() -> int:
             self.peer_repo_var = tk.StringVar(value=DEFAULT_REPO)
             self.peer_port_var = tk.StringVar(value="22")
             self.peer_identity_var = tk.StringVar(value="")
+            self.peer_machine_id_var = tk.StringVar(value="")
+            self.peer_pairing_code_var = tk.StringVar(value="")
+            self.peer_storage_limit_var = tk.StringVar(value="0")
+            self.peer_notes_var = tk.StringVar(value="")
+            self.peer_backup_source_var = tk.BooleanVar(value=True)
+            self.peer_storage_target_var = tk.BooleanVar(value=True)
+            self.peer_store_all_var = tk.BooleanVar(value=True)
+            self.constellation_pairing_code_var = tk.StringVar(value="")
+            self.constellation_summary_var = tk.StringVar(value="")
+            self.backup_progress_window: Optional[tk.Toplevel] = None
+            self.backup_progress_bar: Optional[ttk.Progressbar] = None
+            self.backup_progress_title_var = tk.StringVar(value="Backup not running")
+            self.backup_progress_stage_var = tk.StringVar(value="")
+            self.backup_progress_detail_var = tk.StringVar(value="")
+            self.backup_progress_rate_var = tk.StringVar(value="")
+            self.backup_progress_bytes_var = tk.StringVar(value="")
+            self.backup_progress_phase_var = tk.StringVar(value="")
+            self.backup_progress_logs: Optional[ScrolledText] = None
             self.selected_snapshot_id = ""
             self.dashboard_payload: Dict[str, Any] = {}
             self.snapshot_by_id: Dict[str, Dict[str, Any]] = {}
@@ -5886,7 +5904,6 @@ def gui_main() -> int:
             header = ttk.Frame(outer)
             header.pack(fill="x", pady=(0, 12))
 
-            ttk.Label(header, text=APP_NAME, style="Header.TLabel").pack(side="left")
             ttk.Label(header, textvariable=self.status_var, style="Muted.TLabel").pack(side="right")
 
             self.notebook = ttk.Notebook(outer)
@@ -5988,6 +6005,37 @@ def gui_main() -> int:
                 relief=[("pressed", "flat"), ("active", "flat")],
             )
 
+            style.configure(
+                "Compact.TButton",
+                background="#165dcb",
+                foreground="#ffffff",
+                padding=(10, 5),
+                relief="flat",
+                borderwidth=0,
+                focusthickness=0,
+                font=base_font,
+            )
+            style.map(
+                "Compact.TButton",
+                background=[("pressed", "#114da7"), ("active", "#1a69df"), ("disabled", "#2b3138")],
+                foreground=[("disabled", "#93a4b7")],
+            )
+            style.configure(
+                "Primary.TButton",
+                background="#1f6feb",
+                foreground="#ffffff",
+                padding=(16, 10),
+                relief="flat",
+                borderwidth=0,
+                focusthickness=0,
+                font=("TkDefaultFont", 12, "bold"),
+            )
+            style.map(
+                "Primary.TButton",
+                background=[("pressed", "#165dcb"), ("active", "#2f81f7"), ("disabled", "#2b3138")],
+                foreground=[("disabled", "#93a4b7")],
+            )
+            
             style.configure("TCheckbutton", background="#0e1116", foreground="#e6edf3", font=base_font)
             style.map(
                 "TCheckbutton",
@@ -6303,6 +6351,152 @@ def gui_main() -> int:
             dialog.wait_window()
             return result[0] if result else None
 
+        def make_scrollable_frame(self, parent: ttk.Frame) -> ttk.Frame:
+            canvas = tk.Canvas(parent, bg="#0e1116", bd=0, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+            content = ttk.Frame(canvas)
+            window_id = canvas.create_window((0, 0), window=content, anchor="nw")
+
+            def update_scrollregion(event=None) -> None:
+                canvas.configure(scrollregion=canvas.bbox("all"))
+
+            def resize_content(event) -> None:
+                canvas.itemconfigure(window_id, width=event.width)
+
+            content.bind("<Configure>", update_scrollregion)
+            canvas.bind("<Configure>", resize_content)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+            return content
+
+        def format_rate(self, value: float) -> str:
+            if value <= 0:
+                return "Calculating speed..."
+            return f"{human_bytes(int(value))}/s"
+
+        def confirm_backup_preflight(self) -> bool:
+            try:
+                response = send_daemon_request({"action": "backup_preflight"})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                info = dict(response.get("info") or {})
+                warnings = list(info.get("warnings") or [])
+                if not warnings:
+                    return True
+                message = "\n\n".join(warnings) + "\n\nContinue with Backup Now?"
+                return self.confirm_dangerous_action("Backup storage warning", message)
+            except Exception as exc:
+                self.message_var.set(str(exc))
+                return False
+
+        def open_backup_progress_window(self) -> None:
+            if self.backup_progress_window and self.backup_progress_window.winfo_exists():
+                self.backup_progress_window.lift()
+                return
+
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Backup Progress")
+            dialog.geometry("760x520")
+            dialog.minsize(620, 420)
+            dialog.configure(bg="#0e1116")
+            dialog.transient(self.root)
+            self.backup_progress_window = dialog
+
+            body = ttk.Frame(dialog, padding=18)
+            body.pack(fill="both", expand=True)
+            body.grid_columnconfigure(0, weight=1)
+            body.grid_rowconfigure(7, weight=1)
+
+            ttk.Label(body, text="Backup Now", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                body,
+                text="Aegis is creating Full Recovery and Portable Migration restore points. The app remains usable while this runs.",
+                wraplength=700,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="ew", pady=(6, 14))
+
+            ttk.Label(body, textvariable=self.backup_progress_stage_var).grid(row=2, column=0, sticky="w")
+            self.backup_progress_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
+            self.backup_progress_bar.grid(row=3, column=0, sticky="ew", pady=(8, 10))
+
+            details = ttk.Frame(body)
+            details.grid(row=4, column=0, sticky="ew")
+            details.grid_columnconfigure(1, weight=1)
+            ttk.Label(details, text="Phase:", style="Muted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(details, textvariable=self.backup_progress_phase_var).grid(row=0, column=1, sticky="w", pady=2)
+            ttk.Label(details, text="Data:", style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(details, textvariable=self.backup_progress_bytes_var).grid(row=1, column=1, sticky="w", pady=2)
+            ttk.Label(details, text="Speed:", style="Muted.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 8), pady=2)
+            ttk.Label(details, textvariable=self.backup_progress_rate_var).grid(row=2, column=1, sticky="w", pady=2)
+
+            ttk.Label(body, textvariable=self.backup_progress_detail_var, wraplength=700, style="Muted.TLabel").grid(row=5, column=0, sticky="ew", pady=(10, 10))
+            ttk.Label(body, text="Recent backup activity", style="Header.TLabel").grid(row=6, column=0, sticky="w")
+            self.backup_progress_logs = ScrolledText(body, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+            self.backup_progress_logs.grid(row=7, column=0, sticky="nsew", pady=(8, 0))
+            self.style_scrolled_text(self.backup_progress_logs)
+
+            ttk.Button(body, text="Close", command=dialog.destroy).grid(row=8, column=0, sticky="e", pady=(12, 0))
+
+            def on_close() -> None:
+                self.backup_progress_window = None
+                self.backup_progress_bar = None
+                self.backup_progress_logs = None
+                dialog.destroy()
+
+            dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        def update_backup_progress_window(self, current_job: Optional[Dict[str, Any]], logs: List[str]) -> None:
+            if not self.backup_progress_window or not self.backup_progress_window.winfo_exists():
+                return
+            if not current_job or "backup" not in str(current_job.get("name", "")).lower():
+                return
+
+            progress = current_job.get("progress")
+            stage = str(current_job.get("stage") or "Backup running")
+            phase = str(current_job.get("phase") or "backup")
+            detail = str(current_job.get("detail") or "Working...")
+            done = int(current_job.get("bytes_done") or 0)
+            total = int(current_job.get("bytes_total") or 0)
+            rate = float(current_job.get("rate_bps") or 0.0)
+
+            self.backup_progress_stage_var.set(stage)
+            self.backup_progress_phase_var.set(kind_label(phase) if phase in BACKUP_PROFILE_LABELS else phase.title())
+            self.backup_progress_detail_var.set(detail)
+            self.backup_progress_rate_var.set(self.format_rate(rate))
+            if total > 0:
+                self.backup_progress_bytes_var.set(f"{human_bytes(done)} streamed / about {human_bytes(total)} estimated")
+            else:
+                self.backup_progress_bytes_var.set(f"{human_bytes(done)} streamed")
+
+            if self.backup_progress_bar:
+                if progress is None:
+                    if str(self.backup_progress_bar.cget("mode")) != "indeterminate":
+                        self.backup_progress_bar.configure(mode="indeterminate")
+                        self.backup_progress_bar.start(10)
+                else:
+                    if str(self.backup_progress_bar.cget("mode")) != "determinate":
+                        self.backup_progress_bar.stop()
+                        self.backup_progress_bar.configure(mode="determinate", maximum=100)
+                    self.backup_progress_bar["value"] = max(0.0, min(100.0, float(progress)))
+
+            if self.backup_progress_logs:
+                backup_lines = [line for line in logs[-40:] if "backup" in line.lower() or "snapshot" in line.lower() or "prun" in line.lower()]
+                self.fill_text(self.backup_progress_logs, "\n".join(backup_lines[-20:]) if backup_lines else "Waiting for backup log entries...")
+
+        def finish_backup_progress_window(self, success: bool, message: str) -> None:
+            if not self.backup_progress_window or not self.backup_progress_window.winfo_exists():
+                return
+            self.backup_progress_stage_var.set("Backup complete" if success else "Backup needs attention")
+            self.backup_progress_detail_var.set(message)
+            self.backup_progress_rate_var.set("Finished" if success else "Stopped")
+            self.backup_progress_phase_var.set("Complete" if success else "Error")
+            if self.backup_progress_bar:
+                if str(self.backup_progress_bar.cget("mode")) != "determinate":
+                    self.backup_progress_bar.stop()
+                    self.backup_progress_bar.configure(mode="determinate", maximum=100)
+                self.backup_progress_bar["value"] = 100 if success else 0
+        
         def build_overview_tab(self) -> None:
             summary = ttk.Frame(self.overview_tab)
             summary.pack(fill="x")
@@ -6340,19 +6534,22 @@ def gui_main() -> int:
         def build_backup_tab(self) -> None:
             controls = ttk.Frame(self.backup_tab)
             controls.pack(fill="x")
+            controls.grid_columnconfigure(0, weight=1)
 
-            ttk.Label(controls, text="Create backups", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            ttk.Label(controls, text="Create backups", style="Header.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 controls,
-                text="Every backup restores like a full snapshot, but unchanged data chunks are reused across runs to save time and space.",
-                wraplength=980,
+                text="Backup Now always creates both restore points: Full Recovery for same-machine disaster recovery and Portable Migration for moving to different hardware. Deduplication keeps shared data from being stored twice.",
+                wraplength=1040,
                 style="Muted.TLabel",
-            ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
-            ttk.Button(controls, text="Run Default Backup", command=self.start_default_backup).grid(row=2, column=0, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Full Recovery Backup", command=lambda: self.start_backup("full_recovery")).grid(row=2, column=1, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Portable Migration Backup", command=lambda: self.start_backup("portable_state")).grid(row=2, column=2, padx=(0, 8), pady=(12, 0), sticky="w")
-            ttk.Button(controls, text="Full + Portable Backups", command=lambda: self.start_backup("both")).grid(row=2, column=3, padx=(0, 8), pady=(12, 0), sticky="w")
+            ttk.Button(
+                controls,
+                text="Backup Now",
+                style="Primary.TButton",
+                command=self.start_backup,
+            ).grid(row=2, column=0, padx=(0, 8), pady=(14, 0), sticky="w")
 
             snaps = ttk.Frame(self.backup_tab)
             snaps.pack(fill="both", expand=True, pady=(18, 0))
@@ -6363,76 +6560,91 @@ def gui_main() -> int:
             snap_actions = ttk.Frame(snaps)
             snap_actions.pack(fill="x", pady=(10, 0))
             ttk.Button(snap_actions, text="Delete Selected Backup", command=self.delete_selected_snapshot).pack(side="left")
-            ttk.Button(snap_actions, text="↻ Refresh", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
+            ttk.Button(snap_actions, text="Refresh", style="Compact.TButton", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
 
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
             ttk.Label(export, text="Export selected backup as an encrypted file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
             ttk.Label(export, text="New bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
-            
             ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=2, column=1, sticky="w", pady=(14, 0))
 
         def build_restore_tab(self) -> None:
-            
             if self.recovery_mode:
                 wizard = ttk.Frame(self.restore_tab, padding=16)
                 wizard.pack(fill="both", expand=True)
                 wizard.grid_columnconfigure(0, weight=1)
-                wizard.grid_rowconfigure(5, weight=1)
+                wizard.grid_rowconfigure(4, weight=1)
 
                 ttk.Label(wizard, text="Aegis Time Machine", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-                ttk.Label(wizard, text="Select a point in time below to completely revert your system.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
-                
-                # Backup source
+                ttk.Label(wizard, text="Select a point in time below to completely revert your system.", style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 14))
+
                 source_row = ttk.Frame(wizard)
-                source_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
-                ttk.Entry(source_row, textvariable=self.repo_source_var, state="readonly", width=60).pack(side="left")
-                ttk.Button(source_row, text="Choose Backup Drive", command=self.choose_and_use_repo_source).pack(side="left", padx=(8, 0))
+                source_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+                source_row.grid_columnconfigure(0, weight=1)
+                ttk.Entry(source_row, textvariable=self.repo_source_var, state="readonly").grid(row=0, column=0, sticky="ew")
+                ttk.Button(source_row, text="Choose Backup Drive", style="Compact.TButton", command=self.choose_and_use_repo_source).grid(row=0, column=1, padx=(8, 0))
 
-                ttk.Label(wizard, textvariable=self.repo_size_var, foreground="#9fb3c8", font=("TkDefaultFont", 10, "italic")).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 18))
-                
-                # The Timeline
+                ttk.Label(wizard, textvariable=self.repo_size_var, foreground="#9fb3c8", font=("TkDefaultFont", 10, "italic")).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
+
                 self.restore_tree = self.build_snapshot_table(wizard)
-                self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 18))
+                self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 14))
 
-                # Target Disk
                 target_row = ttk.Frame(wizard)
-                target_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 0))
-                ttk.Label(target_row, text="Destination disk:", style="Header.TLabel").pack(side="left")
-                self.guided_disk_combo = ttk.Combobox(target_row, textvariable=self.guided_target_disk_var, width=54, state="readonly")
-                self.guided_disk_combo.pack(side="left", padx=(12, 8))
-                ttk.Button(target_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left")
+                target_row.grid(row=5, column=0, columnspan=3, sticky="ew")
+                target_row.grid_columnconfigure(1, weight=1)
+                ttk.Label(target_row, text="Destination disk:", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+                self.guided_disk_combo = ttk.Combobox(target_row, textvariable=self.guided_target_disk_var, state="readonly")
+                self.guided_disk_combo.grid(row=0, column=1, sticky="ew", padx=(12, 8))
+                ttk.Button(target_row, text="Refresh", style="Compact.TButton", command=self.refresh_local_device_lists).grid(row=0, column=2)
 
                 self.guided_restore_repo_button = ttk.Button(wizard, text="Restore Machine to Selected Timeline", command=self.guided_restore_repo)
-                self.guided_restore_repo_button.grid(row=6, column=0, sticky="w", pady=(24, 0))
+                self.guided_restore_repo_button.grid(row=6, column=0, sticky="w", pady=(18, 0))
                 self.guided_restore_repo_button.state(["disabled"])
 
             else:
                 desktop = ttk.Frame(self.restore_tab, padding=16)
                 desktop.pack(fill="both", expand=True)
                 desktop.grid_columnconfigure(0, weight=1)
-                desktop.grid_rowconfigure(5, weight=1)
+                desktop.grid_rowconfigure(7, weight=1)
 
                 ttk.Label(desktop, text="Disaster Recovery Preparation", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-                ttk.Label(desktop, text="Aegis strictly enforces full restores from the recovery media to protect your running system. Create your recovery USB below, then boot from it when disaster strikes.", wraplength=1080, style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 18))
+                ttk.Label(
+                    desktop,
+                    text="Aegis strictly enforces full restores from the recovery media to protect your running system. Create your recovery USB below, then boot from it when disaster strikes.",
+                    wraplength=1080,
+                    style="Muted.TLabel",
+                ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 12))
 
                 usb_row = ttk.Frame(desktop)
-                usb_row.grid(row=2, column=0, columnspan=3, sticky="w", pady=(0, 24))
-                self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, width=54, state="readonly")
-                self.recovery_usb_combo.pack(side="left")
-                ttk.Button(usb_row, text="↻ Refresh", command=self.refresh_local_device_lists).pack(side="left", padx=(8, 0))
-                ttk.Button(usb_row, text="Create Recovery USB", command=self.create_recovery_usb_from_gui).pack(side="left", padx=(8, 0))
-                
-                ttk.Separator(desktop, orient="horizontal").grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 18))
+                usb_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 14))
+                usb_row.grid_columnconfigure(0, weight=1)
+                self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, state="readonly")
+                self.recovery_usb_combo.grid(row=0, column=0, sticky="ew")
+                ttk.Button(usb_row, text="Refresh", style="Compact.TButton", command=self.refresh_local_device_lists).grid(row=0, column=1, padx=(8, 0))
+                ttk.Button(usb_row, text="Create Recovery USB", style="Compact.TButton", command=self.create_recovery_usb_from_gui).grid(row=0, column=2, padx=(8, 0))
 
-                ttk.Label(desktop, text="Backup Timeline (View Only)", style="Header.TLabel").grid(row=4, column=0, columnspan=3, sticky="w")
-                ttk.Label(desktop, text="Aegis deduplicates backup chunks. The repository size below is the unique stored backup data, while 'Restore Size' is how much data that point-in-time backup would stream back during restore.", wraplength=1080, style="Muted.TLabel").grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 4))
-                
-                ttk.Label(desktop, textvariable=self.repo_size_var, foreground="#165dcb", font=("TkDefaultFont", 10, "bold")).grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
+                ttk.Label(
+                    desktop,
+                    text="Aegis prefers typical USB-sized drives automatically. Drives larger than 256 GB stay selectable, but require an extra warning before erase.",
+                    wraplength=1080,
+                    style="Muted.TLabel",
+                ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 12))
+
+                ttk.Separator(desktop, orient="horizontal").grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 12))
+
+                ttk.Label(desktop, text="Backup Timeline (View Only)", style="Header.TLabel").grid(row=5, column=0, columnspan=3, sticky="w")
+                ttk.Label(
+                    desktop,
+                    text="Aegis deduplicates backup chunks. Unique Repository Size is stored data; Restore Size is how much that point-in-time backup would stream back during restore.",
+                    wraplength=1080,
+                    style="Muted.TLabel",
+                ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 2))
+
+                ttk.Label(desktop, textvariable=self.repo_size_var, foreground="#165dcb", font=("TkDefaultFont", 10, "bold")).grid(row=7, column=0, columnspan=3, sticky="nw", pady=(0, 6))
 
                 self.restore_tree = self.build_snapshot_table(desktop)
-                self.restore_tree.grid(row=7, column=0, columnspan=3, sticky="nsew")
+                self.restore_tree.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(24, 0))
 
         def build_constellation_tab(self) -> None:
             info = ttk.Frame(self.constellation_tab)
@@ -7012,11 +7224,11 @@ def gui_main() -> int:
         def refresh_local_device_lists(self) -> None:
             try:
                 excluded = self.excluded_target_disks()
-                usb_choices = list_disk_choices(
+                usb_choices = sort_recovery_usb_choices(list_disk_choices(
                     exclude_paths=excluded,
                     removable_only=True,
                     refresh=True,
-                )
+                ))
                 guided_choices = list_disk_choices(
                     exclude_paths=excluded,
                     removable_only=False,
@@ -7031,10 +7243,22 @@ def gui_main() -> int:
                 if hasattr(self, "guided_disk_combo"):
                     self.guided_disk_combo.configure(values=list(self.guided_disk_map.keys()))
 
-                if usb_choices and self.recovery_usb_device_var.get() not in self.usb_choice_map:
-                    self.recovery_usb_device_var.set(usb_choices[0]["display"])
+                current_usb = self.recovery_usb_device_var.get()
+                preferred_usb = [item for item in usb_choices if int(item.get("size") or 0) <= PREFERRED_RECOVERY_USB_MAX_BYTES]
+                if preferred_usb and current_usb not in self.usb_choice_map:
+                    self.recovery_usb_device_var.set(preferred_usb[0]["display"])
+                elif not preferred_usb and current_usb not in self.usb_choice_map:
+                    self.recovery_usb_device_var.set("")
+                    if usb_choices and not self.recovery_mode:
+                        self.message_var.set(
+                            "Only unusually large removable drives are visible for recovery media. Select one manually only if you are sure it can be erased."
+                        )
+
                 if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
                     self.guided_target_disk_var.set(guided_choices[0]["display"])
+
+                if hasattr(self, "storage_tree"):
+                    self.refresh_constellation_storage_preview()
 
                 if self.recovery_mode and not guided_choices:
                     self.message_var.set(
@@ -7259,6 +7483,11 @@ def gui_main() -> int:
             if not device:
                 self.message_var.set("Choose a recovery USB device first.")
                 return
+
+            if is_large_recovery_usb_target(device):
+                if not self.confirm_dangerous_action("Large drive selected", recovery_usb_warning_text(device)):
+                    return
+
             if not self.confirm_dangerous_action("Create Recovery USB", f"This will erase everything on {device}. Continue?"):
                 return
             try:
@@ -7403,6 +7632,7 @@ def gui_main() -> int:
             warnings = payload.get("warnings", [])
             logs = payload.get("logs", [])
 
+            self.update_backup_progress_window(current_job, logs)
             self.snapshot_by_id = {snap.get("id", ""): snap for snap in snapshots if snap.get("id")}
 
             total_disk = payload.get("repo_size_bytes", 0)
@@ -7468,6 +7698,10 @@ def gui_main() -> int:
                                 messagebox.showinfo("Restore complete", completion, parent=self.root)
                             except Exception:
                                 pass
+                    elif "backup" in finished_name.lower():
+                        completion = "Backup complete. Full Recovery and Portable Migration restore points are ready."
+                        self.message_var.set(completion)
+                        self.finish_backup_progress_window(True, completion)
 
             self.summary_labels["machine"].configure(text=f"{settings.get('machine_label')} ({settings.get('machine_id')})")
             self.summary_labels["repo"].configure(text=settings.get("repo_path", ""))
@@ -7544,19 +7778,23 @@ def gui_main() -> int:
                 self.selected_snapshot_id = selection[0]
             self.refresh_restore_actions()
 
-        def start_backup(self, profile: str) -> None:
+        def start_backup(self, profile: str = "both") -> None:
             try:
-                response = send_daemon_request({"action": "run_backup", "profile": profile})
+                if not self.confirm_backup_preflight():
+                    return
+                self.open_backup_progress_window()
+                response = send_daemon_request({"action": "run_backup", "profile": "both"})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
                 self.message_var.set(response.get("message", "Backup started."))
-                self.refresh_dashboard()
+                self.root.after(100, self.refresh_dashboard)
+                self.root.after(700, self.refresh_dashboard)
             except Exception as exc:
+                self.finish_backup_progress_window(False, str(exc))
                 self.message_var.set(str(exc))
 
         def start_default_backup(self) -> None:
-            profile = self.dashboard_payload.get("settings", {}).get("default_backup_profile", "both")
-            self.start_backup(normalize_backup_profile(profile))
+            self.start_backup("both")
         
         def export_selected_bundle(self) -> None:
             if not self.selected_snapshot_id:
