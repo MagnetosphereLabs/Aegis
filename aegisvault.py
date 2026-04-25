@@ -7622,7 +7622,7 @@ def gui_main() -> int:
                 if guided_choices and self.guided_target_disk_var.get() not in self.guided_disk_map:
                     self.guided_target_disk_var.set(guided_choices[0]["display"])
 
-                if hasattr(self, "storage_tree"):
+                if hasattr(self, "storage_tree") and self.storage_tree.winfo_exists():
                     self.refresh_constellation_storage_preview()
 
                 if self.recovery_mode and not guided_choices:
