@@ -2566,6 +2566,222 @@ def snapshot_restore_info(settings: Settings, snapshot_id: str) -> Dict[str, Any
         "needs_recovery_password": needs_recovery_password,
     }
 
+
+@contextmanager
+def file_lock(path: Path):
+    import fcntl
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def read_exact(stream, size: int) -> bytes:
+    chunks: List[bytes] = []
+    remaining = max(0, int(size))
+
+    while remaining > 0:
+        chunk = stream.read(remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+
+    return b"".join(chunks)
+
+
+def _dataclass_from_dict(cls, data: Dict[str, Any]):
+    obj = cls()
+    if not isinstance(data, dict):
+        return obj
+
+    field_names = {item.name for item in dataclasses.fields(cls)}
+    for key, value in data.items():
+        if key in field_names:
+            setattr(obj, key, value)
+    return obj
+
+
+def snapshot_from_dict(data: Dict[str, Any]) -> SnapshotManifest:
+    if not isinstance(data, dict):
+        raise AegisError("Snapshot manifest is invalid.")
+
+    archive_refs: List[ChunkRef] = []
+    for ref in data.get("archive_refs") or []:
+        if isinstance(ref, ChunkRef):
+            archive_refs.append(ref)
+        elif isinstance(ref, dict):
+            archive_refs.append(
+                ChunkRef(
+                    hash=str(ref.get("hash") or ""),
+                    plain_len=int(ref.get("plain_len") or 0),
+                )
+            )
+
+    metadata = _dataclass_from_dict(SnapshotMetadata, data.get("metadata") or {})
+
+    return SnapshotManifest(
+        version=int(data.get("version") or 1),
+        id=str(data.get("id") or ""),
+        run_id=str(data.get("run_id") or ""),
+        machine_id=str(data.get("machine_id") or ""),
+        machine_label=str(data.get("machine_label") or ""),
+        hostname=str(data.get("hostname") or ""),
+        created_at=str(data.get("created_at") or ""),
+        kind=str(data.get("kind") or ""),
+        source_paths=list(data.get("source_paths") or []),
+        exclude_paths=list(data.get("exclude_paths") or []),
+        chunk_size=int(data.get("chunk_size") or 0),
+        archive_refs=archive_refs,
+        archive_plaintext_bytes=int(data.get("archive_plaintext_bytes") or 0),
+        archive_sha256=str(data.get("archive_sha256") or ""),
+        metadata=metadata,
+        notes=list(data.get("notes") or []),
+    )
+
+
+def list_snapshots(settings: Settings) -> List[Dict[str, Any]]:
+    try:
+        repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    except Exception:
+        return []
+
+    machines_root = repo / "machines"
+    if not machines_root.exists():
+        return []
+
+    snapshots: List[Dict[str, Any]] = []
+
+    for manifest_file in sorted(machines_root.glob("*/snapshots/*.json")):
+        try:
+            manifest = snapshot_from_dict(load_json(manifest_file))
+        except Exception as exc:
+            log_line(f"Skipping unreadable snapshot manifest {manifest_file}: {exc}")
+            continue
+
+        if not manifest.id:
+            continue
+
+        snapshots.append({
+            "id": manifest.id,
+            "run_id": manifest.run_id,
+            "machine_id": manifest.machine_id,
+            "machine_label": manifest.machine_label or manifest.hostname or short_machine(manifest.machine_id),
+            "hostname": manifest.hostname,
+            "created_at": manifest.created_at,
+            "kind": manifest.kind,
+            "source_paths": manifest.source_paths,
+            "exclude_paths": manifest.exclude_paths,
+            "archive_bytes": manifest.archive_plaintext_bytes,
+            "archive_plaintext_bytes": manifest.archive_plaintext_bytes,
+            "archive_sha256": manifest.archive_sha256,
+            "chunk_count": len(manifest.archive_refs),
+        })
+
+    snapshots.sort(
+        key=lambda item: (
+            str(item.get("created_at") or ""),
+            str(item.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return snapshots
+
+
+def read_local_machine_key(machine: str) -> bytes:
+    service_cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if service_cred_dir:
+        service_cred = Path(service_cred_dir) / credential_name_for_machine(machine)
+        if service_cred.exists():
+            return read_machine_key_credential(machine)
+
+    cred_path = local_key_credential_path(machine)
+    if cred_path.exists():
+        return read_machine_key_credential(machine)
+
+    legacy_key = local_key_path(machine)
+    if legacy_key.exists():
+        key = legacy_key.read_bytes()
+        if len(key) != 32:
+            raise AegisError("Legacy local key file is corrupt.")
+        write_machine_key_credential(machine, key)
+        legacy_key.unlink(missing_ok=True)
+        return key
+
+    raise AegisError(
+        f"The local unlock credential is missing for machine {machine}. "
+        "Use the recovery password to restore or export this backup."
+    )
+
+
+def resolve_machine_key_for_manifest(
+    settings: Settings,
+    manifest: SnapshotManifest,
+    recovery_password: Optional[str],
+) -> Optional[bytes]:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+
+    if not manifest_archive_is_encrypted(repo, manifest):
+        return None
+
+    if has_local_machine_key(manifest.machine_id):
+        try:
+            return read_local_machine_key(manifest.machine_id)
+        except Exception as exc:
+            if not recovery_password:
+                raise AegisError(str(exc)) from exc
+
+    if not recovery_password:
+        raise AegisError("Recovery password is required for this encrypted backup.")
+
+    envelope_file = key_envelope_path(repo, manifest.machine_id)
+    if not envelope_file.exists():
+        raise AegisError(
+            f"Recovery key envelope is missing for machine {manifest.machine_id}."
+        )
+
+    return unwrap_machine_key(load_json(envelope_file), recovery_password)
+
+
+def stream_archive_from_repo(
+    repo: Path,
+    manifest: SnapshotManifest,
+    key: Optional[bytes],
+    dest,
+    progress_callback=None,
+) -> str:
+    hasher = hashlib.sha256()
+    done = 0
+    total = int(manifest.archive_plaintext_bytes or 0)
+
+    for ref in manifest.archive_refs:
+        obj = object_path(repo, manifest.machine_id, ref.hash)
+        if not obj.exists():
+            raise AegisError(f"Missing backup data object: {ref.hash}")
+
+        plaintext = object_decode(obj.read_bytes(), key)
+
+        if ref.plain_len and len(plaintext) != int(ref.plain_len):
+            raise AegisError(f"Backup data object length mismatch: {ref.hash}")
+
+        dest.write(plaintext)
+        hasher.update(plaintext)
+        done += len(plaintext)
+
+        if progress_callback:
+            progress_callback(done, total)
+
+    digest = hasher.hexdigest()
+    if manifest.archive_sha256 and digest != manifest.archive_sha256:
+        raise AegisError("Archive integrity mismatch while reading backup data.")
+
+    return digest
+
+
 class RepoWriter:
     def __init__(self, repo: Path, machine: str, chunk_size: int, key: Optional[bytes], io_yield_ms: int) -> None:
         self.repo = repo
@@ -7767,6 +7983,7 @@ def gui_main() -> int:
                 self.dashboard_payload = payload
                 self.populate_dashboard(payload)
             except Exception as exc:
+                self.status_var.set("Needs attention")
                 self.message_var.set(str(exc))
 
         def periodic_refresh(self) -> None:
