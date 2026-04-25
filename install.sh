@@ -210,9 +210,60 @@ do_install() {
 
 do_update() {
   require_root
+
+  if [ -r /dev/tty ]; then
+    echo >/dev/tty
+    echo "Aegis update will restart the background service and any open Aegis desktop window." >/dev/tty
+    echo "Do not continue if a backup, restore, export, recovery USB job, or peer sync is currently running." >/dev/tty
+    printf "Continue with update and restart Aegis now? [y/N]: " >/dev/tty
+
+    local answer=""
+    read -r answer </dev/tty
+    case "${answer}" in
+      y|Y|yes|YES) ;;
+      *)
+        echo "Update canceled." >/dev/tty
+        exit 0
+        ;;
+    esac
+  else
+    echo "Refusing to update without an interactive terminal because Aegis must be restarted." >&2
+    echo "Run this from a terminal so you can confirm no backup or restore is currently running." >&2
+    exit 1
+  fi
+
+  local gui_was_running="no"
+  if pgrep -f "python3 /opt/aegisvault/aegisvault.py gui" >/dev/null 2>&1; then
+    gui_was_running="yes"
+    pkill -TERM -f "python3 /opt/aegisvault/aegisvault.py gui" || true
+    sleep 1
+    pkill -KILL -f "python3 /opt/aegisvault/aegisvault.py gui" || true
+  fi
+
   install_app
   systemctl restart aegisvault.service
-  echo "Aegis updated."
+
+  if [ "${gui_was_running}" = "yes" ] && [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" >/dev/null 2>&1; then
+    local runtime_dir=""
+    local sudo_uid=""
+    sudo_uid="$(id -u "${SUDO_USER}" 2>/dev/null || true)"
+    if [ -n "${sudo_uid}" ] && [ -d "/run/user/${sudo_uid}" ]; then
+      runtime_dir="/run/user/${sudo_uid}"
+    fi
+
+    runuser -u "${SUDO_USER}" -- env \
+      DISPLAY="${DISPLAY:-}" \
+      WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+      XAUTHORITY="${XAUTHORITY:-}" \
+      XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${runtime_dir}}" \
+      DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${runtime_dir}/bus}" \
+      nohup "${BIN_PATH}" gui >/dev/null 2>&1 &
+  fi
+
+  echo "Aegis updated. Background service restarted."
+  if [ "${gui_was_running}" = "yes" ]; then
+    echo "Aegis desktop window was closed and relaunched."
+  fi
 }
 
 do_uninstall() {
