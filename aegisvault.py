@@ -4,7 +4,7 @@ Aegis
 Compact Linux backup app for Debian-based systems.
 Single application file with GUI, CLI, daemon, backup engine, restore engine, and peer sync.
 """
-
+ 
 from __future__ import annotations
 
 import argparse
