@@ -6175,8 +6175,8 @@ def gui_main() -> int:
             ttk.Label(frame, text="Welcome to Aegis", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Label(
                 frame,
-                text="Let's get your backup environment configured. Aegis creates space-efficient, fully encrypted backups of your entire system and personal files.\n\n"
-                     "Finish this initial setup once to unlock the main dashboard, where you can run backups, restore data, and sync with peers.",
+                text="Let's get your backup environment configured. Aegis creates space-efficient, fully encrypted Full Recovery and Portable Migration restore points.\n\n"
+                     "Finish this initial setup once to unlock the main dashboard, where you can run backups, restore data, and sync with your own machines.",
                 wraplength=1020,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -6275,7 +6275,7 @@ def gui_main() -> int:
                 response = self.submit_settings_with_recovery_password_if_needed(payload)
                 self.message_var.set(
                     response.get("message", "Setup saved.")
-                    + " Aegis will now keep running in the background using your selected plan."
+                    + " Aegis will now keep running in the background and will create both restore point types for each backup."
                 )
                 self.settings_loaded = False
                 self.refresh_dashboard()
@@ -6647,61 +6647,190 @@ def gui_main() -> int:
                 self.restore_tree.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(24, 0))
 
         def build_constellation_tab(self) -> None:
-            info = ttk.Frame(self.constellation_tab)
-            info.pack(fill="x")
-            ttk.Label(info, text="Constellation Mode", style="Header.TLabel").pack(anchor="w")
-            ttk.Label(
-                info,
-                text="Mirror encrypted backup repositories across your configured peers over SSH and rsync. Each peer stores ciphertext, and every node can pull everyone else's backup namespaces.",
-                wraplength=1040,
-                style="Muted.TLabel",
-            ).pack(anchor="w", pady=(8, 0))
-            ttk.Button(info, text="Sync Peers Now", command=self.sync_peers_now).pack(anchor="w", pady=(12, 0))
+            outer = self.make_scrollable_frame(self.constellation_tab)
+            outer.grid_columnconfigure(0, weight=1)
 
-            peers_frame = ttk.Frame(self.constellation_tab)
-            peers_frame.pack(fill="both", expand=True, pady=(18, 0))
-            ttk.Label(peers_frame, text="Configured peers", style="Header.TLabel").pack(anchor="w")
-            columns = ("enabled", "label", "target", "repo", "port")
-            self.peers_tree = ttk.Treeview(peers_frame, columns=columns, show="headings", height=12)
+            header = ttk.Frame(outer)
+            header.grid(row=0, column=0, sticky="ew")
+            header.grid_columnconfigure(0, weight=1)
+            ttk.Label(header, text="Constellation Mode", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Button(header, text="Sync Now", style="Primary.TButton", command=self.sync_peers_now).grid(row=0, column=1, sticky="e")
+            ttk.Label(
+                header,
+                text="Build your own private backup fabric. Pair your Linux machines, choose which machines are backed up, and decide which machines or attached drives store encrypted backup data.",
+                wraplength=1120,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+            pairing = ttk.Frame(outer)
+            pairing.grid(row=1, column=0, sticky="ew", pady=(20, 0))
+            pairing.grid_columnconfigure(1, weight=1)
+            ttk.Label(pairing, text="Pair this machine", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Label(
+                pairing,
+                text="Use this code when adding this machine from another Aegis desktop or a headless VPS command line. It contains identity metadata only; actual repository data remains encrypted separately.",
+                wraplength=1120,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 8))
+            ttk.Label(pairing, text="Local pairing code").grid(row=2, column=0, sticky="w", padx=(0, 12))
+            ttk.Entry(pairing, textvariable=self.constellation_pairing_code_var, state="readonly").grid(row=2, column=1, sticky="ew")
+            ttk.Button(pairing, text="Refresh Code", style="Compact.TButton", command=self.update_constellation_pairing_code).grid(row=2, column=2, sticky="e", padx=(8, 0))
+            ttk.Label(pairing, textvariable=self.constellation_summary_var, wraplength=1120, style="Muted.TLabel").grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+            storage = ttk.Frame(outer)
+            storage.grid(row=2, column=0, sticky="nsew", pady=(22, 0))
+            storage.grid_columnconfigure(0, weight=1)
+            ttk.Label(storage, text="Local storage candidates", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                storage,
+                text="Aegis can use internal repositories or externally attached drives as storage targets. This preview helps you decide which machine should hold which backups.",
+                wraplength=1120,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="w", pady=(6, 8))
+            storage_columns = ("device", "role", "size", "mounts")
+            self.storage_tree = ttk.Treeview(storage, columns=storage_columns, show="headings", height=5)
+            for key, title, width in [
+                ("device", "Device", 180),
+                ("role", "Detected Role", 180),
+                ("size", "Size", 110),
+                ("mounts", "Mounts", 620),
+            ]:
+                self.storage_tree.heading(key, text=title)
+                self.storage_tree.column(key, width=width, anchor="w")
+            self.storage_tree.grid(row=2, column=0, sticky="nsew")
+            ttk.Button(storage, text="Refresh Storage Preview", style="Compact.TButton", command=self.refresh_constellation_storage_preview).grid(row=3, column=0, sticky="w", pady=(8, 0))
+
+            form = ttk.Frame(outer)
+            form.grid(row=3, column=0, sticky="ew", pady=(24, 0))
+            form.grid_columnconfigure(1, weight=1)
+            form.grid_columnconfigure(3, weight=1)
+            ttk.Label(form, text="Add or edit a machine", style="Header.TLabel").grid(row=0, column=0, columnspan=4, sticky="w")
+            ttk.Label(
+                form,
+                text="For now, transport uses SSH and rsync underneath, but the configuration is expressed in user-owned-machine terms: source machines, storage targets, and optional storage limits.",
+                wraplength=1120,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 10))
+
+            ttk.Label(form, text="Label").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_label_var).grid(row=2, column=1, sticky="ew", pady=5)
+            ttk.Label(form, text="SSH target").grid(row=2, column=2, sticky="w", padx=(14, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_target_var).grid(row=2, column=3, sticky="ew", pady=5)
+
+            ttk.Label(form, text="Repository path").grid(row=3, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_repo_var).grid(row=3, column=1, sticky="ew", pady=5)
+            ttk.Label(form, text="Port").grid(row=3, column=2, sticky="w", padx=(14, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_port_var, width=8).grid(row=3, column=3, sticky="w", pady=5)
+
+            ttk.Label(form, text="Machine ID").grid(row=4, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_machine_id_var).grid(row=4, column=1, sticky="ew", pady=5)
+            ttk.Label(form, text="Identity file").grid(row=4, column=2, sticky="w", padx=(14, 10), pady=5)
+            identity_row = ttk.Frame(form)
+            identity_row.grid(row=4, column=3, sticky="ew", pady=5)
+            identity_row.grid_columnconfigure(0, weight=1)
+            ttk.Entry(identity_row, textvariable=self.peer_identity_var).grid(row=0, column=0, sticky="ew")
+            ttk.Button(identity_row, text="Browse", style="Compact.TButton", command=lambda: self.browse_file(self.peer_identity_var)).grid(row=0, column=1, padx=(8, 0))
+
+            ttk.Label(form, text="Pairing code").grid(row=5, column=0, sticky="w", padx=(0, 10), pady=5)
+            pairing_row = ttk.Frame(form)
+            pairing_row.grid(row=5, column=1, columnspan=3, sticky="ew", pady=5)
+            pairing_row.grid_columnconfigure(0, weight=1)
+            ttk.Entry(pairing_row, textvariable=self.peer_pairing_code_var).grid(row=0, column=0, sticky="ew")
+            ttk.Button(pairing_row, text="Read Code", style="Compact.TButton", command=self.apply_peer_pairing_code).grid(row=0, column=1, padx=(8, 0))
+
+            policy = ttk.Frame(form)
+            policy.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+            ttk.Checkbutton(policy, text="Back up this machine/source", variable=self.peer_backup_source_var).pack(side="left")
+            ttk.Checkbutton(policy, text="Use as storage target", variable=self.peer_storage_target_var).pack(side="left", padx=(18, 0))
+            ttk.Checkbutton(policy, text="Store all machine namespaces", variable=self.peer_store_all_var).pack(side="left", padx=(18, 0))
+
+            ttk.Label(form, text="Storage limit GB").grid(row=7, column=0, sticky="w", padx=(0, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_storage_limit_var, width=10).grid(row=7, column=1, sticky="w", pady=5)
+            ttk.Label(form, text="Notes").grid(row=7, column=2, sticky="w", padx=(14, 10), pady=5)
+            ttk.Entry(form, textvariable=self.peer_notes_var).grid(row=7, column=3, sticky="ew", pady=5)
+
+            actions = ttk.Frame(form)
+            actions.grid(row=8, column=0, columnspan=4, sticky="w", pady=(12, 0))
+            ttk.Button(actions, text="Add or Update Machine", command=self.add_peer_from_form).pack(side="left")
+            ttk.Button(actions, text="Remove Selected", style="Compact.TButton", command=self.remove_selected_peer).pack(side="left", padx=(8, 0))
+            ttk.Button(actions, text="Save Constellation", style="Compact.TButton", command=self.save_settings).pack(side="left", padx=(8, 0))
+
+            peers = ttk.Frame(outer)
+            peers.grid(row=4, column=0, sticky="nsew", pady=(22, 0))
+            peers.grid_columnconfigure(0, weight=1)
+            ttk.Label(peers, text="Configured machines", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            columns = ("label", "target", "repo", "port", "storage", "source", "limit", "identity", "notes", "machine_id", "enabled")
+            self.settings_peers_tree = ttk.Treeview(peers, columns=columns, show="headings", height=10)
+            for key, title, width in [
+                ("label", "Label", 130),
+                ("target", "SSH Target", 180),
+                ("repo", "Repo Path", 220),
+                ("port", "Port", 60),
+                ("storage", "Stores", 80),
+                ("source", "Backed Up", 90),
+                ("limit", "Limit GB", 80),
+                ("identity", "Identity File", 180),
+                ("notes", "Notes", 180),
+                ("machine_id", "Machine ID", 160),
+                ("enabled", "Enabled", 80),
+            ]:
+                self.settings_peers_tree.heading(key, text=title)
+                self.settings_peers_tree.column(key, width=width, anchor="w")
+            self.settings_peers_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+            self.settings_peers_tree.bind("<<TreeviewSelect>>", self.on_peer_select)
+
+            mirror = ttk.Frame(outer)
+            mirror.grid(row=5, column=0, sticky="nsew", pady=(22, 0))
+            mirror.grid_columnconfigure(0, weight=1)
+            ttk.Label(mirror, text="Sync overview", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            overview_columns = ("enabled", "label", "target", "repo", "role", "limit", "port")
+            self.peers_tree = ttk.Treeview(mirror, columns=overview_columns, show="headings", height=7)
             for key, title, width in [
                 ("enabled", "Enabled", 80),
-                ("label", "Label", 180),
+                ("label", "Label", 170),
                 ("target", "SSH Target", 220),
-                ("repo", "Repository", 320),
-                ("port", "Port", 80),
+                ("repo", "Repository", 300),
+                ("role", "Role", 180),
+                ("limit", "Limit", 90),
+                ("port", "Port", 70),
             ]:
                 self.peers_tree.heading(key, text=title)
                 self.peers_tree.column(key, width=width, anchor="w")
-            self.peers_tree.pack(fill="both", expand=True, pady=(8, 0))
+            self.peers_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
 
         def build_settings_tab(self) -> None:
-            outer = ttk.Frame(self.settings_tab)
-            outer.pack(fill="both", expand=True)
+            outer = self.make_scrollable_frame(self.settings_tab)
+            outer.grid_columnconfigure(0, weight=1)
+            outer.grid_columnconfigure(1, weight=1)
 
-            left = ttk.Frame(outer)
-            left.pack(side="left", fill="both", expand=True, padx=(0, 10))
-            right = ttk.Frame(outer)
-            right.pack(side="left", fill="both", expand=True)
-
-            general = ttk.Frame(left)
-            general.pack(fill="x")
+            general = ttk.Frame(outer)
+            general.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
             general.grid_columnconfigure(1, weight=1)
 
             ttk.Label(general, text="General", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Label(general, text="Machine label").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
-            ttk.Entry(general, textvariable=self.machine_label_var, width=40).grid(row=1, column=1, sticky="w", pady=(10, 0))
+            ttk.Entry(general, textvariable=self.machine_label_var).grid(row=1, column=1, sticky="ew", pady=(10, 0))
 
             ttk.Label(general, text="Backup storage folder").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
             repo_row = ttk.Frame(general)
-            repo_row.grid(row=2, column=1, columnspan=2, sticky="w", pady=(10, 0))
-            ttk.Entry(repo_row, textvariable=self.repo_path_var, width=40).pack(side="left")
-            ttk.Button(repo_row, text="Browse", command=lambda: self.browse_directory(self.repo_path_var)).pack(side="left", padx=(8, 0))
+            repo_row.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(10, 0))
+            repo_row.grid_columnconfigure(0, weight=1)
+            ttk.Entry(repo_row, textvariable=self.repo_path_var).grid(row=0, column=0, sticky="ew")
+            ttk.Button(repo_row, text="Browse", style="Compact.TButton", command=lambda: self.browse_directory(self.repo_path_var)).grid(row=0, column=1, padx=(8, 0))
 
-            ttk.Checkbutton(general, text="Encrypt backups", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Checkbutton(general, text="Encrypt backups", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
             ttk.Checkbutton(general, text="Apply package list after portable restore to /", variable=self.apply_packages_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Checkbutton(general, text="Show desktop notifications", variable=self.notifications_enabled_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            ttk.Label(
+                general,
+                text="Backup Now and scheduled backups always create Full Recovery and Portable Migration restore points. Deduplication keeps shared data efficient.",
+                wraplength=520,
+                style="Muted.TLabel",
+            ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
-            schedule = ttk.Frame(left)
-            schedule.pack(fill="x", pady=(24, 0))
+            schedule = ttk.Frame(outer)
+            schedule.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
+            schedule.grid_columnconfigure(1, weight=1)
             ttk.Label(schedule, text="Scheduling and smoothing", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Checkbutton(schedule, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
@@ -6720,77 +6849,43 @@ def gui_main() -> int:
             ttk.Label(schedule, text="I/O yield milliseconds per chunk").grid(row=4, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(schedule, text="Max backup size limit (GB, 0 for unlimited)").grid(row=5, column=0, sticky="w", pady=(10, 0))
+            ttk.Label(schedule, text="Maximum repository size GB").grid(row=5, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.max_repo_size_var, width=12).grid(row=5, column=1, sticky="w", pady=(10, 0))
-
-            ttk.Label(schedule, text="Default backup plan").grid(row=6, column=0, sticky="w", pady=(10, 0))
-            profile_row = ttk.Frame(schedule)
-            profile_row.grid(row=6, column=1, sticky="w", pady=(10, 0))
-            ttk.Radiobutton(profile_row, text="Full machine", variable=self.default_backup_profile_var, value="full_recovery").pack(side="left")
-            ttk.Radiobutton(profile_row, text="Portable", variable=self.default_backup_profile_var, value="portable_state").pack(side="left", padx=(12, 0))
-            ttk.Radiobutton(profile_row, text="Both", variable=self.default_backup_profile_var, value="both").pack(side="left", padx=(12, 0))
-
-            ttk.Checkbutton(schedule, text="Show desktop notifications", variable=self.notifications_enabled_var).grid(
-                row=7, column=0, columnspan=2, sticky="w", pady=(10, 0)
-            )
             ttk.Label(
                 schedule,
-                text="Desktop notifications warn about starts, finishes, and problems such as missing backup drives.",
-                wraplength=420,
+                text="0 means unlimited. This cap applies to unique stored repository data, not the sum of Restore Size values shown in the timeline.",
+                wraplength=520,
                 style="Muted.TLabel",
-            ).grid(row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
-            excludes = ttk.Frame(left)
-            excludes.pack(fill="both", expand=True, pady=(24, 0))
-            ttk.Label(excludes, text="Full Recovery excludes", style="Header.TLabel").pack(anchor="w")
-            self.full_excludes_text = ScrolledText(excludes, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+            advanced = ttk.Frame(outer)
+            advanced.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(24, 0))
+            advanced.grid_columnconfigure(0, weight=1)
+            advanced.grid_columnconfigure(1, weight=1)
+            advanced.grid_columnconfigure(2, weight=1)
+
+            full_box = ttk.Frame(advanced)
+            full_box.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+            ttk.Label(full_box, text="Full Recovery excludes", style="Header.TLabel").pack(anchor="w")
+            self.full_excludes_text = ScrolledText(full_box, height=10, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.full_excludes_text.pack(fill="both", expand=True, pady=(8, 0))
             self.style_scrolled_text(self.full_excludes_text)
-            ttk.Label(excludes, text="Portable includes", style="Header.TLabel").pack(anchor="w", pady=(18, 0))
-            self.portable_includes_text = ScrolledText(excludes, height=6, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+
+            include_box = ttk.Frame(advanced)
+            include_box.grid(row=0, column=1, sticky="nsew", padx=(10, 10))
+            ttk.Label(include_box, text="Portable includes", style="Header.TLabel").pack(anchor="w")
+            self.portable_includes_text = ScrolledText(include_box, height=10, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.portable_includes_text.pack(fill="both", expand=True, pady=(8, 0))
             self.style_scrolled_text(self.portable_includes_text)
-            ttk.Label(excludes, text="Portable excludes", style="Header.TLabel").pack(anchor="w", pady=(18, 0))
-            self.portable_excludes_text = ScrolledText(excludes, height=8, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+
+            portable_box = ttk.Frame(advanced)
+            portable_box.grid(row=0, column=2, sticky="nsew", padx=(10, 0))
+            ttk.Label(portable_box, text="Portable excludes", style="Header.TLabel").pack(anchor="w")
+            self.portable_excludes_text = ScrolledText(portable_box, height=10, bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
             self.portable_excludes_text.pack(fill="both", expand=True, pady=(8, 0))
             self.style_scrolled_text(self.portable_excludes_text)
 
-            peers = ttk.Frame(right)
-            peers.pack(fill="both", expand=True)
-            ttk.Label(peers, text="Constellation peer configuration", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            ttk.Checkbutton(peers, text="Enable Constellation mirror sync", variable=self.peers_enabled_var).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
-
-            ttk.Label(peers, text="Label").grid(row=2, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(peers, textvariable=self.peer_label_var, width=24).grid(row=2, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(peers, text="SSH target").grid(row=3, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(peers, textvariable=self.peer_target_var, width=30).grid(row=3, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(peers, text="Peer repo path").grid(row=4, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(peers, textvariable=self.peer_repo_var, width=30).grid(row=4, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(peers, text="Port").grid(row=5, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(peers, textvariable=self.peer_port_var, width=8).grid(row=5, column=1, sticky="w", pady=(10, 0))
-            ttk.Label(peers, text="Identity file").grid(row=6, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(peers, textvariable=self.peer_identity_var, width=30).grid(row=6, column=1, sticky="w", pady=(10, 0))
-            ttk.Button(peers, text="Browse", command=lambda: self.browse_file(self.peer_identity_var)).grid(row=6, column=2, padx=(8, 0), pady=(10, 0))
-            ttk.Button(peers, text="Add or Update Peer", command=self.add_peer_from_form).grid(row=7, column=0, columnspan=2, sticky="w", pady=(12, 0))
-            ttk.Button(peers, text="Remove Selected Peer", command=self.remove_selected_peer).grid(row=7, column=2, sticky="w", pady=(12, 0))
-            columns = ("label", "target", "repo", "port", "identity", "enabled")
-            self.settings_peers_tree = ttk.Treeview(peers, columns=columns, show="headings", height=11)
-            for key, title, width in [
-                ("label", "Label", 120),
-                ("target", "SSH Target", 170),
-                ("repo", "Repo Path", 180),
-                ("port", "Port", 60),
-                ("identity", "Identity File", 180),
-                ("enabled", "Enabled", 80),
-            ]:
-                self.settings_peers_tree.heading(key, text=title)
-                self.settings_peers_tree.column(key, width=width, anchor="w")
-            self.settings_peers_tree.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(16, 0))
-            peers.grid_rowconfigure(8, weight=1)
-            peers.grid_columnconfigure(1, weight=1)
-            self.settings_peers_tree.bind("<<TreeviewSelect>>", self.on_peer_select)
-
-            ttk.Button(right, text="Save Settings", command=self.save_settings).pack(anchor="w", pady=(18, 0))
+            ttk.Button(outer, text="Save Settings", style="Primary.TButton", command=self.save_settings).grid(row=2, column=0, sticky="w", pady=(22, 0))
 
         def browse_directory(self, variable: tk.StringVar) -> None:
             start_path = variable.get().strip() or self.repo_path_var.get().strip() or "/"
@@ -7266,6 +7361,62 @@ def gui_main() -> int:
                     )
             except Exception as exc:
                 self.message_var.set(str(exc))
+
+        def update_constellation_pairing_code(self) -> None:
+            settings = self.dashboard_payload.get("settings", {})
+            if not settings:
+                try:
+                    payload = self.daemon_dashboard()
+                    settings = payload.get("settings", {})
+                except Exception:
+                    settings = {}
+            machine = settings.get("machine_id") or machine_id()
+            label = settings.get("machine_label") or hostname()
+            repo = settings.get("repo_path") or DEFAULT_REPO
+            temp_settings = Settings(machine_id=machine, machine_label=label, repo_path=repo)
+            self.constellation_pairing_code_var.set(local_constellation_pairing_code(temp_settings))
+            self.constellation_summary_var.set(f"This machine: {label} ({machine}) - repository {repo}")
+
+        def apply_peer_pairing_code(self) -> None:
+            data = decode_constellation_pairing_code(self.peer_pairing_code_var.get())
+            if not data:
+                self.message_var.set("That pairing code could not be read.")
+                return
+            self.peer_machine_id_var.set(str(data.get("machine_id") or ""))
+            if not self.peer_label_var.get().strip():
+                self.peer_label_var.set(str(data.get("machine_label") or data.get("hostname") or ""))
+            if self.peer_repo_var.get().strip() in {"", DEFAULT_REPO}:
+                self.peer_repo_var.set(str(data.get("repo_path") or DEFAULT_REPO))
+            self.message_var.set("Pairing code read. Add the SSH target, then save the machine.")
+
+        def refresh_constellation_storage_preview(self) -> None:
+            if not hasattr(self, "storage_tree"):
+                return
+            for item in self.storage_tree.get_children():
+                self.storage_tree.delete(item)
+            try:
+                root_disk = current_root_disk()
+                for entry in list_block_devices(refresh=False):
+                    if entry.get("type") != "disk":
+                        continue
+                    path = str(entry.get("path") or "")
+                    if not path:
+                        continue
+                    size_text = human_bytes(int(entry.get("size") or 0))
+                    mountpoints: List[str] = []
+                    for child in list_block_devices(refresh=False):
+                        if child.get("type") == "part" and device_parent_disk(str(child.get("path") or "")) == path:
+                            mountpoints.extend([mp for mp in (child.get("mountpoints") or []) if mp])
+                    mount_text = ", ".join(dedupe(mountpoints)) or "not mounted"
+                    if path == root_disk:
+                        role = "System disk"
+                    elif entry.get("removable") or entry.get("transport") == "usb" or any(mp.startswith(EXTERNAL_BACKUP_ROOT_PREFIXES) for mp in mountpoints):
+                        role = "External storage candidate"
+                    else:
+                        role = "Internal storage candidate"
+                    self.storage_tree.insert("", "end", values=(path, role, size_text, mount_text))
+            except Exception as exc:
+                self.message_var.set(str(exc))
         
         def refresh_backup_location_suggestions(self) -> None:
             try:
@@ -7721,9 +7872,14 @@ def gui_main() -> int:
             self.fill_snapshot_tree(self.backup_tree, snapshots)
             self.fill_snapshot_tree(self.restore_tree, snapshots)
             self.fill_peers_tree(self.peers_tree, settings.get("peers", []))
+            if hasattr(self, "constellation_pairing_code_var"):
+                self.update_constellation_pairing_code()
+            if hasattr(self, "storage_tree"):
+                self.refresh_constellation_storage_preview()
 
             if not self.settings_loaded:
-                self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
+                if hasattr(self, "settings_peers_tree"):
+                    self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
                 self.machine_label_var.set(settings.get("machine_label", ""))
                 self.repo_path_var.set(settings.get("repo_path", ""))
                 self.repo_source_var.set(settings.get("repo_path", ""))
@@ -7749,13 +7905,32 @@ def gui_main() -> int:
             for item in tree.get_children():
                 tree.delete(item)
             for idx, peer in enumerate(peers):
+                storage_enabled = bool(peer.get("storage_target_enabled", True))
+                source_enabled = bool(peer.get("backup_source_enabled", True))
+                store_all = bool(peer.get("store_all_machines", True))
+                limit_value = int(peer.get("storage_limit_gb") or 0)
+                limit_text = f"{limit_value} GB" if limit_value > 0 else "unlimited"
+                role_parts = []
+                if storage_enabled:
+                    role_parts.append("stores")
+                if source_enabled:
+                    role_parts.append("backed up")
+                if store_all:
+                    role_parts.append("all namespaces")
+                role_text = ", ".join(role_parts) or "disabled"
+
                 if settings_mode:
                     tree.insert("", "end", iid=str(idx), values=(
                         peer.get("label", ""),
                         peer.get("ssh_target", ""),
                         peer.get("repo_path", ""),
                         str(peer.get("port", 22)),
+                        "yes" if storage_enabled else "no",
+                        "yes" if source_enabled else "no",
+                        str(peer.get("storage_limit_gb", 0) or 0),
                         peer.get("identity_file", ""),
+                        peer.get("notes", ""),
+                        peer.get("machine_id", ""),
                         "yes" if peer.get("enabled", True) else "no",
                     ))
                 else:
@@ -7764,6 +7939,8 @@ def gui_main() -> int:
                         peer.get("label", ""),
                         peer.get("ssh_target", ""),
                         peer.get("repo_path", ""),
+                        role_text,
+                        limit_text,
                         str(peer.get("port", 22)),
                     ))
 
@@ -7956,37 +8133,79 @@ def gui_main() -> int:
                     "ssh_target": values[1],
                     "repo_path": values[2],
                     "port": int(values[3] or 22),
-                    "enabled": values[5] == "yes",
-                    "identity_file": values[4],
+                    "storage_target_enabled": values[4] == "yes",
+                    "backup_source_enabled": values[5] == "yes",
+                    "storage_limit_gb": int(values[6] or 0),
+                    "identity_file": values[7],
+                    "notes": values[8],
+                    "machine_id": values[9],
+                    "enabled": values[10] == "yes",
+                    "store_all_machines": True,
+                    "pairing_code": "",
                 })
             return peers
 
         def add_peer_from_form(self) -> None:
-            label = self.peer_label_var.get().strip()
+            pairing_code = self.peer_pairing_code_var.get().strip()
+            pairing_data = decode_constellation_pairing_code(pairing_code)
+
+            label = self.peer_label_var.get().strip() or str(pairing_data.get("machine_label") or pairing_data.get("hostname") or "")
             target = self.peer_target_var.get().strip()
-            repo_path = self.peer_repo_var.get().strip() or DEFAULT_REPO
+            repo_path = self.peer_repo_var.get().strip() or str(pairing_data.get("repo_path") or DEFAULT_REPO)
             port = self.peer_port_var.get().strip() or "22"
             identity = self.peer_identity_var.get().strip()
+            machine_id_value = self.peer_machine_id_var.get().strip() or str(pairing_data.get("machine_id") or "")
+            limit = self.peer_storage_limit_var.get().strip() or "0"
+            notes = self.peer_notes_var.get().strip()
+
             if not target:
                 self.message_var.set("Peer SSH target is required.")
                 return
+            try:
+                int(port)
+                int(limit)
+            except ValueError:
+                self.message_var.set("Port and storage limit must be numbers.")
+                return
+
             selected = self.settings_peers_tree.selection()
-            values = (label, target, repo_path, port, identity, "yes")
+            values = (
+                label or target,
+                target,
+                repo_path,
+                port,
+                "yes" if self.peer_storage_target_var.get() else "no",
+                "yes" if self.peer_backup_source_var.get() else "no",
+                limit,
+                identity,
+                notes,
+                machine_id_value,
+                "yes",
+            )
             if selected:
                 self.settings_peers_tree.item(selected[0], values=values)
             else:
                 self.settings_peers_tree.insert("", "end", values=values)
+
             self.peer_label_var.set("")
             self.peer_target_var.set("")
             self.peer_repo_var.set(DEFAULT_REPO)
             self.peer_port_var.set("22")
             self.peer_identity_var.set(identity)
-            self.message_var.set("Peer staged. Save settings to persist it.")
+            self.peer_machine_id_var.set("")
+            self.peer_pairing_code_var.set("")
+            self.peer_storage_limit_var.set("0")
+            self.peer_notes_var.set("")
+            self.peer_backup_source_var.set(True)
+            self.peer_storage_target_var.set(True)
+            self.peer_store_all_var.set(True)
+            self.peers_enabled_var.set(True)
+            self.message_var.set("Machine staged. Save Constellation to persist it.")
 
         def remove_selected_peer(self) -> None:
             for item in self.settings_peers_tree.selection():
                 self.settings_peers_tree.delete(item)
-            self.message_var.set("Selected peer removed from staged settings. Save settings to persist.")
+            self.message_var.set("Selected machine removed from staged Constellation settings. Save to persist.")
 
         def on_peer_select(self, event) -> None:
             selection = self.settings_peers_tree.selection()
@@ -7997,7 +8216,13 @@ def gui_main() -> int:
             self.peer_target_var.set(values[1])
             self.peer_repo_var.set(values[2])
             self.peer_port_var.set(values[3])
-            self.peer_identity_var.set(values[4])
+            self.peer_storage_target_var.set(values[4] == "yes")
+            self.peer_backup_source_var.set(values[5] == "yes")
+            self.peer_storage_limit_var.set(values[6])
+            self.peer_identity_var.set(values[7])
+            self.peer_notes_var.set(values[8])
+            self.peer_machine_id_var.set(values[9])
+            self.peer_store_all_var.set(True)
 
         def build_settings_payload(self, onboarding_complete: bool = True) -> Dict[str, Any]:
             full_excludes = split_lines(self.full_excludes_text.get("1.0", "end"))
@@ -8005,16 +8230,24 @@ def gui_main() -> int:
             portable_excludes = split_lines(self.portable_excludes_text.get("1.0", "end"))
 
             peers = []
-            for iid in self.settings_peers_tree.get_children():
-                values = self.settings_peers_tree.item(iid, "values")
-                peers.append({
-                    "enabled": values[5] == "yes",
-                    "label": values[0],
-                    "ssh_target": values[1],
-                    "repo_path": values[2],
-                    "port": int(values[3] or 22),
-                    "identity_file": values[4],
-                })
+            if hasattr(self, "settings_peers_tree"):
+                for iid in self.settings_peers_tree.get_children():
+                    values = self.settings_peers_tree.item(iid, "values")
+                    peers.append({
+                        "enabled": values[10] == "yes",
+                        "label": values[0],
+                        "ssh_target": values[1],
+                        "repo_path": values[2],
+                        "port": int(values[3] or 22),
+                        "storage_target_enabled": values[4] == "yes",
+                        "backup_source_enabled": values[5] == "yes",
+                        "storage_limit_gb": int(values[6] or 0),
+                        "identity_file": values[7],
+                        "notes": values[8],
+                        "machine_id": values[9],
+                        "store_all_machines": True,
+                        "pairing_code": "",
+                    })
 
             schedule_enabled = bool(self.schedule_enabled_var.get())
             schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
@@ -8038,7 +8271,7 @@ def gui_main() -> int:
                 "repo_mount_subpath": "" if repo_path_changed else loaded_settings.get("repo_mount_subpath", ""),
                 "encryption_enabled": bool(self.encryption_var.get()),
                 "notifications_enabled": bool(self.notifications_enabled_var.get()),
-                "default_backup_profile": normalize_backup_profile(self.default_backup_profile_var.get().strip() or "both"),
+                "default_backup_profile": "both",
                 "schedule": {
                     "enabled": schedule_enabled,
                     "preset": schedule_preset,
