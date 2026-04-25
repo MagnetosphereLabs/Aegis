@@ -62,6 +62,9 @@ DEFAULT_RECOVERY_SUITE = "bookworm"
 DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
 DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
 MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
+PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
+BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
+BACKUP_JOB_KIND_ORDER = ["full_recovery", "portable_state"]
 
 
 @dataclass
@@ -92,6 +95,13 @@ class PeerTarget:
     repo_path: str = DEFAULT_REPO
     port: int = 22
     identity_file: str = ""
+    machine_id: str = ""
+    backup_source_enabled: bool = True
+    storage_target_enabled: bool = True
+    storage_limit_gb: int = 0
+    store_all_machines: bool = True
+    notes: str = ""
+    pairing_code: str = ""
 
 
 @dataclass
@@ -135,6 +145,11 @@ class JobState:
     stage: str = ""
     started_at: str = ""
     progress: Optional[float] = None
+    bytes_done: int = 0
+    bytes_total: int = 0
+    rate_bps: float = 0.0
+    detail: str = ""
+    phase: str = ""
 
 
 @dataclass
@@ -823,6 +838,7 @@ class Runtime:
         self.lock = threading.Lock()
         self.current_job: Optional[JobState] = None
         self.logs: List[str] = []
+        self.job_started_monotonic: float = 0.0
 
 RUNTIME = Runtime()
 _SOCKET_AUTH_FAILED = False
@@ -861,6 +877,31 @@ def machine_id() -> str:
 def hostname() -> str:
     return socket.gethostname()
 
+def local_constellation_pairing_code(settings: Settings) -> str:
+    payload = {
+        "version": 1,
+        "app": APP_NAME,
+        "machine_id": settings.machine_id or machine_id(),
+        "machine_label": settings.machine_label or hostname(),
+        "hostname": hostname(),
+        "repo_path": settings.repo_path or DEFAULT_REPO,
+        "created_at": now_rfc3339(),
+    }
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def decode_constellation_pairing_code(code: str) -> Dict[str, Any]:
+    cleaned = str(code or "").strip()
+    if not cleaned:
+        return {}
+    padding = "=" * ((4 - len(cleaned) % 4) % 4)
+    try:
+        payload = base64.urlsafe_b64decode((cleaned + padding).encode("ascii"))
+        data = json.loads(payload.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 def human_bytes(value: int) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
@@ -1216,6 +1257,13 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
                 repo_path=str(peer.get("repo_path") or DEFAULT_REPO),
                 port=int(peer.get("port", 22)),
                 identity_file=str(peer.get("identity_file") or ""),
+                machine_id=str(peer.get("machine_id") or ""),
+                backup_source_enabled=bool(peer.get("backup_source_enabled", True)),
+                storage_target_enabled=bool(peer.get("storage_target_enabled", True)),
+                storage_limit_gb=int(peer.get("storage_limit_gb") or 0),
+                store_all_machines=bool(peer.get("store_all_machines", True)),
+                notes=str(peer.get("notes") or ""),
+                pairing_code=str(peer.get("pairing_code") or ""),
             )
             for peer in peers_data
         ],
@@ -1298,7 +1346,14 @@ def update_stage(stage: str) -> None:
             RUNTIME.current_job.stage = stage
     log_line(stage)
 
-def set_job_progress(progress: Optional[float], stage: Optional[str] = None) -> None:
+def set_job_progress(
+    progress: Optional[float],
+    stage: Optional[str] = None,
+    bytes_done: Optional[int] = None,
+    bytes_total: Optional[int] = None,
+    detail: Optional[str] = None,
+    phase: Optional[str] = None,
+) -> None:
     with RUNTIME.lock:
         if RUNTIME.current_job:
             if progress is None:
@@ -1307,6 +1362,16 @@ def set_job_progress(progress: Optional[float], stage: Optional[str] = None) -> 
                 RUNTIME.current_job.progress = max(0.0, min(100.0, float(progress)))
             if stage is not None:
                 RUNTIME.current_job.stage = stage
+            if bytes_done is not None:
+                RUNTIME.current_job.bytes_done = max(0, int(bytes_done))
+                elapsed = max(0.001, time.monotonic() - max(0.0, RUNTIME.job_started_monotonic))
+                RUNTIME.current_job.rate_bps = float(RUNTIME.current_job.bytes_done) / elapsed
+            if bytes_total is not None:
+                RUNTIME.current_job.bytes_total = max(0, int(bytes_total))
+            if detail is not None:
+                RUNTIME.current_job.detail = detail
+            if phase is not None:
+                RUNTIME.current_job.phase = phase
 
 def run_command(cmd: List[str], check: bool = True, capture: bool = True, cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
     try:
@@ -2060,6 +2125,39 @@ def list_disk_choices(
     return items
 
 
+def recovery_usb_choice_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
+    size = int(item.get("size") or 0)
+    removable_score = 0 if (item.get("removable") or item.get("transport") == "usb") else 1
+
+    if MIN_RECOVERY_USB_BYTES <= size <= 128 * 1000 * 1000 * 1000:
+        size_bucket = 0
+    elif size <= PREFERRED_RECOVERY_USB_MAX_BYTES:
+        size_bucket = 1
+    else:
+        size_bucket = 2
+
+    return (size_bucket, removable_score, str(item.get("display") or item.get("path") or "").lower())
+
+
+def sort_recovery_usb_choices(choices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return sorted(choices, key=recovery_usb_choice_sort_key)
+
+
+def is_large_recovery_usb_target(device: str) -> bool:
+    entry = find_block_device_entry(device) or {}
+    size = int(entry.get("size") or 0) or observed_block_device_size_bytes(device)
+    return bool(size and size > PREFERRED_RECOVERY_USB_MAX_BYTES)
+
+
+def recovery_usb_warning_text(device: str) -> str:
+    entry = find_block_device_entry(device) or {}
+    size = int(entry.get("size") or 0) or observed_block_device_size_bytes(device)
+    size_text = human_bytes(size) if size else "unknown size"
+    return (
+        f"{device} appears to be {size_text}. That is much larger than a typical recovery USB.\n\n"
+        "Creating recovery media will erase the entire selected drive. Make sure this is not a backup drive, storage drive, or internal disk."
+    )
+
 def resolve_block_device_from_identity(identity: Dict[str, Any], timeout_seconds: int = 20) -> str:
     deadline = time.time() + max(1, timeout_seconds)
     last_seen_path = ""
@@ -2682,208 +2780,245 @@ def prune_empty_dirs(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
+def _delete_snapshot_from_repo_locked(settings: Settings, repo: Path, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
+    manifest, manifest_file = find_snapshot_manifest_with_path(repo, snapshot_id)
+    candidate_hashes = {ref.hash for ref in manifest.archive_refs}
+
+    manifest_file.unlink(missing_ok=True)
+
+    remaining_hashes: Set[str] = set()
+    snapshots_dir = repo_machine_dir(repo, manifest.machine_id) / "snapshots"
+    if snapshots_dir.exists():
+        for path in snapshots_dir.glob("*.json"):
+            try:
+                other = snapshot_from_dict(load_json(path))
+                remaining_hashes.update(ref.hash for ref in other.archive_refs)
+            except Exception:
+                continue
+
+    removed_objects = 0
+    machine_objects_root = repo / "objects" / manifest.machine_id
+    for hash_hex in sorted(candidate_hashes - remaining_hashes):
+        obj = object_path(repo, manifest.machine_id, hash_hex)
+        if obj.exists():
+            obj.unlink()
+            removed_objects += 1
+            prune_empty_dirs(obj.parent, machine_objects_root)
+
+    return manifest, removed_objects
+
+
 def delete_snapshot_from_repo(settings: Settings, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     with file_lock(LOCK_PATH):
-        manifest, manifest_file = find_snapshot_manifest_with_path(repo, snapshot_id)
-        candidate_hashes = {ref.hash for ref in manifest.archive_refs}
-
-        manifest_file.unlink(missing_ok=True)
-
-        remaining_hashes: Set[str] = set()
-        snapshots_dir = repo_machine_dir(repo, manifest.machine_id) / "snapshots"
-        if snapshots_dir.exists():
-            for path in snapshots_dir.glob("*.json"):
-                try:
-                    other = snapshot_from_dict(load_json(path))
-                    remaining_hashes.update(ref.hash for ref in other.archive_refs)
-                except Exception:
-                    continue
-
-        removed_objects = 0
-        machine_objects_root = repo / "objects" / manifest.machine_id
-        for hash_hex in sorted(candidate_hashes - remaining_hashes):
-            obj = object_path(repo, manifest.machine_id, hash_hex)
-            if obj.exists():
-                obj.unlink()
-                removed_objects += 1
-                prune_empty_dirs(obj.parent, machine_objects_root)
-
-        return manifest, removed_objects
-
-def snapshot_from_dict(data: Dict[str, Any]) -> SnapshotManifest:
-    return SnapshotManifest(
-        version=int(data["version"]),
-        id=str(data["id"]),
-        run_id=str(data["run_id"]),
-        machine_id=str(data["machine_id"]),
-        machine_label=str(data["machine_label"]),
-        hostname=str(data["hostname"]),
-        created_at=str(data["created_at"]),
-        kind=str(data["kind"]),
-        source_paths=list(data.get("source_paths") or []),
-        exclude_paths=list(data.get("exclude_paths") or []),
-        chunk_size=int(data.get("chunk_size", DEFAULT_CHUNK_MIB * 1024 * 1024)),
-        archive_refs=[ChunkRef(hash=ref["hash"], plain_len=int(ref["plain_len"])) for ref in data.get("archive_refs") or []],
-        archive_plaintext_bytes=int(data.get("archive_plaintext_bytes", 0)),
-        archive_sha256=str(data.get("archive_sha256", "")),
-        metadata=SnapshotMetadata(**(data.get("metadata") or {})),
-        notes=list(data.get("notes") or []),
-    )
-
-
-def list_snapshots(settings: Settings) -> List[Dict[str, Any]]:
-    try:
-        repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
-    except AegisError:
-        return []
-    out: List[Dict[str, Any]] = []
-    machines_root = repo / "machines"
-    if not machines_root.exists():
-        return out
-    for machine_dir in machines_root.iterdir():
-        snapshots_dir = machine_dir / "snapshots"
-        if not snapshots_dir.exists():
-            continue
-        for path in snapshots_dir.glob("*.json"):
-            try:
-                manifest = snapshot_from_dict(load_json(path))
-                out.append({
-                    "id": manifest.id,
-                    "machine_id": manifest.machine_id,
-                    "machine_label": manifest.machine_label,
-                    "kind": manifest.kind,
-                    "created_at": manifest.created_at,
-                    "archive_bytes": manifest.archive_plaintext_bytes,
-                })
-            except Exception:
-                continue
-    out.sort(key=lambda x: x["created_at"], reverse=True)
-    return out
-
-
-def read_local_machine_key(machine: str) -> bytes:
-    legacy = local_key_path(machine)
-    if legacy.exists():
-        data = legacy.read_bytes()
-        if len(data) != 32:
-            raise AegisError(f"Legacy local machine key is invalid for {machine}.")
-        write_machine_key_credential(machine, data)
-        legacy.unlink(missing_ok=True)
-        return data
-
-    return read_machine_key_credential(machine)
-
-
-def load_key_envelope(repo: Path, machine: str) -> Dict[str, Any]:
-    path = key_envelope_path(repo, machine)
-    if not path.exists():
-        raise AegisError(f"Key envelope is missing for {machine}.")
-    return load_json(path)
-
-
-def resolve_machine_key_for_manifest(settings: Settings, manifest: SnapshotManifest, recovery_password: Optional[str]) -> Optional[bytes]:
-    repo = Path(settings.repo_path)
-    objects_root = repo / "objects" / manifest.machine_id
-    if not objects_root.exists():
-        return None
-
-    if has_local_machine_key(manifest.machine_id):
-        return read_local_machine_key(manifest.machine_id)
-
-    encrypted = manifest_archive_is_encrypted(repo, manifest)
-    if not encrypted:
-        return None
-
-    if recovery_password:
-        envelope = load_key_envelope(repo, manifest.machine_id)
-        return unwrap_machine_key(envelope, recovery_password)
-
-    label = manifest.machine_label or manifest.machine_id
-    raise AegisError(f"This backup is encrypted. Enter the recovery password for {label}.")
-
-
-def stream_archive_from_repo(repo: Path, manifest: SnapshotManifest, key: Optional[bytes], writer, progress_callback=None) -> str:
-    hasher = hashlib.sha256()
-    total_bytes = int(manifest.archive_plaintext_bytes or sum(ref.plain_len for ref in manifest.archive_refs))
-    written_bytes = 0
-    last_report_at = 0.0
-
-    for ref in manifest.archive_refs:
-        obj_path = object_path(repo, manifest.machine_id, ref.hash)
-        if not obj_path.exists():
-            raise AegisError(f"Missing object chunk: {obj_path}")
-        payload = obj_path.read_bytes()
-        plain = object_decode(payload, key)
-        if len(plain) != ref.plain_len:
-            raise AegisError(f"Chunk length mismatch for {ref.hash}")
-
-        writer.write(plain)
-        hasher.update(plain)
-        written_bytes += len(plain)
-
-        if progress_callback:
-            now = time.monotonic()
-            if written_bytes >= total_bytes or now - last_report_at >= 0.35:
-                progress_callback(written_bytes, total_bytes)
-                last_report_at = now
-
-    return hasher.hexdigest()
-
-
-@contextmanager
-def file_lock(path: Path):
-    import fcntl
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as fh:
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise AegisError("Another backup operation is already running.") from exc
-        try:
-            yield fh
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return _delete_snapshot_from_repo_locked(settings, repo, snapshot_id)
 
 
 def get_repo_size_bytes(repo_path: Path) -> int:
+    if not repo_path.exists():
+        return 0
     total = 0
     for dirpath, _, filenames in os.walk(repo_path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
-            if not os.path.islink(fp):
-                total += os.path.getsize(fp)
+            try:
+                if not os.path.islink(fp):
+                    total += os.path.getsize(fp)
+            except OSError:
+                continue
     return total
 
-def enforce_repo_size_limit(settings: Settings) -> None:
+
+def repo_size_limit_bytes(settings: Settings) -> int:
+    return max(0, int(settings.max_repo_size_gb)) * 1024 * 1024 * 1024
+
+
+def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
+    repo_size = get_repo_size_bytes(repo)
+    limit_bytes = repo_size_limit_bytes(settings)
+    usage = shutil.disk_usage(str(repo))
+    warnings: List[str] = []
+
+    if limit_bytes > 0:
+        if repo_size >= limit_bytes:
+            warnings.append(
+                f"The repository is already at or above the configured cap ({human_bytes(repo_size)} / {human_bytes(limit_bytes)}). "
+                "Aegis will prune the oldest snapshots after the new backup finishes, while preserving at least one backup."
+            )
+        elif repo_size >= int(limit_bytes * 0.90):
+            warnings.append(
+                f"The repository is close to the configured cap ({human_bytes(repo_size)} / {human_bytes(limit_bytes)}). "
+                "Older snapshots may be pruned after this backup."
+            )
+
+    if usage.free < BACKUP_PREFLIGHT_MIN_FREE_BYTES:
+        warnings.append(
+            f"The backup filesystem has very little free space ({human_bytes(usage.free)} available). "
+            "The backup may fail unless space is freed or the repository cap prunes old data after completion."
+        )
+
+    return {
+        "repo_path": str(repo),
+        "repo_size_bytes": repo_size,
+        "limit_bytes": limit_bytes,
+        "free_bytes": int(usage.free),
+        "warnings": warnings,
+    }
+
+
+def assert_backup_storage_preflight(settings: Settings) -> None:
+    info = backup_preflight_info(settings)
+    if int(info.get("free_bytes") or 0) <= 0:
+        raise AegisError("The backup location reports no free space.")
+
+
+def enforce_repo_size_limit(settings: Settings, already_locked: bool = False) -> None:
     if settings.max_repo_size_gb <= 0:
         return
-    
-    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
-    limit_bytes = settings.max_repo_size_gb * 1024 * 1024 * 1024
-    
-    while get_repo_size_bytes(repo) > limit_bytes:
-        snaps = list_snapshots(settings)
-        if len(snaps) <= 1:
-            # Safety catch: Never delete the last remaining backup
-            break
-            
-        oldest_id = snaps[-1]["id"]
-        update_stage(f"Auto-pruning oldest backup ({oldest_id}) to stay under size limit")
-        delete_snapshot_from_repo(settings, oldest_id)
 
-def read_exact(pipe, size: int) -> bytes:
-    """Read exactly `size` bytes to maintain 512-byte block alignment for CDC."""
-    buf = bytearray(size)
-    view = memoryview(buf)
-    pos = 0
-    while pos < size:
-        read_bytes = pipe.readinto(view[pos:])
-        if not read_bytes:
-            return bytes(buf[:pos])  # EOF
-        pos += read_bytes
-    return bytes(buf)
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    limit_bytes = repo_size_limit_bytes(settings)
+    if limit_bytes <= 0:
+        return
+
+    def prune_until_under_limit() -> None:
+        while get_repo_size_bytes(repo) > limit_bytes:
+            snaps = list_snapshots(settings)
+            if len(snaps) <= 1:
+                # Safety catch: never automatically delete the last remaining backup.
+                break
+
+            oldest_id = snaps[-1]["id"]
+            update_stage(f"Auto-pruning oldest backup ({oldest_id}) to stay under repository size limit")
+            _delete_snapshot_from_repo_locked(settings, repo, oldest_id)
+
+    if already_locked:
+        prune_until_under_limit()
+    else:
+        with file_lock(LOCK_PATH):
+            prune_until_under_limit()
+
+
+def backup_kinds_for_profile(profile: str) -> List[str]:
+    normalized = normalize_backup_profile(profile)
+    if normalized == "both":
+        return list(BACKUP_JOB_KIND_ORDER)
+    return [normalized]
+
+
+def estimated_backup_stream_bytes(settings: Settings, kind: str) -> int:
+    # This is intentionally an estimate: tar is the source of truth, and the UI
+    # still shows exact streamed bytes/rate. The estimate gives users a real
+    # determinate progress bar without doing an expensive pre-scan of every file.
+    try:
+        root_used = shutil.disk_usage("/").used
+    except Exception:
+        root_used = 0
+    return max(1, int(root_used or 1))
+
+
+def capture_backup_kind(
+    settings: Settings,
+    run_id: str,
+    kind: str,
+    kind_index: int,
+    total_kinds: int,
+    chunk_size: int,
+    machine_key_value: Optional[bytes],
+) -> str:
+    kind_label_text = kind_label(kind)
+    kind_span = 88.0 / max(1, total_kinds)
+    kind_base = 3.0 + (kind_index * kind_span)
+
+    set_job_progress(
+        kind_base,
+        f"Collecting metadata for {kind_label_text}",
+        detail="Reading package lists, OS metadata, disk layout, and restore hints.",
+        phase=kind,
+    )
+    metadata = collect_snapshot_metadata(kind)
+    includes = build_include_paths(settings, kind)
+    excludes = build_exclude_paths(settings, kind)
+
+    estimate_bytes = estimated_backup_stream_bytes(settings, kind)
+    set_job_progress(
+        kind_base + 1.0,
+        f"Capturing {kind_label_text}",
+        bytes_done=0,
+        bytes_total=estimate_bytes,
+        detail="Scanning files, packing a tar stream, encrypting chunks, and reusing unchanged data.",
+        phase=kind,
+    )
+
+    writer = RepoWriter(Path(settings.repo_path), settings.machine_id, chunk_size, machine_key_value, settings.io_yield_ms)
+    cmd = build_tar_backup_command(includes, excludes)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    assert proc.stdout is not None
+
+    streamed_bytes = 0
+    last_report_at = 0.0
+
+    while True:
+        # Use read_exact to ensure tar blocks are never misaligned in the buffer.
+        chunk = read_exact(proc.stdout, BUFFER_SIZE)
+        if not chunk:
+            break
+
+        writer.write(chunk)
+        streamed_bytes += len(chunk)
+
+        now = time.monotonic()
+        if now - last_report_at >= 0.35:
+            capture_fraction = min(1.0, streamed_bytes / max(1, estimate_bytes))
+            progress = kind_base + 1.0 + (capture_fraction * max(1.0, kind_span - 3.0))
+            set_job_progress(
+                progress,
+                f"Capturing {kind_label_text} - {human_bytes(streamed_bytes)} streamed",
+                bytes_done=streamed_bytes,
+                bytes_total=estimate_bytes,
+                detail="Aegis is scanning files and storing only new unique encrypted chunks.",
+                phase=kind,
+            )
+            last_report_at = now
+
+    stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
+    returncode = proc.wait()
+    if returncode not in (0, 1):
+        raise AegisError(f"tar backup failed for {kind_label_text}: {stderr_data.strip() or returncode}")
+
+    refs, total_bytes, archive_sha = writer.finish()
+
+    set_job_progress(
+        min(91.0, kind_base + kind_span - 1.0),
+        f"Writing manifest for {kind_label_text}",
+        bytes_done=total_bytes,
+        bytes_total=max(total_bytes, estimate_bytes),
+        detail="The point-in-time restore manifest is being written.",
+        phase=kind,
+    )
+
+    manifest = SnapshotManifest(
+        version=1,
+        id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
+        run_id=run_id,
+        machine_id=settings.machine_id,
+        machine_label=settings.machine_label,
+        hostname=hostname(),
+        created_at=now_rfc3339(),
+        kind=kind,
+        source_paths=includes,
+        exclude_paths=excludes,
+        chunk_size=chunk_size,
+        archive_refs=refs,
+        archive_plaintext_bytes=total_bytes,
+        archive_sha256=archive_sha,
+        metadata=metadata,
+        notes=list(metadata.notes),
+    )
+    write_manifest(settings, manifest)
+    log_line(f"Created {kind_label_text}: {manifest.id} ({human_bytes(total_bytes)} restore stream)")
+    return manifest.id
 
 
 def perform_backup(settings: Settings, profile: str) -> List[str]:
@@ -2894,95 +3029,36 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
     save_state(state)
 
     materialize_settings(settings)
+    assert_backup_storage_preflight(settings)
+
     created: List[str] = []
     chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
     machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
-    
+    kinds = backup_kinds_for_profile(profile)
+
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
-        
-        is_both = profile == "both"
-        kinds = ["full_recovery"] if is_both else [profile]
-        
-        for kind in kinds:
-            update_stage(f"Collecting metadata for {kind_label(kind)}")
-            metadata = collect_snapshot_metadata(kind)
-            includes = build_include_paths(settings, kind)
-            excludes = build_exclude_paths(settings, kind)
-            update_stage(f"Capturing {kind_label(kind)}")
-            writer = RepoWriter(Path(settings.repo_path), settings.machine_id, chunk_size, machine_key_value, settings.io_yield_ms)
-            cmd = build_tar_backup_command(includes, excludes)
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            assert proc.stdout is not None
-            
-            while True:
-                # Use read_exact to ensure tar blocks are never misaligned in the buffer
-                chunk = read_exact(proc.stdout, BUFFER_SIZE)
-                if not chunk:
-                    break
-                writer.write(chunk)
-            
-            stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
-            returncode = proc.wait()
-            if returncode not in (0, 1):
-                raise AegisError(f"tar backup failed for {kind_label(kind)}: {stderr_data.strip() or returncode}")
-            
-            refs, total_bytes, archive_sha = writer.finish()
-            
-            manifest = SnapshotManifest(
-                version=1,
-                id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
-                run_id=run_id,
-                machine_id=settings.machine_id,
-                machine_label=settings.machine_label,
-                hostname=hostname(),
-                created_at=now_rfc3339(),
-                kind=kind,
-                source_paths=includes,
-                exclude_paths=excludes,
-                chunk_size=chunk_size,
-                archive_refs=refs,
-                archive_plaintext_bytes=total_bytes,
-                archive_sha256=archive_sha,
-                metadata=metadata,
-                notes=list(metadata.notes),
-            )
-            write_manifest(settings, manifest)
-            created.append(manifest.id)
-            
-            if is_both and kind == "full_recovery":
-                update_stage("Synthesizing Portable Migration Backup")
-                port_meta = collect_snapshot_metadata("portable_state")
-                port_includes = build_include_paths(settings, "portable_state")
-                port_excludes = build_exclude_paths(settings, "portable_state")
-                
-                port_manifest = SnapshotManifest(
-                    version=1,
-                    id=f"{utc_tag()}-{short_machine(settings.machine_id)}-portable",
+        set_job_progress(1.0, "Starting backup", detail="Preparing repository and encryption state.", phase="start")
+
+        for index, kind in enumerate(kinds):
+            created.append(
+                capture_backup_kind(
+                    settings=settings,
                     run_id=run_id,
-                    machine_id=settings.machine_id,
-                    machine_label=settings.machine_label,
-                    hostname=hostname(),
-                    created_at=now_rfc3339(),
-                    kind="portable_state",
-                    source_paths=port_includes,
-                    exclude_paths=port_excludes,
+                    kind=kind,
+                    kind_index=index,
+                    total_kinds=len(kinds),
                     chunk_size=chunk_size,
-                    archive_refs=refs,
-                    archive_plaintext_bytes=total_bytes,
-                    archive_sha256=archive_sha,
-                    metadata=port_meta,
-                    notes=["Virtual snapshot generated from full backup pass."] + list(port_meta.notes),
+                    machine_key_value=machine_key_value,
                 )
-                write_manifest(settings, port_manifest)
-                created.append(port_manifest.id)
-                
+            )
+
         if settings.peers_enabled and settings.peers:
-            update_stage("Syncing peers")
+            set_job_progress(93.0, "Syncing Constellation peers", detail="Copying encrypted repository namespaces to configured storage targets.", phase="sync")
             sync_peers(settings)
 
-        update_stage("Checking repository size limits")
-        enforce_repo_size_limit(settings)
+        set_job_progress(96.0, "Checking repository size limits", detail="Pruning old snapshots if the configured repository cap requires it.", phase="prune")
+        enforce_repo_size_limit(settings, already_locked=True)
 
         state = load_state()
         state.last_run_at = start_stamp
@@ -2990,6 +3066,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
         state.last_error = ""
         save_state(state)
 
+    set_job_progress(100.0, "Backup complete", detail="Full Recovery and Portable Migration restore points are ready.", phase="complete")
     return created
 
 def build_tar_restore_command(target: Path, member: Optional[str], excludes: Optional[List[str]] = None, includes: Optional[List[str]] = None) -> subprocess.Popen:
@@ -4953,7 +5030,6 @@ def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path
     if result.returncode != 0:
         raise AegisError(f"rsync pull failed for {peer.label or peer.ssh_target}: {result.stderr.strip()}")
 
-
 def sync_peers(settings: Settings) -> None:
     if not settings.peers_enabled or not settings.peers:
         return
@@ -4961,18 +5037,27 @@ def sync_peers(settings: Settings) -> None:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
     local_objects = repo / "objects" / settings.machine_id
     local_meta = repo / "machines" / settings.machine_id
+
     for peer in settings.peers:
         if not peer.enabled or not peer.ssh_target.strip():
             continue
-        update_stage(f"Syncing peer {peer.label or peer.ssh_target}")
+
+        label = peer.label or peer.ssh_target
+        update_stage(f"Syncing Constellation peer {label}")
         ensure_remote_repo(peer)
-        rsync_local_to_remote(local_objects, peer, f"objects/{settings.machine_id}")
-        rsync_local_to_remote(local_meta, peer, f"machines/{settings.machine_id}")
-        rsync_remote_to_local(peer, "objects", repo / "objects")
-        rsync_remote_to_local(peer, "machines", repo / "machines")
+
+        if peer.storage_target_enabled:
+            rsync_local_to_remote(local_objects, peer, f"objects/{settings.machine_id}")
+            rsync_local_to_remote(local_meta, peer, f"machines/{settings.machine_id}")
+
+        if peer.backup_source_enabled or peer.store_all_machines:
+            rsync_remote_to_local(peer, "objects", repo / "objects")
+            rsync_remote_to_local(peer, "machines", repo / "machines")
+
     state = load_state()
     state.last_sync_at = now_rfc3339()
     save_state(state)
+
 
 def dashboard() -> Dashboard:
     settings = load_settings()
@@ -5036,6 +5121,7 @@ def run_job(name: str, func):
     with RUNTIME.lock:
         if RUNTIME.current_job is not None:
             raise AegisError("Another job is already running.")
+        RUNTIME.job_started_monotonic = time.monotonic()
         RUNTIME.current_job = JobState(name=name, stage="Queued", started_at=now_rfc3339(), progress=None)
     log_line(f"{name} queued")
 
@@ -5128,10 +5214,12 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
                 "message": "Settings saved. Password set for encrypted restore.",
             }
         return {"ok": True, "message": "Settings saved."}
+    if action == "backup_preflight":
+        return {"ok": True, "info": backup_preflight_info(load_settings())}
     if action == "run_backup":
-        profile = normalize_backup_profile(request.get("profile", "both"))
-        run_job(f"Backup ({kind_label(profile)})", lambda: perform_backup(load_settings(), profile))
-        return {"ok": True, "message": "Backup started."}
+        profile = "both"
+        run_job("Backup Now", lambda: perform_backup(load_settings(), profile))
+        return {"ok": True, "message": "Backup started. Aegis will create Full Recovery and Portable Migration restore points."}
     if action == "run_export":
         snapshot_id = request["snapshot"]
         output = Path(request["output"])
@@ -5281,8 +5369,7 @@ def scheduler_loop():
                 if RUNTIME.current_job is not None:
                     continue
 
-            profile = normalize_backup_profile(settings.default_backup_profile)
-            run_job("Scheduled backup", lambda: perform_backup(load_settings(), profile))
+            run_job("Scheduled backup", lambda: perform_backup(load_settings(), "both"))
         except Exception as exc:
             log_line(f"Scheduler error: {exc}")
 
@@ -5497,6 +5584,7 @@ def print_status_json() -> int:
 
 def backup_now_command(profile: str, direct: bool) -> int:
     try:
+        profile = "both"
         if not direct:
             try:
                 response = send_daemon_request({"action": "run_backup", "profile": profile})
@@ -5672,6 +5760,52 @@ def sync_peers_command(direct: bool) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+
+def constellation_code_command() -> int:
+    try:
+        settings = load_settings()
+        print(local_constellation_pairing_code(settings))
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def constellation_add_peer_command(args) -> int:
+    try:
+        ensure_root()
+        settings = load_settings()
+        settings.peers_enabled = True
+
+        pairing_data = decode_constellation_pairing_code(args.pairing_code or "")
+        machine_value = args.machine_id or str(pairing_data.get("machine_id") or "")
+        label_value = args.label or str(pairing_data.get("machine_label") or "") or args.ssh_target
+        repo_value = args.repo_path or str(pairing_data.get("repo_path") or DEFAULT_REPO)
+
+        settings.peers.append(
+            PeerTarget(
+                enabled=True,
+                label=label_value,
+                ssh_target=args.ssh_target,
+                repo_path=repo_value,
+                port=int(args.port or 22),
+                identity_file=args.identity_file or "",
+                machine_id=machine_value,
+                backup_source_enabled=not bool(args.storage_only),
+                storage_target_enabled=not bool(args.source_only),
+                storage_limit_gb=int(args.storage_limit_gb or 0),
+                store_all_machines=not bool(args.no_store_all),
+                notes=args.notes or "",
+                pairing_code=args.pairing_code or "",
+            )
+        )
+        save_settings(settings)
+        install_or_update_host_service()
+        print(f"Added Constellation peer: {label_value}")
+        return 0
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 def gui_main() -> int:
     import tkinter as tk
@@ -7728,7 +7862,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sub.add_parser("list-disks")
 
     backup = sub.add_parser("backup-now")
-    backup.add_argument("--profile", choices=["full_recovery", "portable_state", "both"], default="both")
+    backup.add_argument("--profile", choices=["full_recovery", "portable_state", "both"], default="both", help=argparse.SUPPRESS)
     backup.add_argument("--direct", action="store_true")
 
     export = sub.add_parser("export-bundle")
@@ -7759,6 +7893,23 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     auth.add_argument("--user", required=True)
 
     sync = sub.add_parser("sync-peers")
+
+    sub.add_parser("constellation-code")
+
+    add_peer = sub.add_parser("constellation-add-peer")
+    add_peer.add_argument("--ssh-target", required=True)
+    add_peer.add_argument("--label")
+    add_peer.add_argument("--repo-path")
+    add_peer.add_argument("--port", type=int, default=22)
+    add_peer.add_argument("--identity-file", default="")
+    add_peer.add_argument("--machine-id", default="")
+    add_peer.add_argument("--pairing-code", default="")
+    add_peer.add_argument("--storage-limit-gb", type=int, default=0)
+    add_peer.add_argument("--storage-only", action="store_true")
+    add_peer.add_argument("--source-only", action="store_true")
+    add_peer.add_argument("--no-store-all", action="store_true")
+    add_peer.add_argument("--notes", default="")
+    
     sync.add_argument("--direct", action="store_true")
 
     return parser.parse_args(argv)
@@ -7792,6 +7943,10 @@ def main(argv: List[str]) -> int:
             return authorize_socket_command(args.user)
         if cmd == "sync-peers":
             return sync_peers_command(args.direct)
+        if cmd == "constellation-code":
+            return constellation_code_command()
+        if cmd == "constellation-add-peer":
+            return constellation_add_peer_command(args)
         raise AegisError(f"Unknown command: {cmd}")
     except AegisError as exc:
         print(str(exc), file=sys.stderr)
