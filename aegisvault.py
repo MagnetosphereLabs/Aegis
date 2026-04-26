@@ -65,7 +65,7 @@ MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
 PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
 BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
 BACKUP_JOB_KIND_ORDER = ["full_recovery", "portable_state"]
-
+SOCKET_GROUP = "aegisvault"
 
 @dataclass
 class ScheduleSettings:
@@ -756,7 +756,9 @@ def host_service_unit_text() -> str:
 
         [Service]
         Type=simple
-        ExecStartPre=/bin/mkdir -p /run/aegisvault
+        RuntimeDirectory=aegisvault
+        RuntimeDirectoryMode=0755
+        ExecStartPre=/usr/bin/install -d -m 0755 -o root -g {SOCKET_GROUP} /run/aegisvault
         ExecStart={python_bin} {app_path} daemon
         Restart=on-failure
         RestartSec=5
@@ -772,6 +774,7 @@ def host_service_unit_text() -> str:
 
 def install_or_update_host_service() -> None:
     ensure_root()
+    ensure_socket_group()
     unit_bytes = host_service_unit_text().encode("utf-8")
     current = SYSTEMD_SERVICE_PATH.read_bytes() if SYSTEMD_SERVICE_PATH.exists() else b""
     if current != unit_bytes:
@@ -989,6 +992,22 @@ def filter_portable_manual_packages(packages: List[str]) -> List[str]:
         filtered.append(package)
     return filtered
 
+ def ensure_socket_group() -> None:
+    ensure_root()
+    try:
+        grp.getgrnam(SOCKET_GROUP)
+    except KeyError:
+        run_command(["groupadd", "--system", SOCKET_GROUP], check=True, capture=True)
+
+
+def add_user_to_socket_group(user: str) -> None:
+    ensure_socket_group()
+    try:
+        pwd.getpwnam(user)
+    except KeyError as exc:
+        raise AegisError(f"Unknown user: {user}") from exc
+
+    run_command(["usermod", "-aG", SOCKET_GROUP, user], check=True, capture=True)
 
 def ensure_root() -> None:
     if os.geteuid() != 0:
@@ -5594,16 +5613,22 @@ def daemon_main() -> int:
     ensure_root()
     VAR_DIR.mkdir(parents=True, exist_ok=True)
     LEGACY_KEY_DIR.mkdir(parents=True, exist_ok=True)
-    Path("/run/aegisvault").mkdir(parents=True, exist_ok=True)
+    runtime_dir = Path("/run/aegisvault")
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(runtime_dir, 0o755)
+    
     if os.path.exists(SOCKET_PATH):
         os.unlink(SOCKET_PATH)
+    
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(SOCKET_PATH)
+    
     try:
-        gid = grp.getgrnam("aegisvault").gr_gid
+        gid = grp.getgrnam(SOCKET_GROUP).gr_gid
         os.chown(SOCKET_PATH, 0, gid)
-    except Exception:
-        pass
+    except KeyError:
+        log_line(f"Socket group {SOCKET_GROUP} is missing; desktop users may need administrator authorization.")
+    
     os.chmod(SOCKET_PATH, 0o660)
     server.listen(32)
     log_line("Daemon started.")
@@ -5715,6 +5740,9 @@ def authorize_socket_command(user: str) -> int:
         ensure_root()
         Path("/run/aegisvault").mkdir(parents=True, exist_ok=True)
 
+        ensure_socket_group()
+        add_user_to_socket_group(user)
+        
         install_or_update_host_service()
         subprocess.run(["systemctl", "enable", "--now", "aegisvault.service"], check=False, capture_output=True)
 
@@ -5727,6 +5755,15 @@ def authorize_socket_command(user: str) -> int:
         if not Path(SOCKET_PATH).exists():
             raise AegisError("Aegis daemon socket was not created.")
 
+        try:
+            gid = grp.getgrnam(SOCKET_GROUP).gr_gid
+            os.chown(SOCKET_PATH, 0, gid)
+        except KeyError:
+            pass
+        
+        os.chmod(SOCKET_PATH, 0o660)
+        os.chmod("/run/aegisvault", 0o755)
+        
         if shutil.which("setfacl"):
             result = subprocess.run(
                 ["setfacl", "-m", f"user:{user}:rw", SOCKET_PATH],
@@ -5734,11 +5771,18 @@ def authorize_socket_command(user: str) -> int:
                 text=True,
             )
             if result.returncode != 0:
-                os.chmod(SOCKET_PATH, 0o666)
+                print(
+                    "Aegis background access was enabled for future logins. "
+                    "Log out and back in if the app cannot connect immediately."
+                )
+                return 0
         else:
-            os.chmod(SOCKET_PATH, 0o666)
-
-        os.chmod("/run/aegisvault", 0o755)
+            print(
+                "Aegis background access was enabled for future logins. "
+                "Log out and back in if the app cannot connect immediately."
+            )
+            return 0
+        
         print("Socket access granted.")
         return 0
     except Exception as exc:
