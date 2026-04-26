@@ -6389,7 +6389,12 @@ def gui_main() -> int:
                 wraplength=980,
             ).pack(side="left", fill="x", expand=True)
 
-            self.activity_bar = ttk.Progressbar(footer, mode="indeterminate", length=180)
+            self.activity_bar = ttk.Progressbar(
+                footer,
+                mode="indeterminate",
+                length=180,
+                style="Aegis.Horizontal.TProgressbar",
+            )
             # Hidden while idle. It is packed only when a job is actually running.
 
             if self.recovery_mode and os.geteuid() == 0:
@@ -6562,6 +6567,19 @@ def gui_main() -> int:
                 gripcount=0,
             )
             style.map("Vertical.TScrollbar", background=[("active", "#1a2330"), ("!active", "#11161d")])
+            
+            style.configure(
+                "Aegis.Horizontal.TProgressbar",
+                background="#3fb950",
+                troughcolor="#0b0f14",
+                bordercolor="#243041",
+                lightcolor="#3fb950",
+                darkcolor="#3fb950",
+            )
+            style.map(
+                "Aegis.Horizontal.TProgressbar",
+                background=[("active", "#56d364"), ("!active", "#3fb950")],
+            )
 
         def format_timestamp(self, ts: str) -> str:
             try:
@@ -6903,7 +6921,12 @@ def gui_main() -> int:
             ).grid(row=1, column=0, sticky="ew", pady=(6, 14))
 
             ttk.Label(body, textvariable=self.backup_progress_stage_var).grid(row=2, column=0, sticky="w")
-            self.backup_progress_bar = ttk.Progressbar(body, mode="determinate", maximum=100)
+            self.backup_progress_bar = ttk.Progressbar(
+                body,
+                mode="determinate",
+                maximum=100,
+                style="Aegis.Horizontal.TProgressbar",
+            )
             self.backup_progress_bar.grid(row=3, column=0, sticky="ew", pady=(8, 10))
 
             details = ttk.Frame(body)
