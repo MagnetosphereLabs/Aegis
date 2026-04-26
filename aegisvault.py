@@ -2984,9 +2984,20 @@ def stream_archive_from_repo(
 
 
 class RepoWriter:
-    def __init__(self, repo: Path, machine: str, chunk_size: int, key: Optional[bytes], io_yield_ms: int) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        repo: Path,
+        machine: str,
+        chunk_size: int,
+        key: Optional[bytes],
+        io_yield_ms: int,
+        protected_snapshot_ids: Optional[Set[str]] = None,
+    ) -> None:
+        self.settings = settings
         self.repo = repo
         self.machine = machine
+        self.protected_snapshot_ids = set(protected_snapshot_ids or set())
         # Ensure chunk size is perfectly aligned to 512-byte tar blocks
         self.chunk_size = (chunk_size // 512) * 512
         # Target an 80% threshold to search for natural file boundaries
@@ -3041,8 +3052,18 @@ class RepoWriter:
         digest = sha256_hex(plaintext)
         obj = object_path(self.repo, self.machine, digest)
         if not obj.exists():
-            obj.parent.mkdir(parents=True, exist_ok=True)
             encoded = object_encode(plaintext, self.key)
+
+            if self.settings.max_repo_size_gb > 0:
+                prune_repo_for_incoming_bytes(
+                    self.settings,
+                    self.repo,
+                    len(encoded),
+                    protected_snapshot_ids=self.protected_snapshot_ids,
+                    protected_hashes={ref.hash for ref in self.refs},
+                )
+
+            obj.parent.mkdir(parents=True, exist_ok=True)
             atomic_write(obj, encoded, mode=0o600)
         self.refs.append(ChunkRef(hash=digest, plain_len=len(plaintext)))
         if self.io_yield_ms:
@@ -3159,9 +3180,21 @@ def build_tar_backup_command(includes: List[str], excludes: List[str]) -> List[s
 
 
 def write_manifest(settings: Settings, manifest: SnapshotManifest) -> None:
-    path = manifest_path(Path(settings.repo_path), manifest.machine_id, manifest.id)
+    repo = Path(settings.repo_path)
+    path = manifest_path(repo, manifest.machine_id, manifest.id)
     payload = asdict(manifest)
-    save_json(path, payload, mode=0o600)
+    payload_bytes = json.dumps(payload, indent=2, sort_keys=False).encode("utf-8")
+
+    if settings.max_repo_size_gb > 0:
+        prune_repo_for_incoming_bytes(
+            settings,
+            repo,
+            len(payload_bytes),
+            protected_snapshot_ids={manifest.id},
+            protected_hashes={ref.hash for ref in manifest.archive_refs},
+        )
+
+    atomic_write(path, payload_bytes, mode=0o600)
 
 
 def find_snapshot_manifest(repo: Path, snapshot_id: str) -> SnapshotManifest:
@@ -3197,24 +3230,38 @@ def prune_empty_dirs(path: Path, stop_at: Path) -> None:
         current = current.parent
 
 
-def _delete_snapshot_from_repo_locked(settings: Settings, repo: Path, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
+def _delete_snapshot_from_repo_locked(
+    settings: Settings,
+    repo: Path,
+    snapshot_id: str,
+    protected_hashes: Optional[Set[str]] = None,
+) -> Tuple[SnapshotManifest, int]:
     manifest, manifest_file = find_snapshot_manifest_with_path(repo, snapshot_id)
     candidate_hashes = {ref.hash for ref in manifest.archive_refs}
 
-    manifest_file.unlink(missing_ok=True)
-
-    remaining_hashes: Set[str] = set()
+    remaining_hashes: Set[str] = set(protected_hashes or set())
     snapshots_dir = repo_machine_dir(repo, manifest.machine_id) / "snapshots"
+
     if snapshots_dir.exists():
         for path in snapshots_dir.glob("*.json"):
+            if path == manifest_file:
+                continue
+
             try:
                 other = snapshot_from_dict(load_json(path))
-                remaining_hashes.update(ref.hash for ref in other.archive_refs)
-            except Exception:
-                continue
+            except Exception as exc:
+                raise AegisError(
+                    f"Cannot safely delete snapshot because another snapshot manifest "
+                    f"could not be read: {path.name}: {exc}"
+                ) from exc
+
+            remaining_hashes.update(ref.hash for ref in other.archive_refs)
+
+    manifest_file.unlink(missing_ok=True)
 
     removed_objects = 0
     machine_objects_root = repo / "objects" / manifest.machine_id
+
     for hash_hex in sorted(candidate_hashes - remaining_hashes):
         obj = object_path(repo, manifest.machine_id, hash_hex)
         if obj.exists():
@@ -3249,7 +3296,52 @@ def get_repo_size_bytes(repo_path: Path) -> int:
 def repo_size_limit_bytes(settings: Settings) -> int:
     return max(0, int(settings.max_repo_size_gb)) * 1024 * 1024 * 1024
 
+def prune_repo_for_incoming_bytes(
+    settings: Settings,
+    repo: Path,
+    incoming_bytes: int,
+    protected_snapshot_ids: Optional[Set[str]] = None,
+    protected_hashes: Optional[Set[str]] = None,
+) -> None:
+    limit_bytes = repo_size_limit_bytes(settings)
+    if limit_bytes <= 0:
+        return
 
+    incoming = max(0, int(incoming_bytes))
+    protected_snapshot_ids = set(protected_snapshot_ids or set())
+    protected_hashes = set(protected_hashes or set())
+
+    if incoming > limit_bytes:
+        raise AegisError(
+            f"The repository cap is {human_bytes(limit_bytes)}, but one new backup chunk needs "
+            f"{human_bytes(incoming)}. Increase Maximum repository size GB or lower the chunk size."
+        )
+
+    while get_repo_size_bytes(repo) + incoming > limit_bytes:
+        snapshots = [
+            snap for snap in list_snapshots(settings)
+            if str(snap.get("id") or "") not in protected_snapshot_ids
+        ]
+
+        if not snapshots:
+            raise AegisError(
+                f"Aegis cannot keep the repository under {human_bytes(limit_bytes)}. "
+                f"The next backup needs {human_bytes(incoming)} more, but there are no older backups "
+                "left that can be safely deleted. Increase Maximum repository size GB or delete/export backups manually."
+            )
+
+        oldest_id = str(snapshots[-1].get("id") or "")
+        if not oldest_id:
+            raise AegisError("Could not identify the oldest backup to prune.")
+
+        update_stage(f"Making room for the next backup by deleting oldest backup {oldest_id}")
+        _delete_snapshot_from_repo_locked(
+            settings,
+            repo,
+            oldest_id,
+            protected_hashes=protected_hashes,
+        )
+ 
 def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
     repo_size = get_repo_size_bytes(repo)
@@ -3343,6 +3435,7 @@ def capture_backup_kind(
     total_kinds: int,
     chunk_size: int,
     machine_key_value: Optional[bytes],
+    protected_snapshot_ids: Optional[Set[str]] = None,
 ) -> str:
     kind_label_text = kind_label(kind)
     kind_span = 88.0 / max(1, total_kinds)
@@ -3368,7 +3461,15 @@ def capture_backup_kind(
         phase=kind,
     )
 
-    writer = RepoWriter(Path(settings.repo_path), settings.machine_id, chunk_size, machine_key_value, settings.io_yield_ms)
+    writer = RepoWriter(
+        settings,
+        Path(settings.repo_path),
+        settings.machine_id,
+        chunk_size,
+        machine_key_value,
+        settings.io_yield_ms,
+        protected_snapshot_ids=protected_snapshot_ids,
+    )
     cmd = build_tar_backup_command(includes, excludes)
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.stdout is not None
@@ -3457,18 +3558,30 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
         run_id = f"{utc_tag()}-{random_suffix(3)}"
         set_job_progress(1.0, "Starting backup", detail="Preparing repository and encryption state.", phase="start")
 
-        for index, kind in enumerate(kinds):
-            created.append(
-                capture_backup_kind(
-                    settings=settings,
-                    run_id=run_id,
-                    kind=kind,
-                    kind_index=index,
-                    total_kinds=len(kinds),
-                    chunk_size=chunk_size,
-                    machine_key_value=machine_key_value,
-                )
+        protected_snapshot_ids: Set[str] = set()
+
+        if settings.max_repo_size_gb > 0:
+            set_job_progress(
+                0.5,
+                "Preparing repository size limit",
+                detail="Deleting older backups first if the repository is already over the configured cap.",
+                phase="prune",
             )
+            enforce_repo_size_limit(settings, already_locked=True)
+
+        for index, kind in enumerate(kinds):
+            snapshot_id = capture_backup_kind(
+                settings=settings,
+                run_id=run_id,
+                kind=kind,
+                kind_index=index,
+                total_kinds=len(kinds),
+                chunk_size=chunk_size,
+                machine_key_value=machine_key_value,
+                protected_snapshot_ids=protected_snapshot_ids,
+            )
+            created.append(snapshot_id)
+            protected_snapshot_ids.add(snapshot_id)
 
         if settings.peers_enabled and settings.peers:
             set_job_progress(93.0, "Syncing Constellation peers", detail="Copying encrypted repository namespaces to configured storage targets.", phase="sync")
@@ -6268,6 +6381,7 @@ def gui_main() -> int:
             self.root.geometry("1320x860")
             self.root.minsize(1120, 760)
             self.configure_theme()
+            self.install_global_mousewheel_support()
 
             self.message_var = tk.StringVar(value="")
             self.status_var = tk.StringVar(value="Loading…")
@@ -6343,7 +6457,7 @@ def gui_main() -> int:
             self.recovery_usb_device_var = tk.StringVar(value="")
             self.guided_target_disk_var = tk.StringVar(value="")
             
-            self.repo_size_var = tk.StringVar(value="Unique Repository Size: Calculating...")
+            self.repo_size_var = tk.StringVar(value="Storage used by all backups: calculating...")
 
             self.peer_label_var = tk.StringVar()
             
@@ -6581,6 +6695,62 @@ def gui_main() -> int:
                 background=[("active", "#56d364"), ("!active", "#3fb950")],
             )
 
+        def install_global_mousewheel_support(self) -> None:
+            def scrollable_widget_under_pointer(event):
+                widget = self.root.winfo_containing(event.x_root, event.y_root)
+
+                while widget is not None and widget is not self.root:
+                    if hasattr(widget, "yview"):
+                        try:
+                            first, last = widget.yview()
+                            if float(first) <= 0.0 and float(last) >= 1.0:
+                                widget = getattr(widget, "master", None)
+                                continue
+                        except Exception:
+                            pass
+                        return widget
+
+                    widget = getattr(widget, "master", None)
+
+                return None
+
+            def on_mousewheel(event):
+                widget = scrollable_widget_under_pointer(event)
+                if widget is None:
+                    return None
+
+                if getattr(event, "num", None) == 4:
+                    amount = -3
+                elif getattr(event, "num", None) == 5:
+                    amount = 3
+                else:
+                    delta = int(getattr(event, "delta", 0))
+                    if delta == 0:
+                        return None
+                    amount = int(-1 * (delta / 120))
+                    if amount == 0:
+                        amount = -1 if delta > 0 else 1
+
+                try:
+                    if hasattr(widget, "yview_scroll"):
+                        widget.yview_scroll(amount, "units")
+                    else:
+                        widget.yview("scroll", amount, "units")
+                    return "break"
+                except Exception:
+                    return None
+
+            self.root.bind_all("<MouseWheel>", on_mousewheel, add="+")
+            self.root.bind_all("<Button-4>", on_mousewheel, add="+")
+            self.root.bind_all("<Button-5>", on_mousewheel, add="+")
+
+        def repository_size_explainer(self, total_disk: int) -> str:
+            return (
+                f"Storage used by all backups together: {human_bytes(total_disk)} unique data. "
+                "Unchanged files are shared between backups, so many restore points can take much less space "
+                "than adding up the Restore Size column."
+            )
+     
         def format_timestamp(self, ts: str) -> str:
             try:
                 # Converts "2026-04-23T10:24:12Z" to "April 23, 2026 at 10:24 AM"
@@ -6690,7 +6860,7 @@ def gui_main() -> int:
             ttk.Label(frame, text="Custom minutes").grid(row=9, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(frame, textvariable=self.schedule_custom_var, width=12).grid(row=9, column=1, sticky="w", pady=(12, 0))
 
-            ttk.Label(frame, text="I/O yield milliseconds per chunk").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Label(frame, text="I/O pause per chunk (ms)").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=10, column=1, sticky="w", pady=(12, 0))
 
             ttk.Checkbutton(
@@ -6777,7 +6947,8 @@ def gui_main() -> int:
         def ask_string_dialog(self, title: str, prompt: str, show: str = "") -> Optional[str]:
             dialog = tk.Toplevel(self.root)
             dialog.title(title)
-            dialog.geometry("500x220")
+            dialog.geometry("500x255")
+            dialog.minsize(500, 255)
             dialog.configure(bg="#0e1116")
             dialog.transient(self.root)
             dialog.grab_set()
@@ -6787,7 +6958,7 @@ def gui_main() -> int:
             # Center window over parent
             dialog.update_idletasks()
             x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 250
-            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 110
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 128
             dialog.geometry(f"+{x}+{y}")
 
             ttk.Label(dialog, text=prompt, wraplength=460, style="Muted.TLabel").pack(pady=(20, 10), padx=20, fill="x")
@@ -6848,26 +7019,8 @@ def gui_main() -> int:
                 canvas.itemconfigure(window_id, width=event.width)
                 update_scrollregion()
         
-            def on_mousewheel(event) -> None:
-                bbox = canvas.bbox("all")
-                if not bbox:
-                    return
-                content_height = bbox[3] - bbox[1]
-                if content_height <= canvas.winfo_height():
-                    return
-                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        
-            def on_linux_scroll_up(event) -> None:
-                canvas.yview_scroll(-3, "units")
-        
-            def on_linux_scroll_down(event) -> None:
-                canvas.yview_scroll(3, "units")
-        
             content.bind("<Configure>", update_scrollregion)
             canvas.bind("<Configure>", resize_content)
-            canvas.bind_all("<MouseWheel>", on_mousewheel)
-            canvas.bind_all("<Button-4>", on_linux_scroll_up)
-            canvas.bind_all("<Button-5>", on_linux_scroll_down)
         
             canvas.configure(yscrollcommand=scrollbar.set)
             canvas.pack(side="left", fill="both", expand=True)
@@ -7053,12 +7206,19 @@ def gui_main() -> int:
                 style="Muted.TLabel",
             ).grid(row=1, column=0, sticky="w", pady=(6, 0))
 
+            ttk.Label(
+                controls,
+                textvariable=self.repo_size_var,
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=2, column=0, sticky="w", pady=(10, 0))
+
             ttk.Button(
                 controls,
                 text="Backup Now",
                 style="Primary.TButton",
                 command=self.start_backup,
-            ).grid(row=2, column=0, padx=(0, 8), pady=(14, 0), sticky="w")
+            ).grid(row=3, column=0, padx=(0, 8), pady=(14, 0), sticky="w")
 
             snaps = ttk.Frame(self.backup_tab)
             snaps.pack(fill="both", expand=True, pady=(18, 0))
@@ -7074,9 +7234,15 @@ def gui_main() -> int:
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
             ttk.Label(export, text="Export selected backup as an encrypted file", style="Header.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-            ttk.Label(export, text="New bundle password").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=1, column=1, sticky="w", pady=(12, 0))
-            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=2, column=1, sticky="w", pady=(14, 0))
+            ttk.Label(
+                export,
+                text="Optional. This creates one password-protected .avb file for manual restore situations, copying a backup somewhere else, or keeping a standalone archive outside the normal backup repository.",
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ttk.Label(export, text="New bundle password").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(export, textvariable=self.export_password_var, show="*", width=34).grid(row=2, column=1, sticky="w", pady=(12, 0))
+            ttk.Button(export, text="Choose Output and Export", command=self.export_selected_bundle).grid(row=3, column=1, sticky="w", pady=(14, 0))
 
         def build_restore_tab(self) -> None:
             if self.recovery_mode:
@@ -7094,7 +7260,13 @@ def gui_main() -> int:
                 ttk.Entry(source_row, textvariable=self.repo_source_var, state="readonly").grid(row=0, column=0, sticky="ew")
                 ttk.Button(source_row, text="Choose Backup Drive", style="Compact.TButton", command=self.choose_and_use_repo_source).grid(row=0, column=1, padx=(8, 0))
 
-                ttk.Label(wizard, textvariable=self.repo_size_var, foreground="#9fb3c8", font=("TkDefaultFont", 10, "italic")).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
+                ttk.Label(
+                    wizard,
+                    textvariable=self.repo_size_var,
+                    wraplength=1080,
+                    foreground="#9fb3c8",
+                    font=("TkDefaultFont", 10, "italic"),
+                ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
                 self.restore_tree = self.build_snapshot_table(wizard)
                 self.restore_tree.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=(0, 14))
@@ -7145,12 +7317,18 @@ def gui_main() -> int:
                 ttk.Label(desktop, text="Backup Timeline", style="Header.TLabel").grid(row=5, column=0, columnspan=3, sticky="w")
                 ttk.Label(
                     desktop,
-                    text="Aegis deduplicates backup chunks. Unique Repository Size is stored data; Restore Size is how much that point-in-time backup would stream back during restore.",
+                    text="Each row is a point in time backup. Restore Size shows how much data that one backup can restore. Storage used by all backups shows the real disk space used after Aegis shares unchanged data between backups.",
                     wraplength=1080,
                     style="Muted.TLabel",
                 ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(4, 2))
 
-                ttk.Label(desktop, textvariable=self.repo_size_var, foreground="#165dcb", font=("TkDefaultFont", 10, "bold")).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 6))
+                ttk.Label(
+                    desktop,
+                    textvariable=self.repo_size_var,
+                    wraplength=1080,
+                    foreground="#9fb3c8",
+                    font=("TkDefaultFont", 10, "bold"),
+                ).grid(row=7, column=0, columnspan=3, sticky="w", pady=(0, 6))
                 
                 self.restore_tree = self.build_snapshot_table(desktop)
                 self.restore_tree.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
@@ -7166,7 +7344,11 @@ def gui_main() -> int:
             ttk.Label(hero, text="Constellation", style="Header.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 hero,
-                text="Connect your own machines so they can back each other up and store encrypted backup data. Add one machine at a time; advanced SSH details stay inside the add/edit wizard.",
+                text=(
+                    "Connect your own machines so they can copy encrypted backup data to each other. "
+                    "Simple setup: open Aegis on the other machine, copy its pairing code, click Add Machine here, "
+                    "paste the code, enter its SSH target like user@host, then Save Constellation and Sync Now."
+                ),
                 wraplength=1080,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -7316,7 +7498,7 @@ def gui_main() -> int:
             ttk.Label(schedule, text="Custom minutes").grid(row=3, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.schedule_custom_var, width=12).grid(row=3, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(schedule, text="I/O yield milliseconds per chunk").grid(row=4, column=0, sticky="w", pady=(10, 0))
+            ttk.Label(schedule, text="I/O pause per chunk (ms)").grid(row=4, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
 
             ttk.Label(schedule, text="Maximum repository size GB").grid(row=5, column=0, sticky="w", pady=(10, 0))
@@ -7984,7 +8166,11 @@ def gui_main() -> int:
             ttk.Label(body, text="Machine", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", padx=18, pady=(18, 4))
             ttk.Label(
                 body,
-                text="Give this machine a friendly name, then provide the SSH target Aegis should use to sync encrypted repository data.",
+                text=(
+                    "Paste the other machine's pairing code first if you have it. Then enter the SSH target "
+                    "Aegis should connect to, usually user@hostname or user@ip-address. The pairing code identifies "
+                    "the machine; SSH is what actually moves the encrypted backup data."
+                ),
                 wraplength=690,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, columnspan=3, sticky="w", padx=18, pady=(0, 14))
@@ -7995,7 +8181,7 @@ def gui_main() -> int:
             ttk.Label(body, text="SSH target").grid(row=3, column=0, sticky="w", padx=(18, 12), pady=6)
             ttk.Entry(body, textvariable=target_var).grid(row=3, column=1, columnspan=2, sticky="ew", padx=(0, 18), pady=6)
         
-            ttk.Label(body, text="Pairing code").grid(row=4, column=0, sticky="w", padx=(18, 12), pady=6)
+            ttk.Label(body, text="Other machine pairing code").grid(row=4, column=0, sticky="w", padx=(18, 12), pady=6)
             pairing_row = ttk.Frame(body)
             pairing_row.grid(row=4, column=1, columnspan=2, sticky="ew", padx=(0, 18), pady=6)
             pairing_row.grid_columnconfigure(0, weight=1)
@@ -8544,7 +8730,7 @@ def gui_main() -> int:
 
             total_disk = payload.get("repo_size_bytes", 0)
             if hasattr(self, "repo_size_var"):
-                self.repo_size_var.set(f"Unique Repository Size: {human_bytes(total_disk)}")
+                self.repo_size_var.set(self.repository_size_explainer(int(total_disk or 0)))
             
             self.apply_configuration_state(bool(settings.get("onboarding_complete", False)))
 
@@ -8904,7 +9090,7 @@ def gui_main() -> int:
                     "notes": values[8],
                     "machine_id": values[9],
                     "enabled": values[10] == "yes",
-                    "store_all_machines": True,
+                    "store_all_machines": values[11] == "yes",
                     "pairing_code": "",
                 })
             return peers
@@ -8945,6 +9131,7 @@ def gui_main() -> int:
                 notes,
                 machine_id_value,
                 "yes",
+                "yes" if self.peer_store_all_var.get() else "no",
             )
             if selected:
                 self.settings_peers_tree.item(selected[0], values=values)
@@ -9014,7 +9201,7 @@ def gui_main() -> int:
                         "identity_file": values[7],
                         "notes": values[8],
                         "machine_id": values[9],
-                        "store_all_machines": True,
+                        "store_all_machines": values[11] == "yes",
                         "pairing_code": "",
                     })
 
