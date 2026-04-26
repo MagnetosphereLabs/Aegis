@@ -1174,7 +1174,8 @@ def filter_portable_manual_packages(packages: List[str]) -> List[str]:
         filtered.append(package)
     return filtered
 
- def ensure_socket_group() -> None:
+
+def ensure_socket_group() -> None:
     ensure_root()
     try:
         grp.getgrnam(SOCKET_GROUP)
