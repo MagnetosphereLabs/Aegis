@@ -322,7 +322,15 @@ BACKUP_PROFILE_LABELS = {
 EXTERNAL_BACKUP_ROOT_PREFIXES = ("/media/", "/mnt/", "/run/media/")
 SYSTEMD_SERVICE_PATH = Path("/etc/systemd/system/aegisvault.service")
 
-
+DESKTOP_APP_ID = "aegisvault"
+DESKTOP_ENTRY_PATH = Path(f"/usr/share/applications/{DESKTOP_APP_ID}.desktop")
+DESKTOP_ICON_NAME = "drive-harddisk"
+NOTIFICATION_URGENCY_BYTE = {
+    "low": 0,
+    "normal": 1,
+    "critical": 2,
+}
+ 
 def normalize_backup_profile(value: str) -> str:
     return value if value in BACKUP_PROFILE_LABELS else "both"
 
@@ -771,10 +779,55 @@ def host_service_unit_text() -> str:
         """
     ).strip() + "\n"
 
+def desktop_entry_text() -> str:
+    python_bin = sys.executable
+    app_path = str(Path(__file__).resolve())
+
+    return textwrap.dedent(
+        f"""
+        [Desktop Entry]
+        Type=Application
+        Name={APP_NAME}
+        Comment=Encrypted Linux backup and restore
+        Exec={python_bin} {app_path} gui
+        Icon={DESKTOP_ICON_NAME}
+        Terminal=false
+        Categories=System;Utility;Archiving;
+        StartupNotify=true
+        StartupWMClass={APP_NAME}
+        """
+    ).strip() + "\n"
+
+
+def install_desktop_integration() -> None:
+    ensure_root()
+
+    entry_bytes = desktop_entry_text().encode("utf-8")
+    current = DESKTOP_ENTRY_PATH.read_bytes() if DESKTOP_ENTRY_PATH.exists() else b""
+
+    if current != entry_bytes:
+        atomic_write(DESKTOP_ENTRY_PATH, entry_bytes, mode=0o644)
+
+        update_desktop_database = shutil.which("update-desktop-database")
+        if update_desktop_database:
+            subprocess.run(
+                [update_desktop_database, str(DESKTOP_ENTRY_PATH.parent)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+    # notify-send is still the best lowest-friction CLI bridge on Debian desktops.
+    # Do not hard-fail if apt is unavailable; direct D-Bus fallback below may still work.
+    if not shutil.which("notify-send") and shutil.which("apt-get"):
+        subprocess.run(["apt-get", "update"], check=False, capture_output=True, text=True)
+        subprocess.run(["apt-get", "install", "-y", "libnotify-bin"], check=False, capture_output=True, text=True)
 
 def install_or_update_host_service() -> None:
     ensure_root()
     ensure_socket_group()
+    install_desktop_integration()
+
     unit_bytes = host_service_unit_text().encode("utf-8")
     current = SYSTEMD_SERVICE_PATH.read_bytes() if SYSTEMD_SERVICE_PATH.exists() else b""
     if current != unit_bytes:
@@ -803,34 +856,163 @@ def desktop_notification_recipients() -> List[Tuple[str, int]]:
     return recipients
 
 
-def send_desktop_notification(title: str, body: str, urgency: str = "normal") -> None:
+def _desktop_env_for_user(user_name: str, uid: int) -> List[str]:
+    runtime_dir = f"/run/user/{uid}"
+
+    env_values = [
+        f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
+        f"XDG_RUNTIME_DIR={runtime_dir}",
+        f"USER={user_name}",
+        f"LOGNAME={user_name}",
+    ]
+
+    try:
+        home = pwd.getpwnam(user_name).pw_dir
+        if home:
+            env_values.append(f"HOME={home}")
+    except KeyError:
+        pass
+
+    return env_values
+
+
+def _run_as_desktop_user(user_name: str, uid: int, command: List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [
+            "runuser",
+            "-u",
+            user_name,
+            "--",
+            "env",
+            *_desktop_env_for_user(user_name, uid),
+            *command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+
+
+def _send_notification_with_notify_send(
+    user_name: str,
+    uid: int,
+    title: str,
+    body: str,
+    urgency: str,
+) -> bool:
     binary = shutil.which("notify-send")
     if not binary:
+        return False
+
+    result = _run_as_desktop_user(
+        user_name,
+        uid,
+        [
+            binary,
+            "-a",
+            APP_NAME,
+            "-i",
+            DESKTOP_ICON_NAME,
+            "-u",
+            urgency if urgency in {"low", "normal", "critical"} else "normal",
+            "-h",
+            f"string:desktop-entry:{DESKTOP_APP_ID}",
+            "-h",
+            "string:category:transfer",
+            title,
+            body,
+        ],
+    )
+
+    if result.returncode == 0:
+        return True
+
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+    log_line(f"notify-send failed for {user_name}: {detail}")
+    return False
+
+
+def _gvariant_string(value: str) -> str:
+    return json.dumps(str(value))
+
+
+def _send_notification_with_gdbus(
+    user_name: str,
+    uid: int,
+    title: str,
+    body: str,
+    urgency: str,
+) -> bool:
+    binary = shutil.which("gdbus")
+    if not binary:
+        return False
+
+    urgency_byte = NOTIFICATION_URGENCY_BYTE.get(urgency, 1)
+    hints = (
+        "{"
+        f"'desktop-entry': <{_gvariant_string(DESKTOP_APP_ID)}>, "
+        f"'category': <'transfer'>, "
+        f"'urgency': <byte {urgency_byte}>"
+        "}"
+    )
+
+    result = _run_as_desktop_user(
+        user_name,
+        uid,
+        [
+            binary,
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify",
+            APP_NAME,
+            "0",
+            DESKTOP_ICON_NAME,
+            title,
+            body,
+            "[]",
+            hints,
+            "-1",
+        ],
+    )
+
+    if result.returncode == 0:
+        return True
+
+    detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+    log_line(f"gdbus notification failed for {user_name}: {detail}")
+    return False
+
+
+def send_desktop_notification(title: str, body: str, urgency: str = "normal") -> None:
+    recipients = desktop_notification_recipients()
+    if not recipients:
+        log_line("No active desktop notification recipients found.")
         return
 
-    for user_name, uid in desktop_notification_recipients():
-        runtime_dir = f"/run/user/{uid}"
-        subprocess.run(
-            [
-                "runuser",
-                "-u",
-                user_name,
-                "--",
-                "env",
-                f"DBUS_SESSION_BUS_ADDRESS=unix:path={runtime_dir}/bus",
-                f"XDG_RUNTIME_DIR={runtime_dir}",
-                binary,
-                "-a",
-                APP_NAME,
-                "-u",
-                urgency,
-                title,
-                body,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+    delivered = False
+
+    for user_name, uid in recipients:
+        runtime_bus = Path(f"/run/user/{uid}/bus")
+        if not runtime_bus.exists():
+            log_line(f"Skipping desktop notification for {user_name}: no session bus.")
+            continue
+
+        if _send_notification_with_notify_send(user_name, uid, title, body, urgency):
+            delivered = True
+            continue
+
+        if _send_notification_with_gdbus(user_name, uid, title, body, urgency):
+            delivered = True
+            continue
+
+    if not delivered:
+        log_line("Desktop notification was not delivered to any active desktop session.")
 
 class AegisError(Exception):
     pass
@@ -5403,6 +5585,13 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
     action = request.get("action")
     if action == "dashboard":
         return {"ok": True, "dashboard": asdict(dashboard())}
+    if action == "test_notification":
+        send_desktop_notification(
+            "Aegis notifications are working",
+            "Backup alerts will appear here when jobs start, finish, or need attention.",
+            urgency="normal",
+        )
+        return {"ok": True, "message": "Test notification sent. If you did not see it, check Aegis logs and your desktop notification settings."}
     if action == "save_settings":
         previous_settings = load_settings()
         settings = settings_from_dict(request["settings"])
@@ -7062,7 +7251,23 @@ def gui_main() -> int:
 
             ttk.Checkbutton(general, text="Encrypt backups", variable=self.encryption_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
             ttk.Checkbutton(general, text="Apply package list after portable restore to /", variable=self.apply_packages_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
-            ttk.Checkbutton(general, text="Show desktop notifications", variable=self.notifications_enabled_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+            notification_row = ttk.Frame(general)
+            notification_row.grid(row=5, column=0, columnspan=3, sticky="w", pady=(10, 0))
+
+            ttk.Checkbutton(
+                notification_row,
+                text="Show desktop notifications",
+                variable=self.notifications_enabled_var,
+            ).pack(side="left")
+
+            ttk.Button(
+                notification_row,
+                text="Send Test Notification",
+                style="Compact.TButton",
+                command=self.test_notifications,
+            ).pack(side="left", padx=(12, 0))
+
             ttk.Label(
                 general,
                 text="Backup Now and scheduled backups always create Full Recovery and Portable Migration restore points. Deduplication keeps shared data efficient.",
@@ -8261,6 +8466,17 @@ def gui_main() -> int:
             if not response.get("ok"):
                 raise AegisError(response.get("error", "Unknown daemon error"))
             return dict(response.get("info") or {})
+
+        def test_notifications(self) -> None:
+            try:
+                response = send_daemon_request({"action": "test_notification"})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+
+                self.message_var.set(response.get("message", "Test notification sent."))
+                self.root.after(500, self.refresh_dashboard)
+            except Exception as exc:
+                self.message_var.set(str(exc))
 
         def mark_restore_started(self, message: str) -> None:
             self.last_seen_error = ""
