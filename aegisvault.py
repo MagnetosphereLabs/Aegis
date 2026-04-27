@@ -36,6 +36,8 @@ from typing import Any, Dict, List, Optional, Tuple, Set
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 import getpass
+import ipaddress
+import shlex
 import re
 
 
@@ -66,6 +68,16 @@ PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
 BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
 BACKUP_JOB_KIND_ORDER = ["full_recovery", "portable_state"]
 SOCKET_GROUP = "aegisvault"
+CONSTELLATION_DIR = VAR_DIR / "constellation"
+CONSTELLATION_KEY_PATH = CONSTELLATION_DIR / "id_ed25519"
+CONSTELLATION_PUBLIC_KEY_PATH = CONSTELLATION_DIR / "id_ed25519.pub"
+CONSTELLATION_KNOWN_HOSTS_PATH = CONSTELLATION_DIR / "known_hosts"
+CONSTELLATION_BRIDGE_PATH = Path("/usr/local/libexec/aegisvault-ssh-bridge")
+CONSTELLATION_SSHD_DROPIN_PATH = Path("/etc/ssh/sshd_config.d/99-aegisvault-constellation.conf")
+CONSTELLATION_AUTH_MARKER = "aegisvault-constellation"
+CONSTELLATION_CODE_PREFIX = "AEGIS-"
+CONSTELLATION_DEFAULT_SSH_USER = "root"
+CONSTELLATION_DEFAULT_SSH_PORT = 22
 
 @dataclass
 class ScheduleSettings:
@@ -93,7 +105,7 @@ class PeerTarget:
     label: str = ""
     ssh_target: str = ""
     repo_path: str = DEFAULT_REPO
-    port: int = 22
+    port: int = CONSTELLATION_DEFAULT_SSH_PORT
     identity_file: str = ""
     machine_id: str = ""
     backup_source_enabled: bool = True
@@ -102,6 +114,12 @@ class PeerTarget:
     store_all_machines: bool = True
     notes: str = ""
     pairing_code: str = ""
+    transport: str = "ssh"
+    public_key: str = ""
+    connection_hint: str = ""
+    last_status: str = ""
+    last_error: str = ""
+    last_checked_at: str = ""
 
 
 @dataclass
@@ -1062,31 +1080,484 @@ def machine_id() -> str:
 def hostname() -> str:
     return socket.gethostname()
 
-def local_constellation_pairing_code(settings: Settings) -> str:
-    payload = {
-        "version": 1,
-        "app": APP_NAME,
-        "machine_id": settings.machine_id or machine_id(),
-        "machine_label": settings.machine_label or hostname(),
-        "hostname": hostname(),
-        "repo_path": settings.repo_path or DEFAULT_REPO,
-        "created_at": now_rfc3339(),
-    }
+def _b64_json_encode(payload: Dict[str, Any]) -> str:
     raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
 
-def decode_constellation_pairing_code(code: str) -> Dict[str, Any]:
-    cleaned = str(code or "").strip()
+def _b64_json_decode(value: str) -> Dict[str, Any]:
+    cleaned = str(value or "").strip()
+    if cleaned.startswith(CONSTELLATION_CODE_PREFIX):
+        cleaned = cleaned[len(CONSTELLATION_CODE_PREFIX):]
+    cleaned = "".join(cleaned.split())
     if not cleaned:
         return {}
     padding = "=" * ((4 - len(cleaned) % 4) % 4)
     try:
-        payload = base64.urlsafe_b64decode((cleaned + padding).encode("ascii"))
-        data = json.loads(payload.decode("utf-8"))
+        raw = base64.urlsafe_b64decode((cleaned + padding).encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def safe_constellation_label(value: str, fallback: str = "device") -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in str(value or "").strip())
+    cleaned = cleaned.strip("-_.")
+    return cleaned[:64] or fallback
+
+
+def constellation_identity_comment(settings: Optional[Settings] = None) -> str:
+    current_settings = settings or load_settings()
+    return f"{APP_NAME}-{safe_constellation_label(current_settings.machine_label or hostname())}-{short_machine(current_settings.machine_id or machine_id())}"
+
+
+def ensure_constellation_identity(settings: Optional[Settings] = None) -> str:
+    ensure_root()
+    current_settings = settings or load_settings()
+    CONSTELLATION_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONSTELLATION_DIR, 0o700)
+
+    if not CONSTELLATION_KEY_PATH.exists() or not CONSTELLATION_PUBLIC_KEY_PATH.exists():
+        ssh_keygen = shutil.which("ssh-keygen")
+        if not ssh_keygen:
+            ensure_host_packages(["openssh-client"])
+            ssh_keygen = shutil.which("ssh-keygen")
+        if not ssh_keygen:
+            raise AegisError("ssh-keygen is required for Constellation setup.")
+        run_command(
+            [
+                ssh_keygen,
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                constellation_identity_comment(current_settings),
+                "-f",
+                str(CONSTELLATION_KEY_PATH),
+            ],
+            check=True,
+            capture=True,
+        )
+
+    os.chmod(CONSTELLATION_KEY_PATH, 0o600)
+    os.chmod(CONSTELLATION_PUBLIC_KEY_PATH, 0o644)
+    public_key = CONSTELLATION_PUBLIC_KEY_PATH.read_text(encoding="utf-8", errors="ignore").strip()
+    if not public_key.startswith("ssh-"):
+        raise AegisError("Aegis Constellation public key is invalid.")
+    return public_key
+
+
+def local_ipv4_addresses() -> List[str]:
+    found: List[str] = []
+
+    raw_json = run_command_optional(["ip", "-j", "-4", "addr", "show", "scope", "global"])
+    try:
+        payload = json.loads(raw_json) if raw_json else []
+    except Exception:
+        payload = []
+
+    if isinstance(payload, list):
+        for item in payload:
+            for addr in item.get("addr_info") or []:
+                candidate = str(addr.get("local") or "").strip()
+                if candidate:
+                    found.append(candidate)
+
+    for token in run_command_optional(["hostname", "-I"]).split():
+        if token.strip():
+            found.append(token.strip())
+
+    clean: List[str] = []
+    for candidate in found:
+        try:
+            ip = ipaddress.ip_address(candidate.split("/", 1)[0])
+        except ValueError:
+            continue
+        if ip.version != 4:
+            continue
+        if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
+            continue
+        clean.append(str(ip))
+    return dedupe(clean)
+
+
+def constellation_host_candidates() -> List[str]:
+    name = hostname().strip()
+    values: List[str] = []
+    if name:
+        values.append(name)
+        if "." not in name:
+            values.append(f"{name}.local")
+    values.extend(local_ipv4_addresses())
+    return dedupe([value for value in values if value])
+
+
+def preferred_constellation_host() -> str:
+    candidates = constellation_host_candidates()
+    for candidate in candidates:
+        if candidate.endswith(".local"):
+            return candidate
+    return candidates[0] if candidates else hostname()
+
+
+def constellation_ssh_targets() -> List[str]:
+    return [f"{CONSTELLATION_DEFAULT_SSH_USER}@{host}" for host in constellation_host_candidates()]
+
+
+def constellation_bridge_text() -> str:
+    return textwrap.dedent(
+        f'''\
+        #!/usr/bin/env python3
+        import json
+        import os
+        import shlex
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        SETTINGS_PATH = Path({str(CONFIG_PATH)!r})
+        DEFAULT_REPO = {DEFAULT_REPO!r}
+
+        def fail(message, code=126):
+            print(message, file=sys.stderr)
+            raise SystemExit(code)
+
+        def load_repo_path():
+            try:
+                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                repo = str(data.get("repo_path") or DEFAULT_REPO)
+            except Exception:
+                repo = DEFAULT_REPO
+            return str(Path(repo).resolve())
+
+        def under_repo(path_value, repo_root):
+            try:
+                path = Path(path_value).resolve()
+                root = Path(repo_root).resolve()
+                return path == root or root in path.parents
+            except Exception:
+                return False
+
+        def validate_repo_path(path_value, repo_root):
+            if not path_value or "\x00" in path_value:
+                fail("Invalid Aegis repository path.")
+            if not under_repo(path_value, repo_root):
+                fail("Aegis Constellation refused access outside the configured repository.")
+
+        def main():
+            repo_root = load_repo_path()
+            original = os.environ.get("SSH_ORIGINAL_COMMAND", "").strip()
+
+            if not original or original == "aegisvault-probe":
+                print(json.dumps({{"ok": True, "app": "{APP_NAME}", "repo_path": repo_root}}))
+                return 0
+
+            try:
+                tokens = shlex.split(original)
+            except ValueError as exc:
+                fail(f"Invalid Aegis command: {{exc}}")
+
+            if not tokens:
+                print(json.dumps({{"ok": True, "app": "{APP_NAME}", "repo_path": repo_root}}))
+                return 0
+
+            if tokens[0] == "aegisvault-prepare":
+                target = tokens[1] if len(tokens) > 1 else repo_root
+                validate_repo_path(target, repo_root)
+                Path(target, "objects").mkdir(parents=True, exist_ok=True)
+                Path(target, "machines").mkdir(parents=True, exist_ok=True)
+                return 0
+
+            if tokens[0] == "mkdir":
+                paths = []
+                after_double_dash = False
+                for token in tokens[1:]:
+                    if token == "--":
+                        after_double_dash = True
+                        continue
+                    if token.startswith("-") and not after_double_dash:
+                        continue
+                    paths.append(token)
+                if not paths:
+                    fail("Aegis Constellation mkdir had no paths.")
+                for path in paths:
+                    validate_repo_path(path, repo_root)
+                    Path(path).mkdir(parents=True, exist_ok=True)
+                return 0
+
+            if len(tokens) >= 2 and tokens[0] == "rsync" and tokens[1] == "--server":
+                absolute_paths = [token for token in tokens if token.startswith("/")]
+                if not absolute_paths:
+                    fail("Aegis Constellation rsync did not name an absolute repository path.")
+                for path in absolute_paths:
+                    validate_repo_path(path, repo_root)
+                result = subprocess.run(tokens)
+                return int(result.returncode)
+
+            fail("Aegis Constellation allows only probe, repository preparation, and rsync.")
+
+        if __name__ == "__main__":
+            raise SystemExit(main())
+        '''
+    )
+
+
+def install_constellation_bridge() -> None:
+    ensure_root()
+    CONSTELLATION_BRIDGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(CONSTELLATION_BRIDGE_PATH, constellation_bridge_text().encode("utf-8"), mode=0o755)
+
+
+def best_effort_allow_ssh_firewall() -> None:
+    if shutil.which("ufw"):
+        status = run_command_optional(["ufw", "status"]).lower()
+        if "status: active" in status:
+            subprocess.run(["ufw", "allow", "OpenSSH"], check=False, capture_output=True, text=True)
+
+    if shutil.which("firewall-cmd"):
+        active = subprocess.run(["firewall-cmd", "--state"], check=False, capture_output=True, text=True)
+        if active.returncode == 0:
+            subprocess.run(["firewall-cmd", "--permanent", "--add-service=ssh"], check=False, capture_output=True, text=True)
+            subprocess.run(["firewall-cmd", "--reload"], check=False, capture_output=True, text=True)
+
+
+def ensure_constellation_ssh_server() -> None:
+    ensure_root()
+    ensure_host_packages(["openssh-server", "openssh-client", "rsync", "avahi-daemon"])
+    install_constellation_bridge()
+
+    if CONSTELLATION_SSHD_DROPIN_PATH.parent.exists():
+        dropin = textwrap.dedent(
+            """\
+            # Managed by Aegis Constellation.
+            # Aegis uses key-only root SSH entries with a forced command that only permits repository sync.
+            PubkeyAuthentication yes
+            PermitRootLogin prohibit-password
+            """
+        )
+        atomic_write(CONSTELLATION_SSHD_DROPIN_PATH, dropin.encode("utf-8"), mode=0o644)
+
+    root_ssh = Path("/root/.ssh")
+    root_ssh.mkdir(parents=True, exist_ok=True)
+    os.chmod(root_ssh, 0o700)
+    auth_file = root_ssh / "authorized_keys"
+    if not auth_file.exists():
+        atomic_write(auth_file, b"", mode=0o600)
+    else:
+        os.chmod(auth_file, 0o600)
+
+    for service in ("ssh", "sshd"):
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "enable", "--now", service], check=False, capture_output=True, text=True)
+            subprocess.run(["systemctl", "reload", service], check=False, capture_output=True, text=True)
+
+    if shutil.which("systemctl"):
+        subprocess.run(["systemctl", "enable", "--now", "avahi-daemon"], check=False, capture_output=True, text=True)
+
+    best_effort_allow_ssh_firewall()
+
+
+def constellation_endpoint_info(settings: Optional[Settings] = None) -> Dict[str, Any]:
+    current_settings = settings or load_settings()
+    public_key = ensure_constellation_identity(current_settings)
+    hosts = constellation_host_candidates()
+    preferred_host = preferred_constellation_host()
+    ssh_targets = [f"{CONSTELLATION_DEFAULT_SSH_USER}@{host}" for host in hosts]
+    preferred_target = f"{CONSTELLATION_DEFAULT_SSH_USER}@{preferred_host}" if preferred_host else ""
+    key_stamp = int(CONSTELLATION_PUBLIC_KEY_PATH.stat().st_mtime) if CONSTELLATION_PUBLIC_KEY_PATH.exists() else 0
+
+    return {
+        "version": 2,
+        "kind": "aegis-constellation-device",
+        "app": APP_NAME,
+        "machine_id": current_settings.machine_id or machine_id(),
+        "machine_label": current_settings.machine_label or hostname(),
+        "hostname": hostname(),
+        "repo_path": current_settings.repo_path or DEFAULT_REPO,
+        "ssh_user": CONSTELLATION_DEFAULT_SSH_USER,
+        "port": CONSTELLATION_DEFAULT_SSH_PORT,
+        "public_key": public_key,
+        "preferred_host": preferred_host,
+        "preferred_ssh_target": preferred_target,
+        "ssh_targets": ssh_targets,
+        "addresses": local_ipv4_addresses(),
+        "code_id": sha256_hex(public_key.encode("utf-8"))[:16],
+        "key_created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(key_stamp)) if key_stamp else "",
+    }
+
+
+def prepare_constellation_endpoint(settings: Optional[Settings] = None) -> Dict[str, Any]:
+    ensure_root()
+    current_settings = settings or load_settings()
+    ensure_constellation_ssh_server()
+    info = constellation_endpoint_info(current_settings)
+    code = local_constellation_pairing_code(current_settings)
+    return {
+        "ok": True,
+        "info": info,
+        "code": code,
+        "message": "This device is ready for Constellation pairing.",
+    }
+
+
+def local_constellation_pairing_code(settings: Settings) -> str:
+    info = constellation_endpoint_info(settings)
+    return CONSTELLATION_CODE_PREFIX + _b64_json_encode(info)
+
+
+def decode_constellation_pairing_code(code: str) -> Dict[str, Any]:
+    data = _b64_json_decode(code)
+    if not data:
+        return {}
+
+    # Backward compatibility with old v1 codes.
+    if int(data.get("version") or 1) == 1 and data.get("app") == APP_NAME:
+        data.setdefault("kind", "aegis-constellation-device")
+        data.setdefault("port", CONSTELLATION_DEFAULT_SSH_PORT)
+        data.setdefault("ssh_user", CONSTELLATION_DEFAULT_SSH_USER)
+        host_value = str(data.get("hostname") or "").strip()
+        if host_value:
+            data.setdefault("preferred_host", host_value)
+            data.setdefault("preferred_ssh_target", f"{CONSTELLATION_DEFAULT_SSH_USER}@{host_value}")
+            data.setdefault("ssh_targets", [f"{CONSTELLATION_DEFAULT_SSH_USER}@{host_value}"])
+        return data
+
+    if data.get("kind") != "aegis-constellation-device" or data.get("app") != APP_NAME:
+        return {}
+    return data
+
+
+def constellation_authorized_key_line(public_key: str, remote_machine_id: str, label: str) -> str:
+    key = str(public_key or "").strip()
+    if not key.startswith("ssh-") or "\n" in key:
+        raise AegisError("The pasted device card does not contain a valid SSH public key.")
+
+    marker = f"{CONSTELLATION_AUTH_MARKER}:{safe_constellation_label(remote_machine_id, 'unknown')}:{safe_constellation_label(label, 'device')}"
+    options = (
+        f'command="{CONSTELLATION_BRIDGE_PATH}",'
+        "no-agent-forwarding,no-X11-forwarding,no-port-forwarding,no-pty"
+    )
+    return f"{options} {key} {marker}\n"
+
+
+def install_constellation_authorized_key(public_key: str, remote_machine_id: str, label: str) -> None:
+    ensure_root()
+    install_constellation_bridge()
+    root_ssh = Path("/root/.ssh")
+    root_ssh.mkdir(parents=True, exist_ok=True)
+    os.chmod(root_ssh, 0o700)
+    auth_file = root_ssh / "authorized_keys"
+    existing = auth_file.read_text(encoding="utf-8", errors="ignore").splitlines() if auth_file.exists() else []
+
+    machine_marker = f"{CONSTELLATION_AUTH_MARKER}:{safe_constellation_label(remote_machine_id, 'unknown')}:"
+    key_prefix = " ".join(str(public_key or "").strip().split()[:2])
+    kept: List[str] = []
+    for line in existing:
+        if machine_marker in line:
+            continue
+        if key_prefix and key_prefix in line and CONSTELLATION_AUTH_MARKER in line:
+            continue
+        kept.append(line)
+
+    kept.append(constellation_authorized_key_line(public_key, remote_machine_id, label).rstrip("\n"))
+    atomic_write(auth_file, ("\n".join(kept).strip() + "\n").encode("utf-8"), mode=0o600)
+
+
+def constellation_role_flags(role: str) -> Tuple[bool, bool, bool, str]:
+    normalized = str(role or "mirror").strip().lower()
+    if normalized in {"backup_to_peer", "send_only", "this_to_that"}:
+        return False, True, False, "This device backs up to the other device."
+    if normalized in {"pull_from_peer", "receive_only", "that_to_this"}:
+        return True, False, True, "This device stores backups from the other device."
+    if normalized in {"storage_hub", "hub"}:
+        return True, True, True, "This device treats the other device as a storage hub and shared backup source."
+    return True, True, True, "Mirror backup data both ways."
+
+
+def peer_from_constellation_card(data: Dict[str, Any], role: str, storage_limit_gb: int = 0) -> PeerTarget:
+    if not data:
+        raise AegisError("Paste a valid Aegis device card.")
+
+    remote_machine_id = str(data.get("machine_id") or "").strip()
+    if not remote_machine_id:
+        raise AegisError("The pasted device card is missing a machine ID.")
+    if remote_machine_id == machine_id():
+        raise AegisError("That is this device's own Constellation card. Open Aegis on the other device and copy its card instead.")
+
+    public_key = str(data.get("public_key") or "").strip()
+    if not public_key.startswith("ssh-"):
+        raise AegisError("The pasted device card is missing its Aegis public key. Click Prepare This Device on the other computer and copy the new card.")
+
+    backup_source, storage_target, store_all, note = constellation_role_flags(role)
+    label = str(data.get("machine_label") or data.get("hostname") or remote_machine_id or "Aegis device").strip()
+    repo_path = str(data.get("repo_path") or DEFAULT_REPO).strip() or DEFAULT_REPO
+    port = int(data.get("port") or CONSTELLATION_DEFAULT_SSH_PORT)
+
+    targets = [str(value).strip() for value in (data.get("ssh_targets") or []) if str(value).strip()]
+    preferred = str(data.get("preferred_ssh_target") or "").strip()
+    if preferred:
+        targets.insert(0, preferred)
+    ssh_target = dedupe(targets)[0] if dedupe(targets) else f"{CONSTELLATION_DEFAULT_SSH_USER}@{data.get('hostname') or data.get('preferred_host') or ''}"
+    if not ssh_target or ssh_target.endswith("@"):
+        raise AegisError("The pasted device card does not contain a usable address. Use Advanced Settings after adding the device to enter a VPN, VPS, NAS, or hostname target.")
+
+    return PeerTarget(
+        enabled=True,
+        label=label,
+        ssh_target=ssh_target,
+        repo_path=repo_path,
+        port=port,
+        identity_file=str(CONSTELLATION_KEY_PATH),
+        machine_id=remote_machine_id,
+        backup_source_enabled=backup_source,
+        storage_target_enabled=storage_target,
+        storage_limit_gb=max(0, int(storage_limit_gb or 0)),
+        store_all_machines=store_all,
+        notes=note,
+        pairing_code=CONSTELLATION_CODE_PREFIX + _b64_json_encode(data),
+        transport="ssh",
+        public_key=public_key,
+        connection_hint=", ".join(dedupe(targets)[:4]),
+        last_status="paired",
+        last_error="",
+        last_checked_at=now_rfc3339(),
+    )
+
+
+def upsert_constellation_peer(settings: Settings, peer: PeerTarget) -> None:
+    replaced = False
+    for index, existing in enumerate(settings.peers):
+        same_machine = peer.machine_id and existing.machine_id == peer.machine_id
+        same_target = peer.ssh_target and existing.ssh_target == peer.ssh_target
+        if same_machine or same_target:
+            settings.peers[index] = peer
+            replaced = True
+            break
+    if not replaced:
+        settings.peers.append(peer)
+    settings.peers_enabled = True
+
+
+def trust_constellation_device_card(code: str, role: str = "mirror", storage_limit_gb: int = 0) -> Dict[str, Any]:
+    ensure_root()
+    settings = load_settings()
+    prepare_constellation_endpoint(settings)
+
+    data = decode_constellation_pairing_code(code)
+    peer = peer_from_constellation_card(data, role, storage_limit_gb)
+    install_constellation_authorized_key(peer.public_key, peer.machine_id, peer.label)
+    upsert_constellation_peer(settings, peer)
+    save_settings(settings)
+    install_or_update_host_service()
+
+    return {
+        "ok": True,
+        "peer": asdict(peer),
+        "message": f"{peer.label} is trusted. For two-way sync, paste this computer's device card into Aegis on {peer.label} too.",
+        "local_code": local_constellation_pairing_code(settings),
+    }
 
 def human_bytes(value: int) -> str:
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
@@ -1456,7 +1927,7 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
                 label=str(peer.get("label", "")),
                 ssh_target=str(peer.get("ssh_target", "")),
                 repo_path=str(peer.get("repo_path") or DEFAULT_REPO),
-                port=int(peer.get("port", 22)),
+                port=int(peer.get("port", CONSTELLATION_DEFAULT_SSH_PORT)),
                 identity_file=str(peer.get("identity_file") or ""),
                 machine_id=str(peer.get("machine_id") or ""),
                 backup_source_enabled=bool(peer.get("backup_source_enabled", True)),
@@ -1465,6 +1936,12 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
                 store_all_machines=bool(peer.get("store_all_machines", True)),
                 notes=str(peer.get("notes") or ""),
                 pairing_code=str(peer.get("pairing_code") or ""),
+                transport=str(peer.get("transport") or "ssh"),
+                public_key=str(peer.get("public_key") or ""),
+                connection_hint=str(peer.get("connection_hint") or ""),
+                last_status=str(peer.get("last_status") or ""),
+                last_error=str(peer.get("last_error") or ""),
+                last_checked_at=str(peer.get("last_checked_at") or ""),
             )
             for peer in peers_data
         ],
@@ -3585,7 +4062,7 @@ def perform_backup(settings: Settings, profile: str) -> List[str]:
 
         if settings.peers_enabled and settings.peers:
             set_job_progress(93.0, "Syncing Constellation peers", detail="Copying encrypted repository namespaces to configured storage targets.", phase="sync")
-            sync_peers(settings)
+            sync_peers(settings, raise_on_error=False)
 
         set_job_progress(96.0, "Checking repository size limits", detail="Pruning old snapshots if the configured repository cap requires it.", phase="prune")
         enforce_repo_size_limit(settings, already_locked=True)
@@ -5521,36 +5998,114 @@ def restore_from_bundle_url(url: str, password: str, target: Path, member: Optio
         temp.unlink(missing_ok=True)
 
 
+
 def ssh_base_args(peer: PeerTarget) -> List[str]:
-    args = ["ssh", "-p", str(peer.port)]
-    if peer.identity_file:
-        args.extend(["-i", peer.identity_file])
+    args = [
+        "ssh",
+        "-p",
+        str(peer.port or CONSTELLATION_DEFAULT_SSH_PORT),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"UserKnownHostsFile={CONSTELLATION_KNOWN_HOSTS_PATH}",
+    ]
+    identity = peer.identity_file or str(CONSTELLATION_KEY_PATH)
+    if identity:
+        args.extend(["-i", identity])
     return args
 
 
 def rsync_ssh_command(peer: PeerTarget) -> str:
-    base = f"ssh -p {peer.port}"
-    if peer.identity_file:
-        base += f" -i {peer.identity_file}"
-    return base
+    return " ".join(shlex.quote(part) for part in ssh_base_args(peer))
 
 
 def ensure_remote_repo(peer: PeerTarget) -> None:
-    cmd = ssh_base_args(peer) + [peer.ssh_target, f"mkdir -p '{peer.repo_path}/objects' '{peer.repo_path}/machines'"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    repo = peer.repo_path.rstrip("/") or DEFAULT_REPO
+    command = "mkdir -p -- " + " ".join(
+        shlex.quote(value)
+        for value in [f"{repo}/objects", f"{repo}/machines"]
+    )
+    cmd = ssh_base_args(peer) + [peer.ssh_target, command]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
     if result.returncode != 0:
-        raise AegisError(f"Failed to prepare peer {peer.label or peer.ssh_target}: {result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise AegisError(f"Failed to prepare peer {peer.label or peer.ssh_target}: {detail}")
 
 
 def rsync_local_to_remote(local_path: Path, peer: PeerTarget, remote_subdir: str) -> None:
     if not local_path.exists():
         return
     remote = f"{peer.ssh_target}:{peer.repo_path.rstrip('/')}/{remote_subdir.rstrip('/')}/"
-    cmd = ["rsync", "-a", "-e", rsync_ssh_command(peer), f"{str(local_path).rstrip('/')}/", remote]
+    cmd = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--protect-args",
+        "-e",
+        rsync_ssh_command(peer),
+        f"{str(local_path).rstrip('/')}/",
+        remote,
+    ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        raise AegisError(f"rsync push failed for {peer.label or peer.ssh_target}: {result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise AegisError(f"rsync push failed for {peer.label or peer.ssh_target}: {detail}")
 
+
+def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path) -> None:
+    local_path.mkdir(parents=True, exist_ok=True)
+    remote = f"{peer.ssh_target}:{peer.repo_path.rstrip('/')}/{remote_subdir.rstrip('/')}/"
+    cmd = [
+        "rsync",
+        "-a",
+        "--partial",
+        "--protect-args",
+        "-e",
+        rsync_ssh_command(peer),
+        remote,
+        f"{str(local_path).rstrip('/')}/",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        raise AegisError(f"rsync pull failed for {peer.label or peer.ssh_target}: {detail}")
+
+
+def test_constellation_peer(peer: PeerTarget) -> Dict[str, Any]:
+    if not peer.enabled:
+        return {"ok": False, "message": "Peer is disabled."}
+    if not peer.ssh_target.strip():
+        return {"ok": False, "message": "Peer has no connection target."}
+
+    cmd = ssh_base_args(peer) + [peer.ssh_target, "aegisvault-probe"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "message": "Connection timed out."}
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        return {"ok": False, "message": detail}
+
+    payload = {}
+    try:
+        payload = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
+    except Exception:
+        payload = {}
+
+    return {
+        "ok": True,
+        "message": "Connection works.",
+        "detail": payload,
+    }
 
 def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path) -> None:
     local_path.mkdir(parents=True, exist_ok=True)
@@ -5560,33 +6115,54 @@ def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path
     if result.returncode != 0:
         raise AegisError(f"rsync pull failed for {peer.label or peer.ssh_target}: {result.stderr.strip()}")
 
-def sync_peers(settings: Settings) -> None:
+def sync_peers(settings: Settings, raise_on_error: bool = True) -> None:
     if not settings.peers_enabled or not settings.peers:
         return
 
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
     local_objects = repo / "objects" / settings.machine_id
     local_meta = repo / "machines" / settings.machine_id
+    errors: List[str] = []
 
     for peer in settings.peers:
         if not peer.enabled or not peer.ssh_target.strip():
             continue
 
         label = peer.label or peer.ssh_target
-        update_stage(f"Syncing Constellation peer {label}")
-        ensure_remote_repo(peer)
+        try:
+            update_stage(f"Syncing Constellation peer {label}")
+            ensure_remote_repo(peer)
 
-        if peer.storage_target_enabled:
-            rsync_local_to_remote(local_objects, peer, f"objects/{settings.machine_id}")
-            rsync_local_to_remote(local_meta, peer, f"machines/{settings.machine_id}")
+            if peer.storage_target_enabled:
+                rsync_local_to_remote(local_objects, peer, f"objects/{settings.machine_id}")
+                rsync_local_to_remote(local_meta, peer, f"machines/{settings.machine_id}")
 
-        if peer.backup_source_enabled or peer.store_all_machines:
-            rsync_remote_to_local(peer, "objects", repo / "objects")
-            rsync_remote_to_local(peer, "machines", repo / "machines")
+            if peer.backup_source_enabled or peer.store_all_machines:
+                rsync_remote_to_local(peer, "objects", repo / "objects")
+                rsync_remote_to_local(peer, "machines", repo / "machines")
+
+            peer.last_status = "ok"
+            peer.last_error = ""
+            peer.last_checked_at = now_rfc3339()
+            log_line(f"Constellation sync finished for {label}")
+        except Exception as exc:
+            message = f"{label}: {exc}"
+            peer.last_status = "error"
+            peer.last_error = str(exc)
+            peer.last_checked_at = now_rfc3339()
+            log_line(f"Constellation sync warning: {message}")
+            errors.append(message)
+            if raise_on_error:
+                break
+
+    save_settings(settings)
 
     state = load_state()
     state.last_sync_at = now_rfc3339()
     save_state(state)
+
+    if errors and raise_on_error:
+        raise AegisError("Constellation sync needs attention: " + "; ".join(errors))
 
 
 def dashboard() -> Dashboard:
@@ -5884,8 +6460,35 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise AegisError("Provide a bundle file or URL.")
         return {"ok": True, "message": "Guided full restore started."}
+    if action == "constellation_prepare":
+        payload = prepare_constellation_endpoint(load_settings())
+        return {
+            "ok": True,
+            "message": payload.get("message", "This device is ready for Constellation."),
+            "code": payload.get("code", ""),
+            "info": payload.get("info", {}),
+        }
+    if action == "constellation_trust_code":
+        code = str(request.get("code") or "").strip()
+        role = str(request.get("role") or "mirror").strip()
+        storage_limit_gb = int(request.get("storage_limit_gb") or 0)
+        payload = trust_constellation_device_card(code, role=role, storage_limit_gb=storage_limit_gb)
+        return payload
+    if action == "constellation_test_peer":
+        index = int(request.get("index") or 0)
+        settings = load_settings()
+        if index < 0 or index >= len(settings.peers):
+            raise AegisError("Choose a Constellation device first.")
+        result = test_constellation_peer(settings.peers[index])
+        settings.peers[index].last_status = "ok" if result.get("ok") else "error"
+        settings.peers[index].last_error = "" if result.get("ok") else str(result.get("message") or "Connection failed.")
+        settings.peers[index].last_checked_at = now_rfc3339()
+        save_settings(settings)
+        if not result.get("ok"):
+            raise AegisError(str(result.get("message") or "Connection failed."))
+        return {"ok": True, "message": result.get("message", "Connection works."), "detail": result.get("detail", {})}
     if action == "sync_peers":
-        run_job("Peer sync", lambda: sync_peers(load_settings()))
+        run_job("Peer sync", lambda: sync_peers(load_settings(), raise_on_error=True))
         return {"ok": True, "message": "Peer sync started."}
     raise AegisError(f"Unknown action: {action}")
 
@@ -6325,8 +6928,9 @@ def sync_peers_command(direct: bool) -> int:
 
 def constellation_code_command() -> int:
     try:
-        settings = load_settings()
-        print(local_constellation_pairing_code(settings))
+        ensure_root()
+        payload = prepare_constellation_endpoint(load_settings())
+        print(payload["code"])
         return 0
     except Exception as exc:
         print(str(exc), file=sys.stderr)
@@ -6336,34 +6940,45 @@ def constellation_code_command() -> int:
 def constellation_add_peer_command(args) -> int:
     try:
         ensure_root()
+        role = "mirror"
+        if bool(args.storage_only):
+            role = "pull_from_peer"
+        elif bool(args.source_only):
+            role = "backup_to_peer"
+
+        if args.pairing_code:
+            payload = trust_constellation_device_card(
+                args.pairing_code,
+                role=role,
+                storage_limit_gb=int(args.storage_limit_gb or 0),
+            )
+            peer = payload.get("peer", {})
+            print(f"Added Constellation device: {peer.get('label') or peer.get('ssh_target')}")
+            return 0
+
         settings = load_settings()
         settings.peers_enabled = True
-
-        pairing_data = decode_constellation_pairing_code(args.pairing_code or "")
-        machine_value = args.machine_id or str(pairing_data.get("machine_id") or "")
-        label_value = args.label or str(pairing_data.get("machine_label") or "") or args.ssh_target
-        repo_value = args.repo_path or str(pairing_data.get("repo_path") or DEFAULT_REPO)
-
         settings.peers.append(
             PeerTarget(
                 enabled=True,
-                label=label_value,
+                label=args.label or args.ssh_target,
                 ssh_target=args.ssh_target,
-                repo_path=repo_value,
-                port=int(args.port or 22),
-                identity_file=args.identity_file or "",
-                machine_id=machine_value,
+                repo_path=args.repo_path or DEFAULT_REPO,
+                port=int(args.port or CONSTELLATION_DEFAULT_SSH_PORT),
+                identity_file=args.identity_file or str(CONSTELLATION_KEY_PATH),
+                machine_id=args.machine_id or "",
                 backup_source_enabled=not bool(args.storage_only),
                 storage_target_enabled=not bool(args.source_only),
                 storage_limit_gb=int(args.storage_limit_gb or 0),
                 store_all_machines=not bool(args.no_store_all),
                 notes=args.notes or "",
-                pairing_code=args.pairing_code or "",
+                pairing_code="",
+                transport="ssh",
             )
         )
         save_settings(settings)
         install_or_update_host_service()
-        print(f"Added Constellation peer: {label_value}")
+        print(f"Added Constellation peer: {args.label or args.ssh_target}")
         return 0
     except Exception as exc:
         print(str(exc), file=sys.stderr)
@@ -6428,6 +7043,13 @@ def gui_main() -> int:
             self.peer_store_all_var = tk.BooleanVar(value=True)
             self.constellation_pairing_code_var = tk.StringVar(value="")
             self.constellation_summary_var = tk.StringVar(value="")
+            self.constellation_rendered_mode = ""
+            self.constellation_role_labels = {
+                "Mirror both ways": "mirror",
+                "Back up this device to the other device": "backup_to_peer",
+                "Store the other device's backups here": "pull_from_peer",
+                "Use the other device as a storage hub": "storage_hub",
+            }
             self.backup_progress_window: Optional[tk.Toplevel] = None
             self.backup_progress_bar: Optional[ttk.Progressbar] = None
             self.backup_progress_title_var = tk.StringVar(value="Backup not running")
@@ -7334,52 +7956,169 @@ def gui_main() -> int:
                 self.restore_tree.grid(row=8, column=0, columnspan=3, sticky="nsew", pady=(8, 0))
 
         def build_constellation_tab(self) -> None:
-            outer = self.make_scrollable_frame(self.constellation_tab)
+            self.constellation_shell = ttk.Frame(self.constellation_tab)
+            self.constellation_shell.pack(fill="both", expand=True)
+            self.render_constellation_tab(force=True)
+
+        def clear_widget_children(self, widget) -> None:
+            for child in widget.winfo_children():
+                child.destroy()
+
+        def constellation_is_configured(self) -> bool:
+            settings = self.dashboard_payload.get("settings", {}) if self.dashboard_payload else {}
+            return bool(settings.get("peers_enabled", False) and settings.get("peers", []))
+
+        def render_constellation_tab(self, force: bool = False) -> None:
+            if not hasattr(self, "constellation_shell"):
+                return
+
+            configured = self.constellation_is_configured()
+            mode = "configured" if configured else "setup"
+            if not force and self.constellation_rendered_mode == mode:
+                return
+
+            self.constellation_rendered_mode = mode
+            self.clear_widget_children(self.constellation_shell)
+
+            if configured:
+                self.build_constellation_configured_view(self.constellation_shell)
+            else:
+                self.build_constellation_setup_wizard(self.constellation_shell, in_dialog=False)
+
+        def make_constellation_code_box(self, parent, height: int = 4) -> ScrolledText:
+            box = ScrolledText(parent, height=height, wrap="word", bg="#151b23", fg="#e6edf3", insertbackground="#e6edf3", relief="flat")
+            self.style_scrolled_text(box)
+            return box
+
+        def copy_text_widget_to_clipboard(self, widget: ScrolledText, success_message: str = "Copied.") -> None:
+            text = widget.get("1.0", "end").strip()
+            if not text:
+                self.message_var.set("Nothing to copy yet.")
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.message_var.set(success_message)
+
+        def build_constellation_setup_wizard(self, parent, in_dialog: bool = False) -> None:
+            outer = self.make_scrollable_frame(parent) if not in_dialog else parent
             outer.grid_columnconfigure(0, weight=1)
-        
+
+            header = ttk.Frame(outer)
+            header.grid(row=0, column=0, sticky="ew", pady=(0, 16), padx=(0 if in_dialog else 0))
+            header.grid_columnconfigure(0, weight=1)
+            ttk.Label(header, text="Set up Constellation", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                header,
+                text="Connect your own Linux devices so Aegis can copy encrypted backup data between them. Do this once on each device you want to connect.",
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+            step1 = ttk.Frame(outer)
+            step1.grid(row=1, column=0, sticky="ew", pady=(0, 18))
+            step1.grid_columnconfigure(0, weight=1)
+            ttk.Label(step1, text="1. Prepare this device", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                step1,
+                text="Aegis will prepare safe sync access for this computer and create a device card you can paste into Aegis on another computer.",
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+
+            local_code_box = self.make_constellation_code_box(step1, height=5)
+            local_code_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+
+            step1_actions = ttk.Frame(step1)
+            step1_actions.grid(row=3, column=0, sticky="w")
+            ttk.Button(
+                step1_actions,
+                text="Prepare This Device",
+                style="Primary.TButton",
+                command=lambda: self.constellation_prepare_this_device(local_code_box),
+            ).pack(side="left")
+            ttk.Button(
+                step1_actions,
+                text="Copy Device Card",
+                style="Compact.TButton",
+                command=lambda: self.copy_text_widget_to_clipboard(local_code_box, "Device card copied. Paste it into Aegis on the other device."),
+            ).pack(side="left", padx=(8, 0))
+
+            step2 = ttk.Frame(outer)
+            step2.grid(row=2, column=0, sticky="ew", pady=(4, 18))
+            step2.grid_columnconfigure(0, weight=1)
+            ttk.Label(step2, text="2. Add another device", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                step2,
+                text="On the other device, click Prepare This Device, copy its card, and paste it here.",
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="w", pady=(4, 8))
+
+            remote_code_box = self.make_constellation_code_box(step2, height=5)
+            remote_code_box.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+
+            role_row = ttk.Frame(step2)
+            role_row.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+            role_row.grid_columnconfigure(1, weight=1)
+            ttk.Label(role_row, text="Sync role").grid(row=0, column=0, sticky="w", padx=(0, 12))
+            role_var = tk.StringVar(value="Mirror both ways")
+            ttk.Combobox(
+                role_row,
+                textvariable=role_var,
+                values=list(self.constellation_role_labels.keys()),
+                state="readonly",
+            ).grid(row=0, column=1, sticky="ew")
+
+            step2_actions = ttk.Frame(step2)
+            step2_actions.grid(row=4, column=0, sticky="w", pady=(10, 0))
+            ttk.Button(
+                step2_actions,
+                text="Trust and Add Device",
+                style="Primary.TButton",
+                command=lambda: self.constellation_trust_pasted_code(remote_code_box, role_var, None),
+            ).pack(side="left")
+
+            step3 = ttk.Frame(outer)
+            step3.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+            step3.grid_columnconfigure(0, weight=1)
+            ttk.Label(step3, text="3. Finish on both devices", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(
+                step3,
+                text="For two-way sync, repeat the same copy-paste on the other computer. Then click Sync Now. If a device is on another network, use a reachable storage hub, VPS, NAS, VPN hostname, or tunnel hostname as its advanced connection target.",
+                wraplength=1040,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="w", pady=(4, 10))
+            ttk.Button(step3, text="Sync Now", style="Compact.TButton", command=self.sync_peers_now).grid(row=2, column=0, sticky="w")
+
+        def build_constellation_configured_view(self, parent) -> None:
+            outer = self.make_scrollable_frame(parent)
+            outer.grid_columnconfigure(0, weight=1)
+
+            settings = self.dashboard_payload.get("settings", {}) if self.dashboard_payload else {}
+            peers = list(settings.get("peers", []) or [])
+            state = self.dashboard_payload.get("persistent", {}) if self.dashboard_payload else {}
+
             hero = ttk.Frame(outer)
             hero.grid(row=0, column=0, sticky="ew")
             hero.grid_columnconfigure(0, weight=1)
-        
             ttk.Label(hero, text="Constellation", style="Header.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 hero,
-                text=(
-                    "Connect your own machines so they can copy encrypted backup data to each other. "
-                    "Simple setup: open Aegis on the other machine, copy its pairing code, click Add Machine here, "
-                    "paste the code, enter its SSH target like user@host, then Save Constellation and Sync Now."
-                ),
-                wraplength=1080,
+                text=f"{len(peers)} device{'s' if len(peers) != 1 else ''} connected. Last sync: {state.get('last_sync_at') or 'never'}.",
+                wraplength=1040,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, sticky="w", pady=(6, 0))
-        
-            top_actions = ttk.Frame(hero)
-            top_actions.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(16, 0))
-            ttk.Checkbutton(top_actions, text="Enable Constellation", variable=self.peers_enabled_var).pack(anchor="e")
-            ttk.Button(top_actions, text="Sync Now", style="Compact.TButton", command=self.sync_peers_now).pack(anchor="e", pady=(8, 0))
-        
-            pairing = ttk.Frame(outer)
-            pairing.grid(row=1, column=0, sticky="ew", pady=(22, 0))
-            pairing.grid_columnconfigure(1, weight=1)
-        
-            ttk.Label(pairing, text="This machine", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
-            ttk.Label(pairing, text="Pairing code").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(10, 0))
-            ttk.Entry(pairing, textvariable=self.constellation_pairing_code_var, state="readonly").grid(row=1, column=1, sticky="ew", pady=(10, 0))
-            ttk.Button(pairing, text="Copy", style="Compact.TButton", command=self.copy_constellation_pairing_code).grid(row=1, column=2, padx=(8, 0), pady=(10, 0))
-            ttk.Label(pairing, textvariable=self.constellation_summary_var, wraplength=1080, style="Muted.TLabel").grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
-        
+
+            actions = ttk.Frame(hero)
+            actions.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(16, 0))
+            ttk.Button(actions, text="Sync Now", style="Primary.TButton", command=self.sync_peers_now).pack(anchor="e")
+            ttk.Button(actions, text="Add Device", style="Compact.TButton", command=self.open_constellation_add_device_wizard).pack(anchor="e", pady=(8, 0))
+
             machines = ttk.Frame(outer)
-            machines.grid(row=2, column=0, sticky="nsew", pady=(26, 0))
+            machines.grid(row=1, column=0, sticky="nsew", pady=(22, 0))
             machines.grid_columnconfigure(0, weight=1)
-        
-            ttk.Label(machines, text="Machines", style="Header.TLabel").grid(row=0, column=0, sticky="w")
-            ttk.Label(
-                machines,
-                text="Each machine can be a backup source, a storage target, or both.",
-                wraplength=1080,
-                style="Muted.TLabel",
-            ).grid(row=1, column=0, sticky="w", pady=(4, 8))
-        
+            ttk.Label(machines, text="Devices", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+
             columns = (
                 "label",
                 "target",
@@ -7393,46 +8132,128 @@ def gui_main() -> int:
                 "machine_id",
                 "enabled",
                 "store_all",
+                "status",
             )
             self.settings_peers_tree = ttk.Treeview(
                 machines,
                 columns=columns,
                 show="headings",
                 height=9,
-                displaycolumns=("label", "target", "storage", "source", "store_all", "limit"),
+                displaycolumns=("label", "target", "storage", "source", "store_all", "status"),
             )
-        
             for key, title, width in [
-                ("label", "Machine", 220),
-                ("target", "Connection", 260),
-                ("storage", "Stores Backups", 120),
-                ("source", "Backed Up", 110),
-                ("store_all", "Stores All", 100),
-                ("limit", "Limit GB", 90),
+                ("label", "Device", 220),
+                ("target", "Connection", 300),
+                ("storage", "Stores Mine", 110),
+                ("source", "Pulls Theirs", 110),
+                ("store_all", "All Backups", 110),
+                ("status", "Status", 180),
             ]:
                 self.settings_peers_tree.heading(key, text=title)
                 self.settings_peers_tree.column(key, width=width, anchor="w")
-        
-            self.settings_peers_tree.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
-        
+            self.settings_peers_tree.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+            self.fill_peers_tree(self.settings_peers_tree, peers, settings_mode=True)
+
             machine_actions = ttk.Frame(machines)
-            machine_actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-            ttk.Button(machine_actions, text="Add Machine", style="Primary.TButton", command=lambda: self.open_peer_wizard()).pack(side="left")
-            ttk.Button(machine_actions, text="Edit Selected", style="Compact.TButton", command=self.open_selected_peer_wizard).pack(side="left", padx=(8, 0))
+            machine_actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+            ttk.Button(machine_actions, text="Test Selected", style="Compact.TButton", command=self.constellation_test_selected_peer).pack(side="left")
+            ttk.Button(machine_actions, text="Edit Advanced", style="Compact.TButton", command=self.open_selected_peer_wizard).pack(side="left", padx=(8, 0))
             ttk.Button(machine_actions, text="Remove Selected", style="Compact.TButton", command=self.remove_selected_peer).pack(side="left", padx=(8, 0))
-            ttk.Button(machine_actions, text="Save Constellation", style="Compact.TButton", command=self.save_settings).pack(side="left", padx=(8, 0))
-        
-            storage = ttk.Frame(outer)
-            storage.grid(row=3, column=0, sticky="ew", pady=(26, 0))
-            storage.grid_columnconfigure(0, weight=1)
-            ttk.Label(storage, text="Storage preview", style="Header.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Button(machine_actions, text="Save Changes", style="Compact.TButton", command=self.save_settings).pack(side="left", padx=(8, 0))
+
+            footer = ttk.Frame(outer)
+            footer.grid(row=2, column=0, sticky="ew", pady=(24, 0))
+            footer.grid_columnconfigure(0, weight=1)
+            ttk.Label(footer, text="Storage map", style="Header.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
-                storage,
-                text="Use this only when deciding where backups should live. It does not change settings by itself.",
-                wraplength=1080,
+                footer,
+                text="Use this when deciding which device should be a hub, NAS, VPS, or local storage target.",
+                wraplength=1040,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, sticky="w", pady=(4, 8))
-            ttk.Button(storage, text="Open Storage Preview", style="Compact.TButton", command=self.open_constellation_storage_dialog).grid(row=2, column=0, sticky="w")
+            ttk.Button(footer, text="Open Storage Preview", style="Compact.TButton", command=self.open_constellation_storage_dialog).grid(row=2, column=0, sticky="w")
+
+        def open_constellation_add_device_wizard(self) -> None:
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Add Constellation Device")
+            dialog.geometry("920x720")
+            dialog.minsize(760, 560)
+            dialog.configure(bg="#0e1116")
+            dialog.transient(self.root)
+            dialog.grab_set()
+
+            body = ttk.Frame(dialog, padding=18)
+            body.pack(fill="both", expand=True)
+            body.grid_columnconfigure(0, weight=1)
+            self.build_constellation_setup_wizard(body, in_dialog=True)
+
+            bottom = ttk.Frame(dialog, padding=(18, 0, 18, 18))
+            bottom.pack(fill="x")
+            ttk.Button(bottom, text="Close", command=dialog.destroy).pack(side="right")
+
+        def constellation_prepare_this_device(self, code_box: ScrolledText) -> None:
+            try:
+                self.message_var.set("Preparing this device for Constellation...")
+                response = send_daemon_request({"action": "constellation_prepare"})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                code = str(response.get("code") or "").strip()
+                self.fill_text(code_box, code)
+                self.root.clipboard_clear()
+                self.root.clipboard_append(code)
+                self.message_var.set("This device is ready. Device card copied to clipboard.")
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def constellation_trust_pasted_code(self, code_box: ScrolledText, role_var: tk.StringVar, dialog: Optional[tk.Toplevel] = None) -> None:
+            code = code_box.get("1.0", "end").strip()
+            if not code:
+                self.message_var.set("Paste the other device's card first.")
+                return
+
+            role = self.constellation_role_labels.get(role_var.get(), "mirror")
+            try:
+                response = send_daemon_request({
+                    "action": "constellation_trust_code",
+                    "code": code,
+                    "role": role,
+                    "storage_limit_gb": 0,
+                })
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Unknown daemon error"))
+                self.message_var.set(response.get("message", "Device added."))
+                self.settings_loaded = False
+                self.constellation_rendered_mode = ""
+                self.refresh_dashboard()
+                if dialog:
+                    dialog.destroy()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+
+        def constellation_test_selected_peer(self) -> None:
+            if not hasattr(self, "settings_peers_tree"):
+                self.message_var.set("No Constellation devices are configured yet.")
+                return
+            selection = self.settings_peers_tree.selection()
+            if not selection:
+                self.message_var.set("Select a device first.")
+                return
+            try:
+                index = int(selection[0])
+            except ValueError:
+                self.message_var.set("Select a device first.")
+                return
+            try:
+                response = send_daemon_request({"action": "constellation_test_peer", "index": index})
+                if not response.get("ok"):
+                    raise AegisError(response.get("error", "Connection failed."))
+                self.message_var.set(response.get("message", "Connection works."))
+                self.settings_loaded = False
+                self.refresh_dashboard()
+            except Exception as exc:
+                self.message_var.set(str(exc))
+                self.settings_loaded = False
+                self.refresh_dashboard()
 
         def build_settings_tab(self) -> None:
             outer = self.make_scrollable_frame(self.settings_tab)
@@ -8087,18 +8908,12 @@ def gui_main() -> int:
                 self.message_var.set(str(exc))
 
         def update_constellation_pairing_code(self) -> None:
-            settings = self.dashboard_payload.get("settings", {})
-            if not settings:
-                try:
-                    payload = self.daemon_dashboard()
-                    settings = payload.get("settings", {})
-                except Exception:
-                    settings = {}
-            machine = settings.get("machine_id") or machine_id()
+            # Device cards are generated only when the user clicks Prepare This Device.
+            # This prevents the visible code from changing every dashboard refresh.
+            settings = self.dashboard_payload.get("settings", {}) if self.dashboard_payload else {}
             label = settings.get("machine_label") or hostname()
+            machine = settings.get("machine_id") or machine_id()
             repo = settings.get("repo_path") or DEFAULT_REPO
-            temp_settings = Settings(machine_id=machine, machine_label=label, repo_path=repo)
-            self.constellation_pairing_code_var.set(local_constellation_pairing_code(temp_settings))
             self.constellation_summary_var.set(f"This machine: {label} ({machine}) - repository {repo}")
 
         def apply_peer_pairing_code(self) -> None:
@@ -8117,11 +8932,11 @@ def gui_main() -> int:
         def copy_constellation_pairing_code(self) -> None:
             code = self.constellation_pairing_code_var.get().strip()
             if not code:
-                self.update_constellation_pairing_code()
-                code = self.constellation_pairing_code_var.get().strip()
+                self.message_var.set("Click Prepare This Device first.")
+                return
             self.root.clipboard_clear()
             self.root.clipboard_append(code)
-            self.message_var.set("Pairing code copied.")
+            self.message_var.set("Device card copied.")
         
         def open_selected_peer_wizard(self) -> None:
             selection = self.settings_peers_tree.selection()
@@ -8819,10 +9634,10 @@ def gui_main() -> int:
             self.fill_text(self.logs_text, "\n".join(logs[-100:]) if logs else "No activity yet.")
             self.fill_snapshot_tree(self.backup_tree, snapshots)
             self.fill_snapshot_tree(self.restore_tree, snapshots)
-            if hasattr(self, "peers_tree"):
-                self.fill_peers_tree(self.peers_tree, settings.get("peers", []))
-            if hasattr(self, "constellation_pairing_code_var"):
-                self.update_constellation_pairing_code()
+            if hasattr(self, "constellation_shell"):
+                self.render_constellation_tab()
+                if hasattr(self, "settings_peers_tree"):
+                    self.fill_peers_tree(self.settings_peers_tree, settings.get("peers", []), settings_mode=True)
             if hasattr(self, "storage_tree") and self.storage_tree.winfo_exists():
                 self.refresh_constellation_storage_preview()
 
@@ -8853,27 +9668,35 @@ def gui_main() -> int:
         def fill_peers_tree(self, tree: ttk.Treeview, peers: List[Dict[str, Any]], settings_mode: bool = False) -> None:
             for item in tree.get_children():
                 tree.delete(item)
+
+            columns = tuple(tree["columns"])
+            has_status = "status" in columns
+
             for idx, peer in enumerate(peers):
                 storage_enabled = bool(peer.get("storage_target_enabled", True))
                 source_enabled = bool(peer.get("backup_source_enabled", True))
                 store_all = bool(peer.get("store_all_machines", True))
                 limit_value = int(peer.get("storage_limit_gb") or 0)
                 limit_text = f"{limit_value} GB" if limit_value > 0 else "unlimited"
+                status = peer.get("last_status") or ("enabled" if peer.get("enabled", True) else "disabled")
+                if peer.get("last_error"):
+                    status = f"needs attention: {peer.get('last_error')}"
+
                 role_parts = []
                 if storage_enabled:
-                    role_parts.append("stores")
+                    role_parts.append("stores mine")
                 if source_enabled:
-                    role_parts.append("backed up")
+                    role_parts.append("pulls theirs")
                 if store_all:
-                    role_parts.append("all namespaces")
+                    role_parts.append("all backups")
                 role_text = ", ".join(role_parts) or "disabled"
 
                 if settings_mode:
-                    tree.insert("", "end", iid=str(idx), values=(
+                    values = (
                         peer.get("label", ""),
                         peer.get("ssh_target", ""),
                         peer.get("repo_path", ""),
-                        str(peer.get("port", 22)),
+                        str(peer.get("port", CONSTELLATION_DEFAULT_SSH_PORT)),
                         "yes" if storage_enabled else "no",
                         "yes" if source_enabled else "no",
                         str(peer.get("storage_limit_gb", 0) or 0),
@@ -8882,7 +9705,10 @@ def gui_main() -> int:
                         peer.get("machine_id", ""),
                         "yes" if peer.get("enabled", True) else "no",
                         "yes" if store_all else "no",
-                    ))
+                    )
+                    if has_status:
+                        values = values + (status,)
+                    tree.insert("", "end", iid=str(idx), values=values)
                 else:
                     tree.insert("", "end", iid=str(idx), values=(
                         "yes" if peer.get("enabled", True) else "no",
@@ -8891,7 +9717,7 @@ def gui_main() -> int:
                         peer.get("repo_path", ""),
                         role_text,
                         limit_text,
-                        str(peer.get("port", 22)),
+                        str(peer.get("port", CONSTELLATION_DEFAULT_SSH_PORT)),
                     ))
 
         def fill_text(self, widget: ScrolledText, text: str) -> None:
@@ -9070,7 +9896,9 @@ def gui_main() -> int:
                 response = send_daemon_request({"action": "sync_peers"})
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
-                self.message_var.set(response.get("message", "Peer sync started."))
+                self.message_var.set(response.get("message", "Constellation sync started."))
+                self.root.after(500, self.refresh_dashboard)
+                self.root.after(2000, self.refresh_dashboard)
             except Exception as exc:
                 self.message_var.set(str(exc))
 
@@ -9189,20 +10017,24 @@ def gui_main() -> int:
             if hasattr(self, "settings_peers_tree"):
                 for iid in self.settings_peers_tree.get_children():
                     values = self.settings_peers_tree.item(iid, "values")
+                    if len(values) < 12:
+                        continue
                     peers.append({
                         "enabled": values[10] == "yes",
                         "label": values[0],
                         "ssh_target": values[1],
                         "repo_path": values[2],
-                        "port": int(values[3] or 22),
+                        "port": int(values[3] or CONSTELLATION_DEFAULT_SSH_PORT),
                         "storage_target_enabled": values[4] == "yes",
                         "backup_source_enabled": values[5] == "yes",
                         "storage_limit_gb": int(values[6] or 0),
-                        "identity_file": values[7],
+                        "identity_file": values[7] or str(CONSTELLATION_KEY_PATH),
                         "notes": values[8],
                         "machine_id": values[9],
                         "store_all_machines": values[11] == "yes",
                         "pairing_code": "",
+                        "transport": "ssh",
+                        "last_status": values[12] if len(values) > 12 else "",
                     })
 
             schedule_enabled = bool(self.schedule_enabled_var.get())
