@@ -19,6 +19,7 @@ import os
 import pwd
 import shutil
 import socket
+import struct
 import stat
 import subprocess
 import sys
@@ -78,6 +79,14 @@ CONSTELLATION_AUTH_MARKER = "aegisvault-constellation"
 CONSTELLATION_CODE_PREFIX = "AEGIS-"
 CONSTELLATION_DEFAULT_SSH_USER = "root"
 CONSTELLATION_DEFAULT_SSH_PORT = 22
+CONSTELLATION_STUN_SERVERS = [
+    ("stun.l.google.com", 19302),
+    ("stun1.l.google.com", 19302),
+    ("stun2.l.google.com", 19302),
+]
+CONSTELLATION_DIRECT_CONNECT_TIMEOUT = 5
+CONSTELLATION_CANDIDATE_LIMIT = 32
+_STUN_PUBLIC_IPV4_CACHE: Optional[List[str]] = None
 
 @dataclass
 class ScheduleSettings:
@@ -1149,10 +1158,36 @@ def ensure_constellation_identity(settings: Optional[Settings] = None) -> str:
     return public_key
 
 
-def local_ipv4_addresses() -> List[str]:
-    found: List[str] = []
 
-    raw_json = run_command_optional(["ip", "-j", "-4", "addr", "show", "scope", "global"])
+def default_route_interface_ipv4() -> str:
+    raw = run_command_optional(["ip", "-j", "-4", "route", "show", "default"])
+    try:
+        payload = json.loads(raw) if raw else []
+    except Exception:
+        payload = []
+
+    if isinstance(payload, list):
+        for item in payload:
+            dev = str(item.get("dev") or "").strip()
+            if dev:
+                return dev
+    return ""
+
+
+def _interface_penalty(name: str) -> int:
+    lowered = str(name or "").lower()
+    if lowered.startswith(("docker", "br-", "veth", "virbr", "lxc", "podman")):
+        return 80
+    if lowered.startswith(("wg", "tun", "tap", "tailscale", "zt")):
+        return 60
+    return 0
+
+
+def local_ipv4_entries() -> List[Dict[str, Any]]:
+    found: List[Dict[str, Any]] = []
+    default_dev = default_route_interface_ipv4()
+
+    raw_json = run_command_optional(["ip", "-j", "-4", "addr", "show"])
     try:
         payload = json.loads(raw_json) if raw_json else []
     except Exception:
@@ -1160,50 +1195,237 @@ def local_ipv4_addresses() -> List[str]:
 
     if isinstance(payload, list):
         for item in payload:
+            ifname = str(item.get("ifname") or "").strip()
             for addr in item.get("addr_info") or []:
                 candidate = str(addr.get("local") or "").strip()
+                prefixlen = int(addr.get("prefixlen") or 32)
+                scope = str(addr.get("scope") or "").strip()
                 if candidate:
-                    found.append(candidate)
+                    found.append({
+                        "address": candidate,
+                        "ifname": ifname,
+                        "prefixlen": prefixlen,
+                        "scope": scope,
+                        "default": ifname == default_dev,
+                    })
 
+    # Fallback for minimal systems where `ip -j` is unavailable.
     for token in run_command_optional(["hostname", "-I"]).split():
-        if token.strip():
-            found.append(token.strip())
+        candidate = token.strip()
+        if candidate:
+            found.append({
+                "address": candidate,
+                "ifname": "",
+                "prefixlen": 32,
+                "scope": "global",
+                "default": False,
+            })
 
-    clean: List[str] = []
-    for candidate in found:
+    clean: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for entry in found:
+        candidate = str(entry.get("address") or "").split("/", 1)[0].strip()
         try:
-            ip = ipaddress.ip_address(candidate.split("/", 1)[0])
+            ip = ipaddress.ip_address(candidate)
         except ValueError:
             continue
+
         if ip.version != 4:
             continue
         if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified:
             continue
-        clean.append(str(ip))
-    return dedupe(clean)
+        if str(ip) in seen:
+            continue
+
+        seen.add(str(ip))
+        entry["address"] = str(ip)
+        clean.append(entry)
+
+    def sort_key(entry: Dict[str, Any]) -> Tuple[int, int, int, str]:
+        address = str(entry.get("address") or "")
+        iface = str(entry.get("ifname") or "")
+        try:
+            ip = ipaddress.ip_address(address)
+        except ValueError:
+            return (999, 999, 999, address)
+
+        default_score = 0 if entry.get("default") else 20
+        iface_score = _interface_penalty(iface)
+
+        # Prefer normal LAN/private addresses first because same-network sync is
+        # the lowest-latency and most reliable direct path. Public interface IPs
+        # still stay in the candidate set for VPS/NAS/publicly routed machines.
+        if ip.is_private:
+            address_score = 0
+        elif ip.is_global:
+            address_score = 10
+        else:
+            address_score = 30
+
+        return (iface_score + default_score + address_score, address_score, len(address), address)
+
+    clean.sort(key=sort_key)
+    return clean
+
+
+def local_ipv4_addresses() -> List[str]:
+    return dedupe([str(entry.get("address") or "") for entry in local_ipv4_entries() if entry.get("address")])
+
+
+def stun_public_ipv4_addresses(timeout_seconds: float = 1.6) -> List[str]:
+    global _STUN_PUBLIC_IPV4_CACHE
+
+    if _STUN_PUBLIC_IPV4_CACHE is not None:
+        return list(_STUN_PUBLIC_IPV4_CACHE)
+
+    values: List[str] = []
+
+    for server in CONSTELLATION_STUN_SERVERS:
+        try:
+            host, port = server
+            transaction_id = os.urandom(12)
+            request = struct.pack("!HHI12s", 0x0001, 0, 0x2112A442, transaction_id)
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.settimeout(timeout_seconds)
+                sock.sendto(request, (host, int(port)))
+                data, _ = sock.recvfrom(2048)
+            finally:
+                sock.close()
+
+            if len(data) < 20:
+                continue
+
+            msg_type, msg_len, magic, response_transaction_id = struct.unpack("!HHI12s", data[:20])
+            if magic != 0x2112A442 or response_transaction_id != transaction_id:
+                continue
+
+            offset = 20
+            end = min(len(data), 20 + msg_len)
+
+            while offset + 4 <= end:
+                attr_type, attr_len = struct.unpack("!HH", data[offset:offset + 4])
+                value = data[offset + 4:offset + 4 + attr_len]
+                offset += 4 + attr_len + ((4 - attr_len % 4) % 4)
+
+                if attr_type == 0x0020 and len(value) >= 8:
+                    # XOR-MAPPED-ADDRESS
+                    family = value[1]
+                    if family != 0x01:
+                        continue
+                    raw_addr = struct.unpack("!I", value[4:8])[0] ^ 0x2112A442
+                    address = socket.inet_ntoa(struct.pack("!I", raw_addr))
+                    ip = ipaddress.ip_address(address)
+                    if ip.version == 4 and not ip.is_loopback and not ip.is_link_local:
+                        values.append(str(ip))
+
+                elif attr_type == 0x0001 and len(value) >= 8:
+                    # MAPPED-ADDRESS fallback.
+                    family = value[1]
+                    if family != 0x01:
+                        continue
+                    address = socket.inet_ntoa(value[4:8])
+                    ip = ipaddress.ip_address(address)
+                    if ip.version == 4 and not ip.is_loopback and not ip.is_link_local:
+                        values.append(str(ip))
+
+        except Exception:
+            continue
+
+    _STUN_PUBLIC_IPV4_CACHE = dedupe(values)
+    return list(_STUN_PUBLIC_IPV4_CACHE)
 
 
 def constellation_host_candidates() -> List[str]:
     name = hostname().strip()
     values: List[str] = []
+
     if name:
         values.append(name)
         if "." not in name:
             values.append(f"{name}.local")
+
     values.extend(local_ipv4_addresses())
+
+    # STUN is used only for discovery. Aegis never configures or uses TURN.
+    for public_ip in stun_public_ipv4_addresses():
+        if public_ip not in values:
+            values.append(public_ip)
+
     return dedupe([value for value in values if value])
 
 
 def preferred_constellation_host() -> str:
     candidates = constellation_host_candidates()
+
+    for candidate in candidates:
+        try:
+            ip = ipaddress.ip_address(candidate)
+            if ip.is_private:
+                return candidate
+        except ValueError:
+            pass
+
     for candidate in candidates:
         if candidate.endswith(".local"):
             return candidate
+
     return candidates[0] if candidates else hostname()
 
 
+def ssh_target_for_host(user: str, host: str) -> str:
+    cleaned_host = str(host or "").strip()
+    cleaned_user = str(user or CONSTELLATION_DEFAULT_SSH_USER).strip() or CONSTELLATION_DEFAULT_SSH_USER
+
+    if not cleaned_host:
+        return ""
+
+    if ":" in cleaned_host and not cleaned_host.startswith("["):
+        cleaned_host = f"[{cleaned_host}]"
+
+    return f"{cleaned_user}@{cleaned_host}"
+
+
+def constellation_direct_endpoints(user: str = CONSTELLATION_DEFAULT_SSH_USER, port: int = CONSTELLATION_DEFAULT_SSH_PORT) -> List[Dict[str, Any]]:
+    endpoints: List[Dict[str, Any]] = []
+    local_addresses = set(local_ipv4_addresses())
+    stun_addresses = set(stun_public_ipv4_addresses())
+
+    for host_value in constellation_host_candidates():
+        source = "hostname"
+        try:
+            ip = ipaddress.ip_address(host_value)
+            if str(ip) in stun_addresses:
+                source = "stun-public-ip"
+            elif str(ip) in local_addresses:
+                source = "local-interface-ip"
+        except ValueError:
+            if host_value.endswith(".local"):
+                source = "mdns-hostname"
+
+        endpoints.append({
+            "transport": "ssh",
+            "host": host_value,
+            "port": int(port or CONSTELLATION_DEFAULT_SSH_PORT),
+            "target": ssh_target_for_host(user, host_value),
+            "source": source,
+            "turn": False,
+        })
+
+    return endpoints
+
+
 def constellation_ssh_targets() -> List[str]:
-    return [f"{CONSTELLATION_DEFAULT_SSH_USER}@{host}" for host in constellation_host_candidates()]
+    return [
+        endpoint["target"]
+        for endpoint in constellation_direct_endpoints(
+            CONSTELLATION_DEFAULT_SSH_USER,
+            CONSTELLATION_DEFAULT_SSH_PORT,
+        )
+        if endpoint.get("target")
+    ]
 
 
 def constellation_bridge_text() -> str:
@@ -1362,27 +1584,40 @@ def ensure_constellation_ssh_server() -> None:
 def constellation_endpoint_info(settings: Optional[Settings] = None) -> Dict[str, Any]:
     current_settings = settings or load_settings()
     public_key = ensure_constellation_identity(current_settings)
-    hosts = constellation_host_candidates()
+
+    ssh_user = CONSTELLATION_DEFAULT_SSH_USER
+    ssh_port = CONSTELLATION_DEFAULT_SSH_PORT
+    endpoints = constellation_direct_endpoints(ssh_user, ssh_port)
+    hosts = [str(endpoint.get("host") or "") for endpoint in endpoints if endpoint.get("host")]
     preferred_host = preferred_constellation_host()
-    ssh_targets = [f"{CONSTELLATION_DEFAULT_SSH_USER}@{host}" for host in hosts]
-    preferred_target = f"{CONSTELLATION_DEFAULT_SSH_USER}@{preferred_host}" if preferred_host else ""
+    preferred_target = ssh_target_for_host(ssh_user, preferred_host) if preferred_host else ""
+    ssh_targets = dedupe([str(endpoint.get("target") or "") for endpoint in endpoints if endpoint.get("target")])
+    public_addresses = stun_public_ipv4_addresses()
     key_stamp = int(CONSTELLATION_PUBLIC_KEY_PATH.stat().st_mtime) if CONSTELLATION_PUBLIC_KEY_PATH.exists() else 0
 
     return {
-        "version": 2,
+        "version": 3,
         "kind": "aegis-constellation-device",
         "app": APP_NAME,
         "machine_id": current_settings.machine_id or machine_id(),
         "machine_label": current_settings.machine_label or hostname(),
         "hostname": hostname(),
         "repo_path": current_settings.repo_path or DEFAULT_REPO,
-        "ssh_user": CONSTELLATION_DEFAULT_SSH_USER,
-        "port": CONSTELLATION_DEFAULT_SSH_PORT,
+        "ssh_user": ssh_user,
+        "port": ssh_port,
         "public_key": public_key,
         "preferred_host": preferred_host,
         "preferred_ssh_target": preferred_target,
         "ssh_targets": ssh_targets,
         "addresses": local_ipv4_addresses(),
+        "public_addresses": public_addresses,
+        "direct_endpoints": endpoints,
+        "connection_policy": {
+            "direct_only": True,
+            "stun_allowed": True,
+            "turn_allowed": False,
+            "traffic_relay_allowed": False,
+        },
         "code_id": sha256_hex(public_key.encode("utf-8"))[:16],
         "key_created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(key_stamp)) if key_stamp else "",
     }
@@ -1525,6 +1760,206 @@ def peer_from_constellation_card(data: Dict[str, Any], role: str, storage_limit_
         last_checked_at=now_rfc3339(),
     )
 
+def split_ssh_target(target: str) -> Tuple[str, str]:
+    value = str(target or "").strip()
+    if not value:
+        return CONSTELLATION_DEFAULT_SSH_USER, ""
+
+    if "@" in value:
+        user, host = value.rsplit("@", 1)
+    else:
+        user, host = CONSTELLATION_DEFAULT_SSH_USER, value
+
+    user = user.strip() or CONSTELLATION_DEFAULT_SSH_USER
+    host = host.strip()
+
+    if host.startswith("[") and "]" in host:
+        host = host[1:host.index("]")]
+
+    # Accept accidental host:port input but keep the explicit PeerTarget.port as
+    # the source of truth.
+    if host.count(":") == 1:
+        maybe_host, maybe_port = host.rsplit(":", 1)
+        if maybe_port.isdigit():
+            host = maybe_host
+
+    return user, host
+
+
+def _append_candidate_target(out: List[str], value: str, default_user: str) -> None:
+    raw = str(value or "").strip()
+    if not raw:
+        return
+
+    if "@" in raw:
+        target = raw
+    else:
+        target = ssh_target_for_host(default_user, raw)
+
+    if target and target not in out:
+        out.append(target)
+
+
+def constellation_candidate_targets_for_peer(peer: PeerTarget) -> List[str]:
+    card = decode_constellation_pairing_code(peer.pairing_code) if peer.pairing_code else {}
+    current_user, current_host = split_ssh_target(peer.ssh_target)
+    default_user = str(card.get("ssh_user") or current_user or CONSTELLATION_DEFAULT_SSH_USER).strip() or CONSTELLATION_DEFAULT_SSH_USER
+
+    candidates: List[str] = []
+
+    # Always try the last known-good/saved target first.
+    _append_candidate_target(candidates, peer.ssh_target, default_user)
+
+    # Then try explicit targets from the device card, ordered by the remote's own preference.
+    _append_candidate_target(candidates, str(card.get("preferred_ssh_target") or ""), default_user)
+
+    for target in card.get("ssh_targets") or []:
+        _append_candidate_target(candidates, str(target or ""), default_user)
+
+    # v3 cards include normalized direct endpoints with source metadata.
+    for endpoint in card.get("direct_endpoints") or []:
+        if not isinstance(endpoint, dict):
+            continue
+        if endpoint.get("turn"):
+            continue
+        _append_candidate_target(candidates, str(endpoint.get("target") or ""), default_user)
+        _append_candidate_target(candidates, str(endpoint.get("host") or ""), default_user)
+
+    for host_value in [
+        str(card.get("preferred_host") or ""),
+        str(card.get("hostname") or ""),
+        *[str(value or "") for value in (card.get("addresses") or [])],
+        *[str(value or "") for value in (card.get("public_addresses") or [])],
+    ]:
+        _append_candidate_target(candidates, host_value, default_user)
+
+    # Older saved configs keep a comma-separated hint. Treat it as candidates too.
+    for raw_hint in str(peer.connection_hint or "").replace("\n", ",").split(","):
+        _append_candidate_target(candidates, raw_hint.strip(), default_user)
+
+    # Preserve manual host if the user entered one.
+    _append_candidate_target(candidates, current_host, default_user)
+
+    return dedupe(candidates)[:CONSTELLATION_CANDIDATE_LIMIT]
+
+
+def probe_constellation_target(peer: PeerTarget, target: str, timeout_seconds: int = CONSTELLATION_DIRECT_CONNECT_TIMEOUT) -> Dict[str, Any]:
+    candidate_peer = dataclasses.replace(peer, ssh_target=target)
+    cmd = ssh_base_args(candidate_peer) + [target, "aegisvault-probe"]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(2, int(timeout_seconds)),
+        )
+    except subprocess.TimeoutExpired:
+        return {
+            "ok": False,
+            "target": target,
+            "message": "timed out",
+        }
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+        return {
+            "ok": False,
+            "target": target,
+            "message": detail,
+        }
+
+    payload: Dict[str, Any] = {}
+    try:
+        payload = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
+    except Exception:
+        payload = {}
+
+    return {
+        "ok": True,
+        "target": target,
+        "message": "Connection works.",
+        "detail": payload,
+    }
+
+
+def resolve_constellation_peer(peer: PeerTarget, timeout_seconds: int = CONSTELLATION_DIRECT_CONNECT_TIMEOUT) -> Dict[str, Any]:
+    if not peer.enabled:
+        return {"ok": False, "message": "Peer is disabled.", "candidates": []}
+
+    candidates = constellation_candidate_targets_for_peer(peer)
+    if not candidates:
+        return {"ok": False, "message": "Peer has no direct connection candidates.", "candidates": []}
+
+    last_error = ""
+
+    for target in candidates:
+        result = probe_constellation_target(peer, target, timeout_seconds=timeout_seconds)
+        if result.get("ok"):
+            peer.ssh_target = str(result.get("target") or target)
+            peer.last_status = "ok"
+            peer.last_error = ""
+            peer.last_checked_at = now_rfc3339()
+            if peer.ssh_target not in peer.connection_hint:
+                hints = [peer.ssh_target]
+                if peer.connection_hint:
+                    hints.extend([item.strip() for item in peer.connection_hint.split(",") if item.strip()])
+                peer.connection_hint = ", ".join(dedupe(hints)[:8])
+            return {
+                "ok": True,
+                "target": peer.ssh_target,
+                "message": "Connection works.",
+                "detail": result.get("detail", {}),
+                "candidates": candidates,
+            }
+
+        last_error = f"{result.get('target')}: {result.get('message')}"
+
+    peer.last_status = "error"
+    peer.last_error = last_error or "No direct candidate worked."
+    peer.last_checked_at = now_rfc3339()
+
+    return {
+        "ok": False,
+        "message": peer.last_error,
+        "candidates": candidates,
+    }
+
+
+def write_constellation_machine_status(settings: Settings, repo: Path) -> None:
+    status_dir = repo_machine_dir(repo, settings.machine_id)
+    status_dir.mkdir(parents=True, exist_ok=True)
+
+    state = load_state()
+    payload = {
+        "version": 1,
+        "app": APP_NAME,
+        "machine_id": settings.machine_id,
+        "machine_label": settings.machine_label,
+        "hostname": hostname(),
+        "repo_path": settings.repo_path,
+        "checked_at": now_rfc3339(),
+        "last_run_at": state.last_run_at,
+        "last_success_at": state.last_success_at,
+        "last_error": state.last_error,
+        "last_sync_at": state.last_sync_at,
+        "schedule": asdict(settings.schedule),
+        "addresses": local_ipv4_addresses(),
+        "public_addresses": stun_public_ipv4_addresses(),
+        "direct_endpoints": constellation_direct_endpoints(CONSTELLATION_DEFAULT_SSH_USER, CONSTELLATION_DEFAULT_SSH_PORT),
+        "peers": [
+            {
+                "machine_id": peer.machine_id,
+                "label": peer.label,
+                "last_status": peer.last_status,
+                "last_error": peer.last_error,
+                "last_checked_at": peer.last_checked_at,
+            }
+            for peer in settings.peers
+        ],
+    }
+
+    save_json(status_dir / "constellation-status.json", payload, mode=0o600)
 
 def upsert_constellation_peer(settings: Settings, peer: PeerTarget) -> None:
     replaced = False
@@ -1555,7 +1990,11 @@ def trust_constellation_device_card(code: str, role: str = "mirror", storage_lim
     return {
         "ok": True,
         "peer": asdict(peer),
-        "message": f"{peer.label} is trusted. For two-way sync, paste this computer's device card into Aegis on {peer.label} too.",
+        "message": (
+            f"{peer.label} is trusted on this computer. "
+            f"To let both computers send backups to each other, open Aegis on {peer.label} "
+            "and add this computer's device card there too."
+        ),
         "local_code": local_constellation_pairing_code(settings),
     }
 
@@ -6000,6 +6439,12 @@ def restore_from_bundle_url(url: str, password: str, target: Path, member: Optio
 
 
 def ssh_base_args(peer: PeerTarget) -> List[str]:
+    try:
+        CONSTELLATION_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(CONSTELLATION_DIR, 0o700)
+    except Exception:
+        pass
+
     args = [
         "ssh",
         "-p",
@@ -6007,7 +6452,13 @@ def ssh_base_args(peer: PeerTarget) -> List[str]:
         "-o",
         "BatchMode=yes",
         "-o",
-        "ConnectTimeout=8",
+        "PasswordAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        f"ConnectTimeout={CONSTELLATION_DIRECT_CONNECT_TIMEOUT}",
         "-o",
         "ServerAliveInterval=15",
         "-o",
@@ -6028,6 +6479,12 @@ def rsync_ssh_command(peer: PeerTarget) -> str:
 
 
 def ensure_remote_repo(peer: PeerTarget) -> None:
+    resolved = resolve_constellation_peer(peer)
+    if not resolved.get("ok"):
+        tried = ", ".join(resolved.get("candidates") or [])
+        detail = str(resolved.get("message") or "No direct candidate worked.")
+        raise AegisError(f"Failed to reach peer {peer.label or peer.ssh_target}: {detail}. Tried: {tried}")
+
     repo = peer.repo_path.rstrip("/") or DEFAULT_REPO
     command = "mkdir -p -- " + " ".join(
         shlex.quote(value)
@@ -6080,57 +6537,46 @@ def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path
 
 
 def test_constellation_peer(peer: PeerTarget) -> Dict[str, Any]:
-    if not peer.enabled:
-        return {"ok": False, "message": "Peer is disabled."}
-    if not peer.ssh_target.strip():
-        return {"ok": False, "message": "Peer has no connection target."}
-
-    cmd = ssh_base_args(peer) + [peer.ssh_target, "aegisvault-probe"]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "message": "Connection timed out."}
-
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
-        return {"ok": False, "message": detail}
-
-    payload = {}
-    try:
-        payload = json.loads(result.stdout.strip()) if result.stdout.strip() else {}
-    except Exception:
-        payload = {}
+    result = resolve_constellation_peer(peer)
+    if not result.get("ok"):
+        tried = ", ".join(result.get("candidates") or [])
+        message = str(result.get("message") or "Connection failed.")
+        if tried:
+            message = f"{message} Tried: {tried}"
+        return {"ok": False, "message": message}
 
     return {
         "ok": True,
-        "message": "Connection works.",
-        "detail": payload,
+        "message": f"Connection works via {result.get('target')}.",
+        "detail": result.get("detail", {}),
     }
 
-def rsync_remote_to_local(peer: PeerTarget, remote_subdir: str, local_path: Path) -> None:
-    local_path.mkdir(parents=True, exist_ok=True)
-    remote = f"{peer.ssh_target}:{peer.repo_path.rstrip('/')}/{remote_subdir.rstrip('/')}/"
-    cmd = ["rsync", "-a", "-e", rsync_ssh_command(peer), remote, f"{str(local_path).rstrip('/')}/"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise AegisError(f"rsync pull failed for {peer.label or peer.ssh_target}: {result.stderr.strip()}")
 
 def sync_peers(settings: Settings, raise_on_error: bool = True) -> None:
     if not settings.peers_enabled or not settings.peers:
         return
 
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
+    write_constellation_machine_status(settings, repo)
+
     local_objects = repo / "objects" / settings.machine_id
     local_meta = repo / "machines" / settings.machine_id
     errors: List[str] = []
 
     for peer in settings.peers:
-        if not peer.enabled or not peer.ssh_target.strip():
+        if not peer.enabled:
             continue
 
-        label = peer.label or peer.ssh_target
+        label = peer.label or peer.ssh_target or peer.machine_id or "peer"
+
         try:
-            update_stage(f"Syncing Constellation peer {label}")
+            update_stage(f"Finding direct path to Constellation peer {label}")
+            resolved = resolve_constellation_peer(peer)
+            if not resolved.get("ok"):
+                tried = ", ".join(resolved.get("candidates") or [])
+                raise AegisError(f"{resolved.get('message') or 'No direct path worked.'} Tried: {tried}")
+
+            update_stage(f"Syncing Constellation peer {label} via {peer.ssh_target}")
             ensure_remote_repo(peer)
 
             if peer.storage_target_enabled:
@@ -6144,7 +6590,8 @@ def sync_peers(settings: Settings, raise_on_error: bool = True) -> None:
             peer.last_status = "ok"
             peer.last_error = ""
             peer.last_checked_at = now_rfc3339()
-            log_line(f"Constellation sync finished for {label}")
+            log_line(f"Constellation sync finished for {label} via {peer.ssh_target}")
+
         except Exception as exc:
             message = f"{label}: {exc}"
             peer.last_status = "error"
@@ -6163,7 +6610,6 @@ def sync_peers(settings: Settings, raise_on_error: bool = True) -> None:
 
     if errors and raise_on_error:
         raise AegisError("Constellation sync needs attention: " + "; ".join(errors))
-
 
 def dashboard() -> Dashboard:
     settings = load_settings()
@@ -6983,6 +7429,336 @@ def constellation_add_peer_command(args) -> int:
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+def tui_request(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        response = send_daemon_request(payload)
+    except Exception:
+        if os.geteuid() != 0:
+            raise
+        response = handle_request(payload)
+
+    if not response.get("ok"):
+        raise AegisError(response.get("error", "Unknown error"))
+    return response
+
+
+def tui_safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0) -> None:
+    try:
+        height, width = stdscr.getmaxyx()
+        if y < 0 or y >= height or x >= width:
+            return
+        clipped = str(text or "")[:max(0, width - x - 1)]
+        stdscr.addstr(y, x, clipped, attr)
+    except Exception:
+        pass
+
+
+def tui_prompt(stdscr, title: str, prompt: str, hidden: bool = False, max_len: int = 8192) -> str:
+    import curses
+
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    tui_safe_addstr(stdscr, 1, 2, title, curses.A_BOLD)
+    lines = textwrap.wrap(prompt, max(20, width - 4))
+    y = 3
+    for line in lines:
+        tui_safe_addstr(stdscr, y, 2, line)
+        y += 1
+    y += 1
+    tui_safe_addstr(stdscr, y, 2, "> ")
+    stdscr.refresh()
+
+    curses.echo()
+    if hidden:
+        curses.noecho()
+
+    try:
+        raw = stdscr.getstr(y, 4, max_len)
+    finally:
+        curses.noecho()
+
+    return raw.decode("utf-8", errors="ignore").strip()
+
+
+def tui_show_text(stdscr, title: str, body: str) -> None:
+    import curses
+
+    offset = 0
+    lines = []
+    for raw in str(body or "").splitlines() or [""]:
+        wrapped = textwrap.wrap(raw, max(20, stdscr.getmaxyx()[1] - 4)) or [""]
+        lines.extend(wrapped)
+
+    while True:
+        stdscr.erase()
+        height, width = stdscr.getmaxyx()
+        tui_safe_addstr(stdscr, 1, 2, title, curses.A_BOLD)
+
+        visible_count = max(1, height - 5)
+        for idx, line in enumerate(lines[offset:offset + visible_count]):
+            tui_safe_addstr(stdscr, 3 + idx, 2, line)
+
+        tui_safe_addstr(stdscr, height - 2, 2, "Up/Down scroll | q/Esc/Enter closes", curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (ord("q"), 27, 10, 13):
+            return
+        if key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max(0, len(lines) - visible_count), offset + 1)
+        elif key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key == curses.KEY_NPAGE:
+            offset = min(max(0, len(lines) - visible_count), offset + visible_count)
+        elif key == curses.KEY_PPAGE:
+            offset = max(0, offset - visible_count)
+
+
+def tui_select(stdscr, title: str, options: List[str]) -> int:
+    import curses
+
+    selected = 0
+    while True:
+        stdscr.erase()
+        tui_safe_addstr(stdscr, 1, 2, title, curses.A_BOLD)
+        for idx, option in enumerate(options):
+            attr = curses.A_REVERSE if idx == selected else 0
+            tui_safe_addstr(stdscr, 3 + idx, 4, option, attr)
+        tui_safe_addstr(stdscr, stdscr.getmaxyx()[0] - 2, 2, "Arrow keys move | Enter selects | Esc cancels", curses.A_DIM)
+        stdscr.refresh()
+
+        key = stdscr.getch()
+        if key in (10, 13):
+            return selected
+        if key == 27:
+            return -1
+        if key in (curses.KEY_UP, ord("k")):
+            selected = max(0, selected - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = min(len(options) - 1, selected + 1)
+
+
+def tui_dashboard_payload() -> Dict[str, Any]:
+    try:
+        return tui_request({"action": "dashboard"})["dashboard"]
+    except Exception:
+        return asdict(dashboard())
+
+
+def tui_add_device_flow(stdscr) -> str:
+    role_options = [
+        "Mirror both ways",
+        "Back up this device to the other device",
+        "Store the other device's backups here",
+        "Use the other device as a storage hub",
+    ]
+    role_values = {
+        "Mirror both ways": "mirror",
+        "Back up this device to the other device": "backup_to_peer",
+        "Store the other device's backups here": "pull_from_peer",
+        "Use the other device as a storage hub": "storage_hub",
+    }
+
+    choice = tui_select(stdscr, "Choose sync role", role_options)
+    if choice < 0:
+        return "Canceled."
+
+    code = tui_prompt(
+        stdscr,
+        "Paste device card",
+        "Paste the complete AEGIS device card from the other device, then press Enter.",
+        hidden=False,
+        max_len=32768,
+    )
+    if not code:
+        return "No card pasted."
+
+    response = tui_request({
+        "action": "constellation_trust_code",
+        "code": code,
+        "role": role_values[role_options[choice]],
+        "storage_limit_gb": 0,
+    })
+    return response.get("message", "Device added.")
+
+
+def tui_test_peers_flow(stdscr) -> str:
+    payload = tui_dashboard_payload()
+    peers = list((payload.get("settings") or {}).get("peers") or [])
+    if not peers:
+        return "No Constellation devices are configured."
+
+    messages: List[str] = []
+    for index, peer in enumerate(peers):
+        label = peer.get("label") or peer.get("ssh_target") or f"peer {index + 1}"
+        try:
+            response = tui_request({"action": "constellation_test_peer", "index": index})
+            messages.append(f"{label}: {response.get('message', 'Connection works.')}")
+        except Exception as exc:
+            messages.append(f"{label}: {exc}")
+
+    return "\n".join(messages)
+
+
+def tui_snapshots_text(payload: Dict[str, Any]) -> str:
+    snapshots = list(payload.get("snapshots") or [])
+    if not snapshots:
+        return "No backups yet."
+
+    lines = []
+    for snap in snapshots:
+        lines.append(
+            f"{snap.get('created_at', '')}  "
+            f"{snap.get('machine_label', '')}  "
+            f"{kind_label(str(snap.get('kind') or ''))}  "
+            f"{human_bytes(int(snap.get('archive_bytes') or 0))}  "
+            f"{snap.get('id', '')}"
+        )
+    return "\n".join(lines)
+
+
+def tui_main() -> int:
+    import curses
+
+    menu = [
+        "Backup Now",
+        "Sync Peers",
+        "Prepare / Show This Device Card",
+        "Add Device Card",
+        "Test Peer Connections",
+        "Show Backups",
+        "Show Recent Logs",
+        "Quit",
+    ]
+
+    def run(stdscr) -> int:
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        selected = 0
+        message = ""
+
+        while True:
+            payload = tui_dashboard_payload()
+            settings = payload.get("settings") or {}
+            state = payload.get("persistent") or {}
+            current_job = payload.get("current_job")
+            warnings = list(payload.get("warnings") or [])
+            peers = list(settings.get("peers") or [])
+
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+
+            tui_safe_addstr(stdscr, 1, 2, APP_NAME, curses.A_BOLD)
+            tui_safe_addstr(stdscr, 2, 2, "Terminal app - direct device-to-device Constellation sync, no TURN/relay traffic.", curses.A_DIM)
+
+            y = 4
+            tui_safe_addstr(stdscr, y, 2, f"Machine: {settings.get('machine_label') or hostname()} ({settings.get('machine_id') or machine_id()})")
+            y += 1
+            tui_safe_addstr(stdscr, y, 2, f"Repository: {settings.get('repo_path') or DEFAULT_REPO}")
+            y += 1
+            tui_safe_addstr(stdscr, y, 2, f"Last backup: {state.get('last_success_at') or 'never'}")
+            y += 1
+            tui_safe_addstr(stdscr, y, 2, f"Last sync: {state.get('last_sync_at') or 'never'}")
+            y += 1
+
+            if current_job:
+                tui_safe_addstr(stdscr, y, 2, f"Status: Busy - {current_job.get('name')} - {current_job.get('stage')}", curses.A_BOLD)
+            else:
+                tui_safe_addstr(stdscr, y, 2, "Status: Idle")
+            y += 2
+
+            tui_safe_addstr(stdscr, y, 2, f"Peers: {len(peers)}")
+            y += 1
+            for peer in peers[:5]:
+                peer_label = peer.get("label") or peer.get("ssh_target") or "peer"
+                peer_status = peer.get("last_status") or "not checked"
+                peer_target = peer.get("ssh_target") or "auto"
+                tui_safe_addstr(stdscr, y, 4, f"{peer_label}: {peer_status} via {peer_target}")
+                y += 1
+
+            if warnings:
+                y += 1
+                tui_safe_addstr(stdscr, y, 2, "Warnings:", curses.A_BOLD)
+                y += 1
+                for warning in warnings[:3]:
+                    tui_safe_addstr(stdscr, y, 4, warning)
+                    y += 1
+
+            y += 1
+            tui_safe_addstr(stdscr, y, 2, "Actions", curses.A_BOLD)
+            y += 1
+
+            for idx, option in enumerate(menu):
+                attr = curses.A_REVERSE if idx == selected else 0
+                tui_safe_addstr(stdscr, y + idx, 4, option, attr)
+
+            if message:
+                tui_safe_addstr(stdscr, height - 3, 2, message[:width - 4], curses.A_BOLD)
+
+            tui_safe_addstr(stdscr, height - 2, 2, "Arrow keys move | Enter selects | q quits", curses.A_DIM)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+
+            if key in (ord("q"), 27):
+                return 0
+            if key in (curses.KEY_UP, ord("k")):
+                selected = max(0, selected - 1)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")):
+                selected = min(len(menu) - 1, selected + 1)
+                continue
+            if key not in (10, 13):
+                continue
+
+            action = menu[selected]
+
+            try:
+                if action == "Backup Now":
+                    response = tui_request({"action": "run_backup", "profile": "both"})
+                    message = response.get("message", "Backup started.")
+
+                elif action == "Sync Peers":
+                    response = tui_request({"action": "sync_peers"})
+                    message = response.get("message", "Peer sync started.")
+
+                elif action == "Prepare / Show This Device Card":
+                    response = tui_request({"action": "constellation_prepare"})
+                    code = response.get("code", "")
+                    tui_show_text(
+                        stdscr,
+                        "This device card",
+                        "Copy this entire card and paste it into Aegis on the other device:\n\n" + code,
+                    )
+                    message = "Device card shown."
+
+                elif action == "Add Device Card":
+                    message = tui_add_device_flow(stdscr)
+
+                elif action == "Test Peer Connections":
+                    tui_show_text(stdscr, "Peer connection tests", tui_test_peers_flow(stdscr))
+                    message = "Peer tests finished."
+
+                elif action == "Show Backups":
+                    tui_show_text(stdscr, "Backups", tui_snapshots_text(payload))
+                    message = "Backups shown."
+
+                elif action == "Show Recent Logs":
+                    logs = "\n".join((payload.get("logs") or [])[-120:]) or "No logs yet."
+                    tui_show_text(stdscr, "Recent logs", logs)
+                    message = "Logs shown."
+
+                elif action == "Quit":
+                    return 0
+
+            except Exception as exc:
+                message = str(exc)
+
+    try:
+        return curses.wrapper(run)
+    except KeyboardInterrupt:
+        return 130
 
 def gui_main() -> int:
     import tkinter as tk
@@ -7850,8 +8626,17 @@ def gui_main() -> int:
 
             snap_actions = ttk.Frame(snaps)
             snap_actions.pack(fill="x", pady=(10, 0))
-            ttk.Button(snap_actions, text="Delete Selected Backup", command=self.delete_selected_snapshot).pack(side="left")
-            ttk.Button(snap_actions, text="Refresh", style="Compact.TButton", command=self.refresh_dashboard).pack(side="left", padx=(8, 0))
+            ttk.Button(
+                snap_actions,
+                text="Delete Selected Backup",
+                command=self.delete_selected_snapshot,
+            ).pack(side="left")
+            
+            ttk.Button(
+                snap_actions,
+                text="Refresh",
+                command=self.refresh_dashboard,
+            ).pack(side="left", padx=(8, 0))
 
             export = ttk.Frame(self.backup_tab)
             export.pack(fill="x", pady=(18, 0))
@@ -8036,11 +8821,15 @@ def gui_main() -> int:
                 style="Primary.TButton",
                 command=lambda: self.constellation_prepare_this_device(local_code_box),
             ).pack(side="left")
+            
             ttk.Button(
                 step1_actions,
                 text="Copy Device Card",
-                style="Compact.TButton",
-                command=lambda: self.copy_text_widget_to_clipboard(local_code_box, "Device card copied. Paste it into Aegis on the other device."),
+                style="Primary.TButton",
+                command=lambda: self.copy_text_widget_to_clipboard(
+                    local_code_box,
+                    "Device card copied. Paste it into Aegis on the other device.",
+                ),
             ).pack(side="left", padx=(8, 0))
 
             step2 = ttk.Frame(outer)
@@ -8084,7 +8873,11 @@ def gui_main() -> int:
             ttk.Label(step3, text="3. Finish on both devices", style="Header.TLabel").grid(row=0, column=0, sticky="w")
             ttk.Label(
                 step3,
-                text="For two-way sync, repeat the same copy-paste on the other computer. Then click Sync Now. If a device is on another network, use a reachable storage hub, VPS, NAS, VPN hostname, or tunnel hostname as its advanced connection target.",
+                text=(
+                    "To allow both computers to send backups to each other, add this computer's device card "
+                    "inside Aegis on the other computer too. After both devices trust each other, Aegis will "
+                    "choose the best available connection path automatically."
+                ),
                 wraplength=1040,
                 style="Muted.TLabel",
             ).grid(row=1, column=0, sticky="w", pady=(4, 10))
@@ -10103,6 +10896,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command")
 
     sub.add_parser("gui")
+    sub.add_parser("tui")
     sub.add_parser("daemon")
     init_parser = sub.add_parser("init")
     init_parser.add_argument("--repo")
@@ -10171,10 +10965,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
-    cmd = args.command or "gui"
+    cmd = args.command or ("gui" if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") else "tui")
     try:
         if cmd == "gui":
             return gui_main()
+        if cmd == "tui":
+            return tui_main()
         if cmd == "daemon":
             return daemon_main()
         if cmd == "init":
