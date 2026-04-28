@@ -92,20 +92,23 @@ T2_CACHE_DEBIAN_CODENAMES = {"bookworm", "trixie"}
 UBUNTU_APT_MIRROR = "https://archive.ubuntu.com/ubuntu"
 UBUNTU_SECURITY_MIRROR = "https://security.ubuntu.com/ubuntu"
 DEBIAN_SECURITY_MIRROR = "https://security.debian.org/debian-security"
+
 T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
 T2_CORE_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
 
 T2_RECOVERY_CODENAMES = ["trixie", "noble", "jammy", "bookworm"]
 
 # These are the codenames that must have a complete offline T2 cache:
-# - trixie: the recovery USB itself
-# - noble: Pop!_OS 24.04 / Ubuntu 24.04 restored targets
+# - trixie: the Debian recovery USB itself
+# - noble: Pop!_OS 24.04 / Ubuntu 24.04 / Linux Mint 22 restored targets
 T2_OFFLINE_REQUIRED_CACHE_CODENAMES = {T2_RECOVERY_SUITE, "noble"}
 
 # tiny-dfr is mandatory where Touch Bar support must work.
 T2_TOUCHBAR_REQUIRED_CODENAMES = {T2_RECOVERY_SUITE, "noble"}
 
-T2_TOUCHBAR_OPTIONAL_CODENAMES = {"jammy"}
+# Do not try tiny-dfr on older optional caches unless that release repo actually
+# advertises it. Missing optional candidates are skipped by the cache resolver.
+T2_TOUCHBAR_OPTIONAL_CODENAMES: Set[str] = set()
 
 # Keep this name as core-only compatibility. Codename-sensitive paths must use
 # t2_required_packages_for_codename().
@@ -152,22 +155,32 @@ T2_INITRAMFS_MODULES = [
 # AMD-equipped T2 Macs should use amdgpu/radeon DRM plus Xorg modesetting.
 T2_GRAPHICS_MODULES = ["i915", "amdgpu", "radeon"]
 
-T2_RECOVERY_GRAPHICS_PACKAGES = [
+
+T2_GRAPHICS_PACKAGES_COMMON = [
     "libgl1-mesa-dri",
     "libglx-mesa0",
     "xserver-xorg-video-amdgpu",
     "xserver-xorg-video-radeon",
-    "firmware-amd-graphics",
+]
+
+# Debian firmware package name. This exists on Debian trixie/bookworm.
+T2_DEBIAN_GRAPHICS_FIRMWARE_PACKAGES = ["firmware-amd-graphics"]
+
+# Ubuntu / Pop!_OS / Linux Mint firmware package name. firmware-amd-graphics is
+# Debian-only; Ubuntu-family systems get AMD firmware through linux-firmware.
+T2_UBUNTU_GRAPHICS_FIRMWARE_PACKAGES = ["linux-firmware"]
+
+T2_RECOVERY_GRAPHICS_PACKAGES = [
+    *T2_GRAPHICS_PACKAGES_COMMON,
+    *T2_DEBIAN_GRAPHICS_FIRMWARE_PACKAGES,
     "mesa-utils",
 ]
 
-T2_RESTORED_GRAPHICS_PACKAGES = [
-    "libgl1-mesa-dri",
-    "libglx-mesa0",
-    "xserver-xorg-video-amdgpu",
-    "xserver-xorg-video-radeon",
-    "firmware-amd-graphics",
-]
+# Compatibility name only. Codename-sensitive paths must use
+# t2_graphics_packages_for_codename().
+T2_RESTORED_GRAPHICS_PACKAGES = [*T2_GRAPHICS_PACKAGES_COMMON]
+
+
 MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
 PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
 BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
@@ -2157,27 +2170,53 @@ def target_os_release_map(target: Path) -> Dict[str, str]:
 def target_t2_codename(target: Path) -> str:
     values = target_os_release_map(target)
 
-    for key in ("VERSION_CODENAME", "UBUNTU_CODENAME", "DEBIAN_CODENAME"):
-        codename = values.get(key, "").strip().lower()
-        if codename:
-            return codename
-
-    version_id = values.get("VERSION_ID", "").strip()
     distro_id = values.get("ID", "").strip().lower()
+    distro_like = values.get("ID_LIKE", "").strip().lower()
+    version_id = values.get("VERSION_ID", "").strip().lower()
 
-    if distro_id in {"pop", "pop_os", "pop!_os", "ubuntu"}:
-        if version_id.startswith("22.04"):
-            return "jammy"
-        if version_id.startswith("24.04"):
+    ubuntu_codename = values.get("UBUNTU_CODENAME", "").strip().lower()
+    debian_codename = values.get("DEBIAN_CODENAME", "").strip().lower()
+    version_codename = values.get("VERSION_CODENAME", "").strip().lower()
+
+    ubuntu_like = (
+        distro_id in {"ubuntu", "pop", "pop_os", "pop!_os", "linuxmint", "elementary", "zorin", "neon"}
+        or "ubuntu" in distro_like
+    )
+    debian_like = distro_id == "debian" or "debian" in distro_like
+
+    # Ubuntu derivatives often use their own VERSION_CODENAME, e.g. Linux Mint
+    # 22 uses "wilma", but their binary package base is still Ubuntu noble.
+    if ubuntu_like:
+        for candidate in (ubuntu_codename, debian_codename, version_codename):
+            if candidate in T2_CACHE_UBUNTU_CODENAMES:
+                return candidate
+
+        if version_id.startswith("24.04") or version_id in {"22", "22.1", "22.2", "22.3"}:
             return "noble"
 
-    if distro_id == "debian":
-        if version_id.startswith("12"):
-            return "bookworm"
+        if version_id.startswith("22.04") or version_id.startswith("21."):
+            return "jammy"
+
+        # Current supported Ubuntu-family fallback for this recovery builder.
+        return "noble"
+
+    if debian_like:
+        for candidate in (debian_codename, version_codename):
+            if candidate in T2_CACHE_DEBIAN_CODENAMES:
+                return candidate
+
         if version_id.startswith("13"):
             return "trixie"
+        if version_id.startswith("12"):
+            return "bookworm"
 
-    return DEFAULT_RECOVERY_SUITE
+        return T2_RECOVERY_SUITE
+
+    for candidate in (ubuntu_codename, debian_codename, version_codename):
+        if candidate in T2_CACHE_UBUNTU_CODENAMES or candidate in T2_CACHE_DEBIAN_CODENAMES:
+            return candidate
+
+    return "noble"
 
 
 def append_unique_lines(path: Path, lines: List[str], mode: int = 0o644) -> None:
@@ -2473,6 +2512,7 @@ def write_t2_apt_sources(root: Path, codename: str) -> None:
     )
 
 
+
 def t2_package_install_command(packages: List[str]) -> List[str]:
     return [
         "/usr/bin/env",
@@ -2487,17 +2527,74 @@ def t2_package_install_command(packages: List[str]) -> List[str]:
     ]
 
 
+def t2_codename_family(codename: str) -> str:
+    cleaned = str(codename or "").strip().lower()
+    if cleaned in T2_CACHE_UBUNTU_CODENAMES:
+        return "ubuntu"
+    if cleaned in T2_CACHE_DEBIAN_CODENAMES:
+        return "debian"
+    return ""
+
+
+def t2_graphics_packages_for_codename(codename: str, include_recovery_extras: bool = False) -> List[str]:
+    family = t2_codename_family(codename)
+
+    packages = [*T2_GRAPHICS_PACKAGES_COMMON]
+
+    if family == "debian":
+        packages.extend(T2_DEBIAN_GRAPHICS_FIRMWARE_PACKAGES)
+    else:
+        # Pop!_OS, Ubuntu, and Linux Mint are Ubuntu-family here.
+        packages.extend(T2_UBUNTU_GRAPHICS_FIRMWARE_PACKAGES)
+
+    if include_recovery_extras:
+        packages.append("mesa-utils")
+
+    return dedupe(packages)
+
+
 def t2_required_packages_for_codename(codename: str) -> List[str]:
     cleaned = str(codename or "").strip().lower()
 
-    packages = [*T2_CORE_REQUIRED_PACKAGES]
+    packages = [
+        *T2_CORE_REQUIRED_PACKAGES,
+        *t2_graphics_packages_for_codename(cleaned),
+    ]
 
     if cleaned in T2_TOUCHBAR_REQUIRED_CODENAMES:
         packages.extend(T2_TOUCHBAR_PACKAGES)
 
     return dedupe(packages)
 
+
+def chroot_package_has_candidate(target: Path, package: str) -> bool:
+    result = run_chroot(target, ["apt-cache", "policy", package])
+    if result.returncode != 0:
+        return False
+
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("Candidate:"):
+            candidate = line.split(":", 1)[1].strip()
+            return bool(candidate and candidate != "(none)")
+
+    return False
+
+
 def install_t2_packages_best_effort(target: Path, required: List[str], optional: List[str]) -> None:
+    required = dedupe([package for package in required if package])
+    optional = dedupe([package for package in optional if package and package not in required])
+
+    missing_required = [
+        package for package in required
+        if not chroot_package_has_candidate(target, package)
+    ]
+    if missing_required:
+        raise AegisError(
+            "Required Apple T2 package(s) are missing from the recovery USB offline repo: "
+            + ", ".join(missing_required)
+        )
+
     if required:
         run_chroot_checked(
             target,
@@ -2506,11 +2603,13 @@ def install_t2_packages_best_effort(target: Path, required: List[str], optional:
         )
 
     for package in optional:
+        if not chroot_package_has_candidate(target, package):
+            continue
+
         result = run_chroot(target, t2_package_install_command([package]))
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
             log_line(f"Optional Apple T2 package {package} was not installed: {detail}")
-
 
 def newest_kernel_pair_matching(target: Path, needle: str) -> Optional[Tuple[Path, Path]]:
     boot_dir = target / "boot"
@@ -2652,10 +2751,7 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
             install_t2_packages_best_effort(
                 target,
                 required=t2_required_packages_for_codename(codename),
-                optional=[
-                    *T2_OPTIONAL_PACKAGES,
-                    *T2_RESTORED_GRAPHICS_PACKAGES,
-                ],
+                optional=t2_offline_optional_cache_packages(codename),
             )
 
     return True
@@ -7176,6 +7272,7 @@ def t2_chroot_apt_update_checked(root: Path, label: str) -> None:
     raise AegisError(f"{label} failed after retrying apt metadata fetches: {last_detail}")
 
 
+
 def t2_offline_required_cache_packages(codename: str) -> List[str]:
     packages = [
         *t2_required_packages_for_codename(codename),
@@ -7190,19 +7287,16 @@ def t2_offline_required_cache_packages(codename: str) -> List[str]:
 def t2_offline_optional_cache_packages(codename: str) -> List[str]:
     cleaned = str(codename or "").strip().lower()
 
-    packages = [
-        *T2_OPTIONAL_PACKAGES,
-        *T2_RESTORED_GRAPHICS_PACKAGES,
-    ]
+    packages = [*T2_OPTIONAL_PACKAGES]
 
     if cleaned in T2_TOUCHBAR_OPTIONAL_CODENAMES:
         packages.extend(T2_TOUCHBAR_PACKAGES)
 
     if cleaned == T2_RECOVERY_SUITE:
-        packages.extend(T2_RECOVERY_GRAPHICS_PACKAGES)
+        packages.append("mesa-utils")
 
-    return dedupe(packages)
-
+    required = set(t2_offline_required_cache_packages(cleaned))
+    return dedupe([package for package in packages if package not in required])
 
 def prepare_t2_cache_apt_state(mount_root: Path, codename: str, repo_dir: Path) -> str:
     state = f"/tmp/aegis-t2-cache-apt-{codename}"
@@ -7253,6 +7347,34 @@ def t2_cache_apt_get_command(state: str, repo_dir: Path, apt_args: List[str]) ->
     ]
 
 
+
+def t2_cache_package_has_candidate(
+    mount_root: Path,
+    state: str,
+    repo_dir: Path,
+    package: str,
+) -> bool:
+    result = run_chroot(
+        mount_root,
+        [
+            "apt-cache",
+            *t2_cache_apt_options(state, repo_dir),
+            "policy",
+            package,
+        ],
+    )
+    if result.returncode != 0:
+        return False
+
+    for raw in result.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("Candidate:"):
+            candidate = line.split(":", 1)[1].strip()
+            return bool(candidate and candidate != "(none)")
+
+    return False
+
+
 def cache_t2_package_closure(
     mount_root: Path,
     codename: str,
@@ -7261,6 +7383,7 @@ def cache_t2_package_closure(
     label: str,
     required: bool,
 ) -> None:
+    packages = dedupe([package for package in packages if package])
     if not packages:
         return
 
@@ -7275,6 +7398,18 @@ def cache_t2_package_closure(
         if required:
             raise AegisError(f"apt update for {label} failed: {detail}")
         log_line(f"Optional Apple T2 cache update failed for {label}: {detail}")
+        return
+
+    missing = [
+        package for package in packages
+        if not t2_cache_package_has_candidate(mount_root, state, repo_dir, package)
+    ]
+    if missing:
+        if required:
+            raise AegisError(
+                f"Could not cache required Apple T2 package dependency set for {label}: "
+                f"no installation candidate for {', '.join(missing)}"
+            )
         return
 
     result = run_chroot(
@@ -7299,7 +7434,6 @@ def cache_t2_package_closure(
         if required:
             raise AegisError(f"Could not cache required Apple T2 package dependency set for {label}: {detail}")
         log_line(f"Optional Apple T2 package dependency set was not fully cached for {label}: {detail}")
-
 
 def index_t2_offline_repo(mount_root: Path, codename: str, repo_dir: Path, required: bool = True) -> bool:
     repo_abs = mount_root / str(repo_dir).lstrip("/")
