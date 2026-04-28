@@ -4422,6 +4422,120 @@ def stream_archive_from_repo(
 
     return digest
 
+def verify_manifest_restore_stream(
+    repo: Path,
+    manifest: SnapshotManifest,
+    key: Optional[bytes],
+    *,
+    validate_tar_headers: bool = False,
+) -> None:
+    if manifest.kind not in {"full_recovery", "portable_state"}:
+        raise AegisError(f"Unsupported restore snapshot kind: {manifest.kind}")
+
+    if not manifest.archive_refs:
+        raise AegisError(
+            f"Snapshot {manifest.id} has no archive chunk refs. "
+            "This is a metadata-only or delta-only snapshot, not a restorable backup."
+        )
+
+    expected = int(manifest.archive_plaintext_bytes or 0)
+    refs_total = sum(int(ref.plain_len or 0) for ref in manifest.archive_refs)
+
+    if expected <= 10240:
+        raise AegisError(
+            f"Snapshot {manifest.id} restore stream is only {human_bytes(expected)}. "
+            "That is empty or near-empty and cannot represent a system restore."
+        )
+
+    if refs_total != expected:
+        raise AegisError(
+            f"Snapshot {manifest.id} manifest is inconsistent: chunk refs total "
+            f"{human_bytes(refs_total)}, but manifest archive size is {human_bytes(expected)}."
+        )
+
+    hasher = hashlib.sha256()
+    done = 0
+    first_block = b""
+
+    tar_proc: Optional[subprocess.Popen] = None
+    if validate_tar_headers:
+        tar_proc = subprocess.Popen(
+            ["tar", "-tf", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        assert tar_proc.stdin is not None
+
+    try:
+        for index, ref in enumerate(manifest.archive_refs):
+            if not ref.hash:
+                raise AegisError(f"Snapshot {manifest.id} contains an empty chunk hash at index {index}.")
+
+            obj = object_path(repo, manifest.machine_id, ref.hash)
+            if not obj.exists():
+                raise AegisError(
+                    f"Snapshot {manifest.id} is missing backup object {ref.hash}. "
+                    "This snapshot cannot be restored."
+                )
+
+            plaintext = object_decode(obj.read_bytes(), key)
+
+            if len(plaintext) != int(ref.plain_len or 0):
+                raise AegisError(
+                    f"Snapshot {manifest.id} object length mismatch for {ref.hash}: "
+                    f"object decoded to {human_bytes(len(plaintext))}, manifest expected {human_bytes(int(ref.plain_len or 0))}."
+                )
+
+            if index == 0:
+                first_block = plaintext[:512]
+
+            hasher.update(plaintext)
+            done += len(plaintext)
+
+            if tar_proc and tar_proc.stdin:
+                try:
+                    tar_proc.stdin.write(plaintext)
+                except BrokenPipeError as exc:
+                    stderr = tar_proc.stderr.read().decode("utf-8", errors="ignore") if tar_proc.stderr else ""
+                    raise AegisError(
+                        f"Snapshot {manifest.id} is not a readable tar restore stream: "
+                        f"{stderr.strip() or 'tar stopped while reading the stream'}"
+                    ) from exc
+
+        if done != expected:
+            raise AegisError(
+                f"Snapshot {manifest.id} decoded {human_bytes(done)}, but expected {human_bytes(expected)}."
+            )
+
+        digest = hasher.hexdigest()
+        if manifest.archive_sha256 and digest != manifest.archive_sha256:
+            raise AegisError(
+                f"Snapshot {manifest.id} archive digest mismatch. "
+                "The manifest refs do not reconstruct the recorded restore stream."
+            )
+
+        if len(first_block) < 512 or first_block == b"\0" * 512:
+            raise AegisError(
+                f"Snapshot {manifest.id} starts with an empty or invalid tar block. "
+                "This is not a valid full restore stream."
+            )
+
+    finally:
+        if tar_proc and tar_proc.stdin:
+            try:
+                tar_proc.stdin.close()
+            except Exception:
+                pass
+
+    if tar_proc:
+        stderr = tar_proc.stderr.read().decode("utf-8", errors="ignore") if tar_proc.stderr else ""
+        returncode = tar_proc.wait()
+        if returncode != 0:
+            raise AegisError(
+                f"Snapshot {manifest.id} is not a readable tar restore stream: "
+                f"{stderr.strip() or f'tar exited with status {returncode}'}"
+            )
 
 class RepoWriter:
     def __init__(
@@ -4946,16 +5060,16 @@ def capture_backup_kind(
         raise AegisError(f"tar backup failed for {kind_label_text}: {stderr_data.strip() or returncode}")
 
     refs, total_bytes, archive_sha = writer.finish()
-
+    
     set_job_progress(
         min(91.0, kind_base + kind_span - 1.0),
-        f"Writing manifest for {kind_label_text}",
+        f"Verifying restore stream for {kind_label_text}",
         bytes_done=total_bytes,
         bytes_total=max(total_bytes, estimate_bytes),
-        detail="The point-in-time restore manifest is being written.",
+        detail="Checking that this snapshot can reconstruct a complete restore archive.",
         phase=kind,
     )
-
+    
     manifest = SnapshotManifest(
         version=1,
         id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
@@ -4974,6 +5088,23 @@ def capture_backup_kind(
         metadata=metadata,
         notes=list(metadata.notes),
     )
+    
+    verify_manifest_restore_stream(
+        Path(settings.repo_path),
+        manifest,
+        machine_key_value,
+        validate_tar_headers=False,
+    )
+    
+    set_job_progress(
+        min(91.0, kind_base + kind_span - 1.0),
+        f"Writing manifest for {kind_label_text}",
+        bytes_done=total_bytes,
+        bytes_total=max(total_bytes, estimate_bytes),
+        detail="The point-in-time restore manifest is being written.",
+        phase=kind,
+    )
+    
     write_manifest(settings, manifest)
     log_line(f"Created {kind_label_text}: {manifest.id} ({human_bytes(total_bytes)} restore stream)")
     return manifest.id
@@ -6211,19 +6342,32 @@ def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest,
 
     if returncode != 0:
         raise AegisError(f"tar extraction failed: {stderr_data.strip() or returncode}")
-
+    
     if digest != manifest.archive_sha256:
         raise AegisError("Archive integrity mismatch during restore.")
-
+    
     if not member:
         expected = int(manifest.archive_plaintext_bytes or 0)
-
-        if streamed <= 10240:
+        refs_total = sum(int(ref.plain_len or 0) for ref in manifest.archive_refs)
+    
+        if not manifest.archive_refs:
             raise AegisError(
-                f"Restore extracted only {human_bytes(streamed)}. "
-                "That is an empty or near-empty tar stream, not a valid system restore."
+                "Restore snapshot has no archive chunk refs. "
+                "This is not a restorable snapshot."
             )
-
+    
+        if expected <= 10240 or refs_total <= 10240 or streamed <= 10240:
+            raise AegisError(
+                f"Restore streamed only {human_bytes(streamed)}. "
+                "That is empty or near-empty, not a valid system restore."
+            )
+    
+        if refs_total != expected:
+            raise AegisError(
+                f"Restore manifest is inconsistent: chunk refs total {human_bytes(refs_total)}, "
+                f"but manifest expected {human_bytes(expected)}."
+            )
+    
         if expected and streamed != expected:
             raise AegisError(
                 f"Restore streamed {human_bytes(streamed)}, but the manifest expected {human_bytes(expected)}."
@@ -6658,8 +6802,12 @@ def mounted_guided_target(device: str):
         shutil.rmtree(mount_root, ignore_errors=True)
 
 def assert_manifest_has_restore_payload(repo: Path, manifest: SnapshotManifest, key: Optional[bytes]) -> None:
-    if manifest.kind not in {"full_recovery", "portable_state"}:
-        raise AegisError("Guided disk restore only works with Full Recovery or Portable Migration snapshots.")
+    verify_manifest_restore_stream(
+        repo,
+        manifest,
+        key,
+        validate_tar_headers=True,
+    )
 
     if not manifest.archive_refs:
         raise AegisError(
