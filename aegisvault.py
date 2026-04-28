@@ -2307,25 +2307,30 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
 
     configure_t2_kernel_files(target)
 
+    local_source_list = target / "etc/apt/sources.list.d/aegis-t2-local.list"
+
     with mounted_t2_local_repo_for_target(target, codename):
-        write_target_t2_local_apt_source(target, codename)
+        try:
+            write_target_t2_local_apt_source(target, codename)
 
-        run_chroot_checked(
-            target,
-            [
-                "/usr/bin/env",
-                "DEBIAN_FRONTEND=noninteractive",
-                "apt-get",
-                "update",
-            ],
-            "apt update for local Apple T2 support repo",
-        )
+            run_chroot_checked(
+                target,
+                [
+                    "/usr/bin/env",
+                    "DEBIAN_FRONTEND=noninteractive",
+                    "apt-get",
+                    "update",
+                ],
+                "apt update for local Apple T2 support repo",
+            )
 
-        install_t2_packages_best_effort(
-            target,
-            required=T2_REQUIRED_PACKAGES,
-            optional=T2_OPTIONAL_PACKAGES,
-        )
+            install_t2_packages_best_effort(
+                target,
+                required=T2_REQUIRED_PACKAGES,
+                optional=T2_OPTIONAL_PACKAGES,
+            )
+        finally:
+            local_source_list.unlink(missing_ok=True)
 
     return True
 
@@ -6603,6 +6608,29 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
     write_t2_apt_sources(mount_root, DEFAULT_RECOVERY_SUITE)
     configure_t2_kernel_files(mount_root)
 
+    run_chroot_checked(
+        mount_root,
+        ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
+        "apt update before preparing Apple T2 package cache",
+    )
+
+    run_chroot_checked(
+        mount_root,
+        [
+            "/usr/bin/env",
+            "DEBIAN_FRONTEND=noninteractive",
+            "apt-get",
+            "-o",
+            "Dpkg::Use-Pty=0",
+            "install",
+            "-y",
+            "--no-install-recommends",
+            "ca-certificates",
+            "dpkg-dev",
+        ],
+        "install Apple T2 package cache tools",
+    )
+
     for codename in T2_RECOVERY_CODENAMES:
         download_one_t2_package_set(mount_root, codename)
 
@@ -6657,48 +6685,6 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
             )
 
             packages = recovery_package_list(include_t2_support)
-                "systemd-sysv",
-                "grub-common",
-                "grub2-common",
-                "grub-pc-bin",
-                "grub-efi-amd64-bin",
-                "python3",
-                "python3-tk",
-                "python3-cryptography",
-                "xorg",
-                "xinit",
-                "openbox",
-                "xterm",
-                "dbus-x11",
-                "network-manager",
-                "ca-certificates",
-                "curl",
-                "rsync",
-                "openssh-client",
-                "tar",
-                "parted",
-                "dosfstools",
-                "gdisk",
-                "e2fsprogs",
-                "btrfs-progs",
-                "xfsprogs",
-                "ntfs-3g",
-                "exfatprogs",
-                "util-linux",
-                "udisks2",
-                "nvme-cli",
-                "cryptsetup",
-                "mdadm",
-                "lvm2",
-                "dmsetup",
-                "usbutils",
-                "pciutils",
-                "firmware-misc-nonfree",
-                "firmware-brcm80211",
-                "firmware-iwlwifi",
-                "firmware-realtek",
-                "sudo",
-            ]
             try:
                 run_chroot_checked(
                     mount_root,
