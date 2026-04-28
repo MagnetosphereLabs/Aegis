@@ -6183,12 +6183,18 @@ def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest,
     if member:
         label = f"Restoring {normalize_member_path(member)}"
 
+    streamed = 0
+
     def report_progress(done_bytes: int, total_bytes: int) -> None:
+        nonlocal streamed
+        streamed = done_bytes
+
         if total_bytes <= 0:
-            set_job_progress(None, f"{label} — streaming data")
+            set_job_progress(None, f"{label} - streaming data")
             return
+
         percent = (done_bytes / total_bytes) * 90.0
-        stage = f"{label} — {percent:.1f}% ({human_bytes(done_bytes)} / {human_bytes(total_bytes)})"
+        stage = f"{label} - {percent:.1f}% ({human_bytes(done_bytes)} / {human_bytes(total_bytes)})"
         set_job_progress(percent, stage)
 
     digest = stream_archive_from_repo(
@@ -6202,13 +6208,28 @@ def extract_manifest_from_repo_to_target(repo: Path, manifest: SnapshotManifest,
 
     stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
     returncode = proc.wait()
+
     if returncode != 0:
         raise AegisError(f"tar extraction failed: {stderr_data.strip() or returncode}")
+
     if digest != manifest.archive_sha256:
         raise AegisError("Archive integrity mismatch during restore.")
 
-    set_job_progress(90.0, "Restore payload extracted")
+    if not member:
+        expected = int(manifest.archive_plaintext_bytes or 0)
 
+        if streamed <= 10240:
+            raise AegisError(
+                f"Restore extracted only {human_bytes(streamed)}. "
+                "That is an empty or near-empty tar stream, not a valid system restore."
+            )
+
+        if expected and streamed != expected:
+            raise AegisError(
+                f"Restore streamed {human_bytes(streamed)}, but the manifest expected {human_bytes(expected)}."
+            )
+
+    set_job_progress(90.0, "Restore payload extracted")
 
 def extract_archive_file_to_target(archive_file: Path, target: Path, member: Optional[str]) -> None:
     target.mkdir(parents=True, exist_ok=True)
@@ -6636,16 +6657,83 @@ def mounted_guided_target(device: str):
         flush_and_unmount(mount_root)
         shutil.rmtree(mount_root, ignore_errors=True)
 
-
-def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_password: Optional[str]) -> None:
-    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
-    ensure_target_disk_is_not_source_disk(target_disk, str(repo), "selected backup repository")
-
-    manifest = find_snapshot_manifest(repo, snapshot_id)
+def assert_manifest_has_restore_payload(repo: Path, manifest: SnapshotManifest, key: Optional[bytes]) -> None:
     if manifest.kind not in {"full_recovery", "portable_state"}:
         raise AegisError("Guided disk restore only works with Full Recovery or Portable Migration snapshots.")
 
+    if not manifest.archive_refs:
+        raise AegisError(
+            f"Snapshot {manifest.id} has no backup data chunks. "
+            "Refusing to erase the target disk."
+        )
+
+    expected_total = int(manifest.archive_plaintext_bytes or 0)
+    refs_total = sum(int(ref.plain_len or 0) for ref in manifest.archive_refs)
+
+    if expected_total <= 0:
+        raise AegisError(
+            f"Snapshot {manifest.id} reports a zero-byte restore archive. "
+            "Refusing to erase the target disk."
+        )
+
+    if refs_total != expected_total:
+        raise AegisError(
+            f"Snapshot {manifest.id} manifest is inconsistent: refs total {human_bytes(refs_total)} "
+            f"but archive size is {human_bytes(expected_total)}. Refusing to erase the target disk."
+        )
+
+    first_ref = manifest.archive_refs[0]
+    first_obj = object_path(repo, manifest.machine_id, first_ref.hash)
+    if not first_obj.exists():
+        raise AegisError(
+            f"Snapshot {manifest.id} is missing its first backup data object: {first_ref.hash}. "
+            "Refusing to erase the target disk."
+        )
+
+    first_plain = object_decode(first_obj.read_bytes(), key)
+    if not first_plain:
+        raise AegisError(
+            f"Snapshot {manifest.id} starts with an empty data chunk. "
+            "Refusing to erase the target disk."
+        )
+
+    first_block = first_plain[:512]
+    if len(first_block) < 512:
+        raise AegisError(
+            f"Snapshot {manifest.id} starts with an incomplete tar block. "
+            "Refusing to erase the target disk."
+        )
+
+    if first_block == b"\0" * 512:
+        raise AegisError(
+            f"Snapshot {manifest.id} appears to contain an empty tar archive. "
+            "Refusing to erase the target disk."
+        )
+
+    missing = []
+    for ref in manifest.archive_refs:
+        obj = object_path(repo, manifest.machine_id, ref.hash)
+        if not obj.exists():
+            missing.append(ref.hash)
+            if len(missing) >= 5:
+                break
+
+    if missing:
+        raise AegisError(
+            "Snapshot data is incomplete; missing backup object(s): "
+            + ", ".join(missing)
+            + ". Refusing to erase the target disk."
+        )
+
+def guided_full_restore_from_repo(settings: Settings, snapshot_id: str, target_disk: str, recovery_password: Optional[str]) -> None:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    manifest = find_snapshot_manifest(repo, snapshot_id)
     key = resolve_machine_key_for_manifest(settings, manifest, recovery_password)
+
+    update_stage(f"Checking restore payload for {snapshot_id}")
+    assert_manifest_has_restore_payload(repo, manifest, key)
+
+    ensure_target_disk_is_not_source_disk(target_disk, str(repo), "selected backup repository")
 
     with mounted_guided_target(target_disk) as (layout, mount_root):
         update_stage(f"Restoring {snapshot_id} to {target_disk}")
@@ -7508,7 +7596,10 @@ def run_job(name: str, func):
     log_line(f"{name} queued")
 
     state = load_state()
-    state.last_error = ""
+    state.last_error = (
+        f"{name} was interrupted before it reported success. "
+        "If this message remains after the job stops, the Aegis daemon or restore worker exited unexpectedly."
+    )
     save_state(state)
 
     is_backup_job = "backup" in name.lower()
@@ -11075,8 +11166,13 @@ def gui_main() -> int:
                 self.message_var.set(str(exc))
                 return
 
-            if info.get("kind") not in {"full_recovery", "portable_state"}:
-                self.message_var.set("Choose a valid backup first.")
+            snapshot = self.selected_snapshot()
+            restore_size = int(snapshot.get("archive_plaintext_bytes") or snapshot.get("archive_bytes") or 0)
+            if restore_size <= 10240:
+                self.message_var.set(
+                    f"Selected backup restore size is only {human_bytes(restore_size)}. "
+                    "Refusing to erase the target disk because this does not look like a real system backup."
+                )
                 return
 
             recovery_password = self.repo_recovery_key_var.get().strip()
@@ -11197,8 +11293,15 @@ def gui_main() -> int:
                     self.message_var.set(str(exc))
 
         def periodic_refresh(self) -> None:
-            if self.recovery_mode:
+            current_job = None
+            try:
+                current_job = self.dashboard_payload.get("current_job") if self.dashboard_payload else None
+            except Exception:
+                current_job = None
+        
+            if self.recovery_mode and not current_job:
                 self.refresh_local_device_lists()
+        
             self.refresh_dashboard()
             self.root.after(2000, self.periodic_refresh)
 
