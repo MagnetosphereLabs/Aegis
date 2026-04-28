@@ -2598,21 +2598,22 @@ def install_t2_packages_best_effort(target: Path, required: List[str], optional:
             + ", ".join(missing_required)
         )
 
-    if required:
-        run_chroot_checked(
-            target,
-            t2_package_install_command(required),
-            "install required Apple T2 support packages",
-        )
+    with chroot_service_autostart_guard(target):
+        if required:
+            run_chroot_checked(
+                target,
+                t2_package_install_command(required),
+                "install required Apple T2 support packages",
+            )
 
-    for package in optional:
-        if not chroot_package_has_candidate(target, package):
-            continue
+        for package in optional:
+            if not chroot_package_has_candidate(target, package):
+                continue
 
-        result = run_chroot(target, t2_package_install_command([package]))
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-            log_line(f"Optional Apple T2 package {package} was not installed: {detail}")
+            result = run_chroot(target, t2_package_install_command([package]))
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+                log_line(f"Optional Apple T2 package {package} was not installed: {detail}")
 
 def newest_kernel_pair_matching(target: Path, needle: str) -> Optional[Tuple[Path, Path]]:
     boot_dir = target / "boot"
@@ -5613,6 +5614,97 @@ def run_chroot(target: Path, args: List[str]) -> subprocess.CompletedProcess:
         text=True,
     )
 
+@contextmanager
+def chroot_service_autostart_guard(target: Path):
+    """
+    Package maintainer scripts sometimes call systemctl enable --now/start.
+    That fails in a build/restore chroot because systemd is not PID 1.
+
+    During package installation:
+    - service starts are blocked
+    - enable commands are allowed best-effort with --now stripped
+    - package configuration is allowed to finish
+    """
+    policy_path = target / "usr/sbin/policy-rc.d"
+    policy_backup = policy_path.with_name(policy_path.name + ".aegis-real")
+
+    systemctl_path = target / "usr/bin/systemctl"
+    if not systemctl_path.exists():
+        systemctl_path = target / "bin/systemctl"
+    systemctl_real = systemctl_path.with_name(systemctl_path.name + ".aegis-real")
+
+    systemctl_guarded = False
+
+    try:
+        policy_path.parent.mkdir(parents=True, exist_ok=True)
+        if policy_path.exists() and not policy_backup.exists():
+            policy_path.rename(policy_backup)
+
+        atomic_write(
+            policy_path,
+            b"#!/bin/sh\nexit 101\n",
+            mode=0o755,
+        )
+
+        if systemctl_path.exists():
+            if not systemctl_real.exists():
+                systemctl_path.rename(systemctl_real)
+
+            real_inside = "/" + str(systemctl_real.relative_to(target))
+            wrapper = textwrap.dedent("""\
+                #!/bin/bash
+                REAL="__AEGIS_REAL_SYSTEMCTL__"
+
+                args=()
+                for arg in "$@"; do
+                    if [[ "$arg" == "--now" ]]; then
+                        continue
+                    fi
+                    args+=("$arg")
+                done
+
+                action=""
+                for arg in "${args[@]}"; do
+                    if [[ "$arg" == -* ]]; then
+                        continue
+                    fi
+                    action="$arg"
+                    break
+                done
+
+                case "$action" in
+                    enable|reenable|disable|preset|mask|unmask)
+                        if [[ -x "$REAL" ]]; then
+                            "$REAL" "${args[@]}" >/dev/null 2>&1 || true
+                        fi
+                        exit 0
+                        ;;
+                    start|stop|restart|try-restart|reload|reload-or-restart|daemon-reload)
+                        exit 0
+                        ;;
+                esac
+
+                if [[ -x "$REAL" ]]; then
+                    exec "$REAL" "$@"
+                fi
+
+                exit 0
+            """).replace("__AEGIS_REAL_SYSTEMCTL__", real_inside)
+
+            atomic_write(systemctl_path, wrapper.encode("utf-8"), mode=0o755)
+            systemctl_guarded = True
+
+        yield
+
+    finally:
+        policy_path.unlink(missing_ok=True)
+        if policy_backup.exists():
+            policy_backup.rename(policy_path)
+
+        if systemctl_guarded and systemctl_real.exists():
+            systemctl_path.unlink(missing_ok=True)
+            systemctl_real.rename(systemctl_path)
+
 def safe_unlink_any(path: Path) -> None:
     try:
         if path.is_dir() and not path.is_symlink():
@@ -7776,21 +7868,22 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
 
             packages = recovery_package_list(include_t2_support)
             try:
-                run_chroot_checked(
-                    mount_root,
-                    [
-                        "/usr/bin/env",
-                        "DEBIAN_FRONTEND=noninteractive",
-                        "apt-get",
-                        "-o",
-                        "Dpkg::Use-Pty=0",
-                        "install",
-                        "-y",
-                        "--no-install-recommends",
-                        *packages,
-                    ],
-                    "package install in recovery media",
-                )
+                with chroot_service_autostart_guard(mount_root):
+                    run_chroot_checked(
+                        mount_root,
+                        [
+                            "/usr/bin/env",
+                            "DEBIAN_FRONTEND=noninteractive",
+                            "apt-get",
+                            "-o",
+                            "Dpkg::Use-Pty=0",
+                            "install",
+                            "-y",
+                            "--no-install-recommends",
+                            *packages,
+                        ],
+                        "package install in recovery media",
+                    )
             except AegisError as exc:
                 detail = str(exc)
                 if "Read-only file system" in detail:
