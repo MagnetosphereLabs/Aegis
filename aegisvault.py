@@ -887,18 +887,6 @@ def host_service_unit_text() -> str:
     python_bin = sys.executable
     app_path = str(Path(__file__).resolve())
 
-    load_cred_line = ""
-    try:
-        settings = load_settings()
-        if settings.encryption_enabled:
-            load_cred_line = (
-                f"LoadCredentialEncrypted="
-                f"{credential_name_for_machine(settings.machine_id)}:"
-                f"{local_key_credential_path(settings.machine_id)}"
-            )
-    except Exception:
-        pass
-
     return textwrap.dedent(
         f"""
         [Unit]
@@ -916,7 +904,6 @@ def host_service_unit_text() -> str:
         RestartSec=5
         WorkingDirectory=/var/lib/aegisvault
         UMask=0077
-        {load_cred_line}
 
         [Install]
         WantedBy=multi-user.target
@@ -2975,10 +2962,12 @@ def read_machine_key_credential(machine: str) -> bytes:
 
 
 def has_local_machine_key(machine: str) -> bool:
-    service_cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
-    if service_cred_dir and (Path(service_cred_dir) / credential_name_for_machine(machine)).exists():
-        return True
-    return local_key_credential_path(machine).exists() or local_key_path(machine).exists()
+    try:
+        key = read_local_machine_key(machine)
+        return len(key) == 32
+    except Exception as exc:
+        log_line(f"Local unlock credential for {machine} is not usable: {exc}")
+        return False
 
 
 def repo_machine_dir(repo: Path, machine: str) -> Path:
@@ -4308,6 +4297,30 @@ def unwrap_machine_key(envelope: Dict[str, Any], recovery_password: str) -> byte
     cipher = AESGCM(key)
     return cipher.decrypt(nonce, ciphertext, None)
 
+def recover_local_machine_key_from_envelope(
+    settings: Settings,
+    machine: str,
+    recovery_password: str,
+) -> bytes:
+    repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+    envelope_file = key_envelope_path(repo, machine)
+
+    if not envelope_file.exists():
+        raise AegisError(
+            f"Recovery key envelope is missing for machine {machine}."
+        )
+
+    try:
+        machine_key_value = unwrap_machine_key(load_json(envelope_file), recovery_password)
+    except Exception as exc:
+        raise AegisError("Recovery password did not unlock this backup.") from exc
+
+    if len(machine_key_value) != 32:
+        raise AegisError("Recovered machine key has an invalid length.")
+
+    write_machine_key_credential(machine, machine_key_value)
+    log_line(f"Repaired local unlock credential for machine {machine} from recovery password.")
+    return machine_key_value
 
 def materialize_settings(settings: Settings, recovery_password: Optional[str] = None) -> bool:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
@@ -4331,16 +4344,36 @@ def materialize_settings(settings: Settings, recovery_password: Optional[str] = 
         write_machine_key_credential(settings.machine_id, machine_key_value)
         legacy_key.unlink(missing_ok=True)
 
-    elif not cred_path.exists():
-        if envelope_path.exists():
-            raise AegisError(
-                "The local unlock credential is missing for this machine. "
-                "Restore it with the recovery password instead of recreating encryption."
-            )
-        write_machine_key_credential(settings.machine_id, os.urandom(32))
-
     if envelope_path.exists():
-        return False
+        try:
+            read_local_machine_key(settings.machine_id)
+            return False
+        except Exception as exc:
+            log_line(
+                f"Local unlock credential for {settings.machine_id} could not be used and will be repaired from the recovery envelope: {exc}"
+            )
+
+            if not recovery_password:
+                raise AegisError(RECOVERY_PASSWORD_REQUIRED_ERROR) from exc
+
+            recover_local_machine_key_from_envelope(
+                settings,
+                settings.machine_id,
+                recovery_password,
+            )
+            return False
+
+    if cred_path.exists():
+        try:
+            read_local_machine_key(settings.machine_id)
+        except Exception as exc:
+            log_line(
+                f"Discarding unusable local unlock credential for new encrypted setup on {settings.machine_id}: {exc}"
+            )
+            cred_path.unlink(missing_ok=True)
+
+    if not cred_path.exists():
+        write_machine_key_credential(settings.machine_id, os.urandom(32))
 
     if not recovery_password:
         raise AegisError(RECOVERY_PASSWORD_REQUIRED_ERROR)
@@ -4591,22 +4624,16 @@ def resolve_machine_key_for_manifest(
         return None
 
     if has_local_machine_key(manifest.machine_id):
-        try:
-            return read_local_machine_key(manifest.machine_id)
-        except Exception as exc:
-            if not recovery_password:
-                raise AegisError(str(exc)) from exc
+        return read_local_machine_key(manifest.machine_id)
 
     if not recovery_password:
         raise AegisError("Recovery password is required for this encrypted backup.")
 
-    envelope_file = key_envelope_path(repo, manifest.machine_id)
-    if not envelope_file.exists():
-        raise AegisError(
-            f"Recovery key envelope is missing for machine {manifest.machine_id}."
-        )
-
-    return unwrap_machine_key(load_json(envelope_file), recovery_password)
+    return recover_local_machine_key_from_envelope(
+        settings,
+        manifest.machine_id,
+        recovery_password,
+    )
 
 
 def stream_archive_from_repo(
@@ -5331,14 +5358,14 @@ def capture_backup_kind(
     return manifest.id
 
 
-def perform_backup(settings: Settings, profile: str) -> List[str]:
+def perform_backup(settings: Settings, profile: str, recovery_password: Optional[str] = None) -> List[str]:
     start_stamp = now_rfc3339()
     state = load_state()
     state.last_run_at = start_stamp
     state.last_error = ""
     save_state(state)
 
-    materialize_settings(settings)
+    materialize_settings(settings, recovery_password=recovery_password)
     assert_backup_storage_preflight(settings)
 
     created: List[str] = []
@@ -8244,7 +8271,13 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": True, "info": backup_preflight_info(load_settings())}
     if action == "run_backup":
         profile = "both"
-        run_job("Backup Now", lambda: perform_backup(load_settings(), profile))
+        recovery_password = request.get("recovery_password") or None
+
+        settings = load_settings()
+        materialize_settings(settings, recovery_password=recovery_password)
+        save_settings(settings)
+
+        run_job("Backup Now", lambda: perform_backup(load_settings(), profile, recovery_password))
         return {"ok": True, "message": "Backup started. Aegis will create Full Recovery and Portable Migration restore points."}
     if action == "run_export":
         snapshot_id = request["snapshot"]
@@ -12054,13 +12087,41 @@ def gui_main() -> int:
             try:
                 if not self.confirm_backup_preflight():
                     return
+
+                recovery_password = ""
+
+                while True:
+                    response = send_daemon_request({
+                        "action": "run_backup",
+                        "profile": "both",
+                        "recovery_password": recovery_password,
+                    })
+
+                    if response.get("ok"):
+                        break
+
+                    error = str(response.get("error") or "Unknown daemon error")
+
+                    if error == RECOVERY_PASSWORD_REQUIRED_ERROR and not recovery_password:
+                        entered = self.ask_string_dialog(
+                            "Recovery password required",
+                            "This backup repository is encrypted, but the local automatic unlock credential is missing or no longer works after reinstall/reset.\n\nEnter the recovery password once. Aegis will repair the local unlock credential and continue:",
+                            show="*",
+                        )
+                        if entered is None:
+                            self.message_var.set("Backup canceled.")
+                            return
+
+                        recovery_password = entered.strip()
+                        continue
+
+                    raise AegisError(error)
+
                 self.open_backup_progress_window()
-                response = send_daemon_request({"action": "run_backup", "profile": "both"})
-                if not response.get("ok"):
-                    raise AegisError(response.get("error", "Unknown daemon error"))
                 self.message_var.set(response.get("message", "Backup started."))
                 self.root.after(100, self.refresh_dashboard)
                 self.root.after(700, self.refresh_dashboard)
+
             except Exception as exc:
                 self.finish_backup_progress_window(False, str(exc))
                 self.message_var.set(str(exc))
