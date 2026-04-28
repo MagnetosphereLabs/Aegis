@@ -2587,7 +2587,7 @@ def write_target_t2_local_apt_source(target: Path, codename: str) -> None:
     atomic_write(sources_dir / "aegis-t2-local.list", source.encode("utf-8"), mode=0o644)
 
 
-ddef maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
+def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
     if not t2_support_available_in_recovery():
         return False
 
