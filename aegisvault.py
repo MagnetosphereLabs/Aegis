@@ -6663,12 +6663,12 @@ def recovery_package_list(include_t2_support: bool) -> List[str]:
     ]
 
     if include_t2_support:
-        # These are required for a T2 recovery USB that can actually boot and
-        # use the internal Apple input stack, audio config, and Touch Bar daemon.
-        # Optional T2 packages are cached/installed best-effort elsewhere so one
-        # missing optional package never breaks the whole recovery USB.
+        # T2 recovery media does not get Debian's normal linux-image-amd64 path.
+        # Require initramfs-tools explicitly because update-initramfs is needed
+        # after writing the Apple T2 initramfs module config.
         packages.extend([
             "dpkg-dev",
+            "initramfs-tools",
             *T2_REQUIRED_PACKAGES,
             *T2_TOUCHBAR_PACKAGES,
         ])
@@ -6829,6 +6829,46 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
         mode=0o644,
     )
 
+
+def ensure_recovery_initramfs(mount_root: Path) -> None:
+    update_tool = mount_root / "usr/sbin/update-initramfs"
+    if not update_tool.exists():
+        raise AegisError(
+            "Apple T2 recovery media is missing /usr/sbin/update-initramfs. "
+            "The T2 recovery package list must include initramfs-tools."
+        )
+
+    modules_dir = mount_root / "lib/modules"
+    kernel_versions = sorted(
+        child.name
+        for child in modules_dir.iterdir()
+        if child.is_dir()
+    ) if modules_dir.exists() else []
+
+    if not kernel_versions:
+        raise AegisError("Apple T2 recovery media has no installed kernel modules under /lib/modules.")
+
+    for version in kernel_versions:
+        if (mount_root / "sbin/depmod").exists() or (mount_root / "usr/sbin/depmod").exists():
+            run_chroot_checked(
+                mount_root,
+                ["depmod", "-a", version],
+                f"depmod for recovery kernel {version}",
+            )
+
+        initrd = mount_root / "boot" / f"initrd.img-{version}"
+        mode = "-u" if initrd.exists() else "-c"
+
+        run_chroot_checked(
+            mount_root,
+            ["update-initramfs", mode, "-k", version],
+            f"initramfs generation for recovery kernel {version}",
+        )
+
+        if not initrd.exists():
+            raise AegisError(
+                f"Apple T2 recovery media did not create /boot/initrd.img-{version}."
+            )
 
 def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
     ensure_root()
@@ -6995,7 +7035,12 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
 
             run_chroot_checked(mount_root, ["/bin/systemctl", "enable", "aegisvault.service"], "enable aegisvault.service")
             run_chroot_checked(mount_root, ["/bin/systemctl", "enable", "NetworkManager.service"], "enable NetworkManager.service")
-            run_chroot_checked(mount_root, ["/usr/sbin/update-initramfs", "-u", "-k", "all"], "update-initramfs in recovery media")
+
+            if include_t2_support:
+                ensure_recovery_initramfs(mount_root)
+            else:
+                run_chroot_checked(mount_root, ["/usr/sbin/update-initramfs", "-u", "-k", "all"], "update-initramfs in recovery media")
+
             run_chroot_checked(mount_root, ["/usr/sbin/grub-install", "--target=i386-pc", layout["disk"]], "BIOS grub-install for recovery media")
             run_chroot_checked(
                 mount_root,
