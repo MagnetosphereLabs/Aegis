@@ -88,6 +88,11 @@ T2_APPLE_FIRMWARE_REPO = (
 )
 
 T2_RECOVERY_CODENAMES = ["trixie", "bookworm", "jammy", "noble"]
+T2_CACHE_UBUNTU_CODENAMES = {"jammy", "noble"}
+T2_CACHE_DEBIAN_CODENAMES = {"bookworm", "trixie"}
+UBUNTU_APT_MIRROR = "https://archive.ubuntu.com/ubuntu"
+UBUNTU_SECURITY_MIRROR = "https://security.ubuntu.com/ubuntu"
+DEBIAN_SECURITY_MIRROR = "https://security.debian.org/debian-security"
 T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
 T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
 T2_OPTIONAL_PACKAGES = [
@@ -2346,6 +2351,53 @@ def preflight_t2_repository_assets() -> None:
             + "\n".join(failures[:8])
         )
 
+def t2_remote_apt_sources_text(codename: str) -> str:
+    common_list = fetch_url_bytes(T2_COMMON_LIST_URL).decode("utf-8", errors="replace")
+    common_list = normalize_t2_apt_sources_text(common_list)
+
+    release_line = T2_RELEASE_REPO_TEMPLATE.format(codename=codename)
+
+    return (
+        common_list.rstrip()
+        + "\n"
+        + t2_signed_apt_line(release_line)
+        + "\n"
+        + t2_signed_apt_line(T2_APPLE_FIRMWARE_REPO)
+        + "\n"
+    )
+
+
+def t2_base_apt_sources_text(codename: str) -> str:
+    codename = str(codename or "").strip().lower()
+
+    if codename in T2_CACHE_UBUNTU_CODENAMES:
+        components = "main restricted universe multiverse"
+        return textwrap.dedent(f"""\
+            deb [trusted=yes] {UBUNTU_APT_MIRROR} {codename} {components}
+            deb [trusted=yes] {UBUNTU_APT_MIRROR} {codename}-updates {components}
+            deb [trusted=yes] {UBUNTU_SECURITY_MIRROR} {codename}-security {components}
+        """)
+
+    if codename in T2_CACHE_DEBIAN_CODENAMES:
+        components = "main contrib non-free non-free-firmware"
+        return textwrap.dedent(f"""\
+            deb [trusted=yes] {DEFAULT_RECOVERY_MIRROR} {codename} {components}
+            deb [trusted=yes] {DEFAULT_RECOVERY_MIRROR} {codename}-updates {components}
+            deb [trusted=yes] {DEBIAN_SECURITY_MIRROR} {codename}-security {components}
+        """)
+
+    return ""
+
+
+def t2_cache_apt_sources_text(codename: str) -> str:
+    base = t2_base_apt_sources_text(codename).strip()
+    remote = t2_remote_apt_sources_text(codename).strip()
+
+    if base:
+        return base + "\n" + remote + "\n"
+    return remote + "\n"
+
+
 def write_t2_apt_sources(root: Path, codename: str) -> None:
     keyring = root / T2_APT_KEYRING_PATH.lstrip("/")
     trusted_dir = root / "etc/apt/trusted.gpg.d"
@@ -2354,8 +2406,6 @@ def write_t2_apt_sources(root: Path, codename: str) -> None:
     sources_dir = root / "etc/apt/sources.list.d"
     sources_dir.mkdir(parents=True, exist_ok=True)
 
-    # Remove the legacy location if an earlier failed run left it behind.
-    # Otherwise apt may warn that it cannot read the old 0600 keyring.
     legacy_keyring = trusted_dir / "t2-ubuntu-repo.gpg"
     if legacy_keyring != keyring:
         legacy_keyring.unlink(missing_ok=True)
@@ -2387,9 +2437,6 @@ def write_t2_apt_sources(root: Path, codename: str) -> None:
         if not keyring_tmp.exists() or keyring_tmp.stat().st_size <= 0:
             raise AegisError("Could not prepare Apple T2 apt key: empty keyring was generated.")
 
-        # Critical fix: atomic_write with mode 0644 beats the daemon's UMask=0077.
-        # APT drops to _apt while reading repository metadata, so the signed-by
-        # keyring must be world-readable.
         atomic_write(keyring, keyring_tmp.read_bytes(), mode=0o644)
         os.chmod(keyring, 0o644)
 
@@ -2397,20 +2444,11 @@ def write_t2_apt_sources(root: Path, codename: str) -> None:
         key_ascii.unlink(missing_ok=True)
         keyring_tmp.unlink(missing_ok=True)
 
-    common_list = fetch_url_bytes(T2_COMMON_LIST_URL).decode("utf-8", errors="replace")
-    common_list = normalize_t2_apt_sources_text(common_list)
-
-    release_line = T2_RELEASE_REPO_TEMPLATE.format(codename=codename)
-    text = (
-        common_list.rstrip()
-        + "\n"
-        + t2_signed_apt_line(release_line)
-        + "\n"
-        + t2_signed_apt_line(T2_APPLE_FIRMWARE_REPO)
-        + "\n"
+    atomic_write(
+        sources_dir / "t2.list",
+        t2_remote_apt_sources_text(codename).encode("utf-8"),
+        mode=0o644,
     )
-
-    atomic_write(sources_dir / "t2.list", text.encode("utf-8"), mode=0o644)
 
 
 def t2_package_install_command(packages: List[str]) -> List[str]:
@@ -2483,6 +2521,64 @@ def mounted_t2_local_repo_for_target(target: Path, codename: str):
             subprocess.run(["umount", "-lf", str(dest)], check=False, capture_output=True)
 
 
+@contextmanager
+def target_t2_local_apt_only(target: Path, codename: str):
+    apt_dir = target / "etc/apt"
+    sources_dir = apt_dir / "sources.list.d"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    local_source_list = sources_dir / "aegis-t2-local.list"
+    local_source_list.unlink(missing_ok=True)
+
+    candidates: List[Path] = []
+    candidates.append(apt_dir / "sources.list")
+    if sources_dir.exists():
+        candidates.extend(sorted(sources_dir.glob("*.list")))
+        candidates.extend(sorted(sources_dir.glob("*.sources")))
+
+    disabled: List[Tuple[Path, Path]] = []
+
+    try:
+        for source_path in candidates:
+            if not source_path.exists() or source_path == local_source_list:
+                continue
+            if source_path.name.startswith("aegis-t2-local."):
+                source_path.unlink(missing_ok=True)
+                continue
+
+            disabled_path = source_path.with_name(source_path.name + ".aegis-t2-disabled")
+            suffix = 2
+            while disabled_path.exists():
+                disabled_path = source_path.with_name(source_path.name + f".aegis-t2-disabled-{suffix}")
+                suffix += 1
+
+            source_path.rename(disabled_path)
+            disabled.append((source_path, disabled_path))
+
+        write_target_t2_local_apt_source(target, codename)
+
+        run_chroot(
+            target,
+            [
+                "/bin/bash",
+                "-lc",
+                "rm -rf /var/lib/apt/lists/* "
+                "/var/lib/apt/lists/partial/* "
+                "/var/cache/apt/archives/partial/*",
+            ],
+        )
+
+        yield
+
+    finally:
+        local_source_list.unlink(missing_ok=True)
+
+        for original_path, disabled_path in reversed(disabled):
+            if disabled_path.exists():
+                if original_path.exists():
+                    safe_unlink_any(original_path)
+                disabled_path.rename(original_path)
+
 def write_target_t2_local_apt_source(target: Path, codename: str) -> None:
     sources_dir = target / "etc/apt/sources.list.d"
     sources_dir.mkdir(parents=True, exist_ok=True)
@@ -2491,7 +2587,7 @@ def write_target_t2_local_apt_source(target: Path, codename: str) -> None:
     atomic_write(sources_dir / "aegis-t2-local.list", source.encode("utf-8"), mode=0o644)
 
 
-def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
+ddef maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
     if not t2_support_available_in_recovery():
         return False
 
@@ -2504,21 +2600,21 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
     configure_t2_kernel_files(target)
     configure_t2_graphics_files(target)
 
-    local_source_list = target / "etc/apt/sources.list.d/aegis-t2-local.list"
-
     with mounted_t2_local_repo_for_target(target, codename):
-        try:
-            write_target_t2_local_apt_source(target, codename)
-
+        with target_t2_local_apt_only(target, codename):
             run_chroot_checked(
                 target,
                 [
                     "/usr/bin/env",
                     "DEBIAN_FRONTEND=noninteractive",
                     "apt-get",
+                    "-o",
+                    "Acquire::Retries=0",
+                    "-o",
+                    "Acquire::Languages=none",
                     "update",
                 ],
-                "apt update for local Apple T2 support repo",
+                "apt update for offline Apple T2 support repo",
             )
 
             install_t2_packages_best_effort(
@@ -2530,8 +2626,6 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
                     *T2_RESTORED_GRAPHICS_PACKAGES,
                 ],
             )
-        finally:
-            local_source_list.unlink(missing_ok=True)
 
     return True
 
@@ -7052,13 +7146,159 @@ def t2_chroot_apt_update_checked(root: Path, label: str) -> None:
     raise AegisError(f"{label} failed after retrying apt metadata fetches: {last_detail}")
 
 
-def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
-    write_t2_apt_sources(mount_root, codename)
+def t2_offline_required_cache_packages(codename: str) -> List[str]:
+    packages = [
+        *T2_REQUIRED_PACKAGES,
+        "initramfs-tools",
+        "linux-base",
+        "kmod",
+    ]
 
-    t2_chroot_apt_update_checked(
-        mount_root,
-        f"apt update for Apple T2 package cache ({codename})",
+    if codename == T2_RECOVERY_SUITE:
+        packages.extend(T2_TOUCHBAR_PACKAGES)
+
+    return dedupe(packages)
+
+
+def t2_offline_optional_cache_packages(codename: str) -> List[str]:
+    packages = [
+        *T2_TOUCHBAR_PACKAGES,
+        *T2_OPTIONAL_PACKAGES,
+        *T2_RESTORED_GRAPHICS_PACKAGES,
+    ]
+
+    if codename == T2_RECOVERY_SUITE:
+        packages.extend(T2_RECOVERY_GRAPHICS_PACKAGES)
+
+    return dedupe(packages)
+
+
+def prepare_t2_cache_apt_state(mount_root: Path, codename: str, repo_dir: Path) -> str:
+    state = f"/tmp/aegis-t2-cache-apt-{codename}"
+    state_dir = mount_root / state.lstrip("/")
+
+    shutil.rmtree(state_dir, ignore_errors=True)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "sources.list.d").mkdir(parents=True, exist_ok=True)
+    (state_dir / "lists/partial").mkdir(parents=True, exist_ok=True)
+
+    repo_abs = mount_root / str(repo_dir).lstrip("/")
+    repo_abs.mkdir(parents=True, exist_ok=True)
+    (repo_abs / "partial").mkdir(parents=True, exist_ok=True)
+
+    atomic_write(
+        state_dir / "sources.list",
+        t2_cache_apt_sources_text(codename).encode("utf-8"),
+        mode=0o644,
     )
+    atomic_write(state_dir / "status", b"", mode=0o644)
+
+    return state
+
+
+def t2_cache_apt_options(state: str, repo_dir: Path) -> List[str]:
+    return [
+        "-o", f"Dir::Etc::sourcelist={state}/sources.list",
+        "-o", f"Dir::Etc::sourceparts={state}/sources.list.d",
+        "-o", f"Dir::State::lists={state}/lists",
+        "-o", f"Dir::State::status={state}/status",
+        "-o", f"Dir::Cache::archives={repo_dir}",
+        "-o", "Acquire::Languages=none",
+        "-o", "Acquire::Retries=5",
+        "-o", "Acquire::http::No-Cache=true",
+        "-o", "Acquire::https::No-Cache=true",
+        "-o", "Acquire::http::Pipeline-Depth=0",
+        "-o", "APT::Get::List-Cleanup=0",
+    ]
+
+
+def t2_cache_apt_get_command(state: str, repo_dir: Path, apt_args: List[str]) -> List[str]:
+    return [
+        "/usr/bin/env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "apt-get",
+        *t2_cache_apt_options(state, repo_dir),
+        *apt_args,
+    ]
+
+
+def cache_t2_package_closure(
+    mount_root: Path,
+    codename: str,
+    repo_dir: Path,
+    packages: List[str],
+    label: str,
+    required: bool,
+) -> None:
+    if not packages:
+        return
+
+    state = prepare_t2_cache_apt_state(mount_root, codename, repo_dir)
+
+    result = run_chroot(
+        mount_root,
+        t2_cache_apt_get_command(state, repo_dir, ["update"]),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        if required:
+            raise AegisError(f"apt update for {label} failed: {detail}")
+        log_line(f"Optional Apple T2 cache update failed for {label}: {detail}")
+        return
+
+    result = run_chroot(
+        mount_root,
+        t2_cache_apt_get_command(
+            state,
+            repo_dir,
+            [
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "install",
+                "-y",
+                "--download-only",
+                "--reinstall",
+                "--no-install-recommends",
+                *packages,
+            ],
+        ),
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        if required:
+            raise AegisError(f"Could not cache required Apple T2 package dependency set for {label}: {detail}")
+        log_line(f"Optional Apple T2 package dependency set was not fully cached for {label}: {detail}")
+
+
+def index_t2_offline_repo(mount_root: Path, codename: str, repo_dir: Path) -> None:
+    repo_abs = mount_root / str(repo_dir).lstrip("/")
+    debs = sorted(repo_abs.glob("*.deb"))
+
+    if not debs:
+        raise AegisError(f"No Apple T2 packages were cached for {codename}.")
+
+    result = run_chroot(
+        mount_root,
+        [
+            "/bin/bash",
+            "-lc",
+            (
+                f"cd {shlex.quote(str(repo_dir))} && "
+                "dpkg-scanpackages -m . /dev/null > Packages && "
+                "gzip -fk Packages"
+            ),
+        ],
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        raise AegisError(f"Could not index Apple T2 offline repo for {codename}: {detail}")
+
+
+def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
+    # Prepare the signed T2 keyring once inside the recovery filesystem.
+    # The actual cache resolver below uses an isolated source list so jammy/noble
+    # dependencies come from Ubuntu, and bookworm/trixie dependencies come from Debian.
+    write_t2_apt_sources(mount_root, codename)
 
     repo_dir = T2_LOCAL_REPO_ROOT / codename
     run_chroot_checked(
@@ -7067,52 +7307,26 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
         f"create Apple T2 offline repo directory ({codename})",
     )
 
-    all_packages = dedupe([
-        *T2_REQUIRED_PACKAGES,
-        *T2_TOUCHBAR_PACKAGES,
-        *T2_OPTIONAL_PACKAGES,
-    ])
-
-    required_for_this_cache = set(T2_REQUIRED_PACKAGES)
-    if codename == T2_RECOVERY_SUITE:
-        required_for_this_cache.update(T2_TOUCHBAR_PACKAGES)
-
-    downloaded = 0
-
-    for package in all_packages:
-        result = run_chroot(
-            mount_root,
-            [
-                "/bin/bash",
-                "-lc",
-                f"cd {shlex.quote(str(repo_dir))} && apt-get download {shlex.quote(package)}",
-            ],
-        )
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-            if package in required_for_this_cache:
-                raise AegisError(
-                    f"Could not cache required Apple T2 package {package} for {codename}: {detail}"
-                )
-            log_line(f"Could not cache optional Apple T2 package {package} for {codename}: {detail}")
-            continue
-
-        downloaded += 1
-
-    if downloaded <= 0:
-        raise AegisError(f"No Apple T2 packages were cached for {codename}.")
-
-    result = run_chroot(
+    cache_t2_package_closure(
         mount_root,
-        [
-            "/bin/bash",
-            "-lc",
-            f"cd {shlex.quote(str(repo_dir))} && dpkg-scanpackages . /dev/null > Packages",
-        ],
+        codename,
+        repo_dir,
+        t2_offline_required_cache_packages(codename),
+        codename,
+        required=True,
     )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-        raise AegisError(f"Could not index Apple T2 offline repo for {codename}: {detail}")
+
+    for package in t2_offline_optional_cache_packages(codename):
+        cache_t2_package_closure(
+            mount_root,
+            codename,
+            repo_dir,
+            [package],
+            f"{codename}/{package}",
+            required=False,
+        )
+
+    index_t2_offline_repo(mount_root, codename, repo_dir)
 
 
 def prepare_recovery_t2_support(mount_root: Path) -> None:
