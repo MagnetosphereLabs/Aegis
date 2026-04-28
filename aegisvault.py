@@ -64,6 +64,52 @@ BACKUP_BROWSE_MOUNT_ROOT = Path("/media/aegisvault-browser")
 DEFAULT_RECOVERY_SUITE = "bookworm"
 DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
 DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
+T2_SUPPORT_MARKER = Path("/opt/aegisvault/t2-support-enabled")
+T2_LOCAL_REPO_ROOT = Path("/opt/aegisvault/t2-offline")
+
+T2_APT_KEY_URL = "https://adityagarg8.github.io/t2-ubuntu-repo/KEY.gpg"
+T2_COMMON_LIST_URL = "https://adityagarg8.github.io/t2-ubuntu-repo/t2.list"
+T2_RELEASE_REPO_TEMPLATE = (
+    "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] "
+    "https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/{codename} ./"
+)
+T2_APPLE_FIRMWARE_REPO = (
+    "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] "
+    "https://github.com/AdityaGarg8/Apple-Firmware/releases/download/debian ./"
+)
+
+T2_RECOVERY_CODENAMES = ["bookworm", "trixie", "jammy", "noble"]
+T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
+T2_OPTIONAL_PACKAGES = [
+    "tiny-dfr",
+    "t2fanrd",
+    "t2-apple-audio-dsp-mic",
+    "t2-apple-audio-dsp-speakers161",
+    "apple-firmware",
+    "apple-firmware-script",
+]
+
+APPLE_T2_DMI_PRODUCTS = {
+    "MacBookPro15,1",
+    "MacBookPro15,2",
+    "MacBookPro15,3",
+    "MacBookPro15,4",
+    "MacBookPro16,1",
+    "MacBookPro16,2",
+    "MacBookPro16,3",
+    "MacBookPro16,4",
+    "MacBookAir8,1",
+    "MacBookAir8,2",
+    "MacBookAir9,1",
+    "Macmini8,1",
+    "iMacPro1,1",
+    "iMac20,1",
+    "iMac20,2",
+    "MacPro7,1",
+}
+
+T2_KERNEL_CMDLINE = ["intel_iommu=on", "iommu=pt", "pm_async=off"]
+T2_INITRAMFS_MODULES = ["snd", "snd_pcm", "apple-bce"]
 MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
 PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
 BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
@@ -2015,6 +2061,273 @@ def is_recovery_environment() -> bool:
 def firmware_mode() -> str:
     return "uefi" if Path("/sys/firmware/efi").exists() else "bios"
 
+def sysfs_text(path: str) -> str:
+    return safe_read_text(path).strip()
+
+
+def current_dmi_product_name() -> str:
+    return sysfs_text("/sys/class/dmi/id/product_name")
+
+
+def current_dmi_vendor() -> str:
+    return sysfs_text("/sys/class/dmi/id/sys_vendor")
+
+
+def is_apple_t2_hardware() -> bool:
+    return (
+        current_dmi_vendor() == "Apple Inc."
+        and current_dmi_product_name() in APPLE_T2_DMI_PRODUCTS
+    )
+
+
+def t2_support_available_in_recovery() -> bool:
+    return is_recovery_environment() and T2_SUPPORT_MARKER.exists() and T2_LOCAL_REPO_ROOT.exists()
+
+
+def target_os_release_map(target: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    text = safe_read_text(str(target / "etc/os-release"))
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def target_t2_codename(target: Path) -> str:
+    values = target_os_release_map(target)
+
+    for key in ("VERSION_CODENAME", "UBUNTU_CODENAME", "DEBIAN_CODENAME"):
+        codename = values.get(key, "").strip().lower()
+        if codename:
+            return codename
+
+    version_id = values.get("VERSION_ID", "").strip()
+    distro_id = values.get("ID", "").strip().lower()
+
+    if distro_id in {"pop", "pop_os", "pop!_os", "ubuntu"}:
+        if version_id.startswith("22.04"):
+            return "jammy"
+        if version_id.startswith("24.04"):
+            return "noble"
+
+    if distro_id == "debian":
+        if version_id.startswith("12"):
+            return "bookworm"
+        if version_id.startswith("13"):
+            return "trixie"
+
+    return DEFAULT_RECOVERY_SUITE
+
+
+def append_unique_lines(path: Path, lines: List[str], mode: int = 0o644) -> None:
+    existing = safe_read_text(str(path)).splitlines()
+    wanted = list(existing)
+
+    for line in lines:
+        if line not in wanted:
+            wanted.append(line)
+
+    atomic_write(path, ("\n".join(wanted).rstrip() + "\n").encode("utf-8"), mode=mode)
+
+
+def add_tokens_to_grub_cmdline_text(text: str, tokens: List[str]) -> str:
+    pattern = re.compile(r'^(GRUB_CMDLINE_LINUX_DEFAULT=)(["\'])(.*?)(\2)\s*$', re.MULTILINE)
+    match = pattern.search(text)
+
+    if not match:
+        line = 'GRUB_CMDLINE_LINUX_DEFAULT="' + " ".join(tokens) + '"\n'
+        return text.rstrip() + "\n" + line
+
+    current = match.group(3).split()
+    updated = current[:]
+    for token in tokens:
+        if token not in updated:
+            updated.append(token)
+
+    replacement = f'{match.group(1)}{match.group(2)}{" ".join(updated)}{match.group(4)}'
+    return text[:match.start()] + replacement + text[match.end():]
+
+
+def configure_t2_kernel_files(target: Path) -> None:
+    modules_load = target / "etc/modules-load.d/t2.conf"
+    modules_load.parent.mkdir(parents=True, exist_ok=True)
+    append_unique_lines(modules_load, ["apple-bce"], mode=0o644)
+
+    initramfs_modules = target / "etc/initramfs-tools/modules"
+    initramfs_modules.parent.mkdir(parents=True, exist_ok=True)
+    append_unique_lines(
+        initramfs_modules,
+        [
+            "",
+            "# Added by Aegis for Apple T2 Mac keyboard/trackpad/Touch Bar support:",
+            *T2_INITRAMFS_MODULES,
+        ],
+        mode=0o644,
+    )
+
+    grub_default = target / "etc/default/grub"
+    if grub_default.exists():
+        rewrite_target_text_file(
+            grub_default,
+            lambda text: add_tokens_to_grub_cmdline_text(text, T2_KERNEL_CMDLINE),
+        )
+
+
+def fetch_url_bytes(url: str, timeout_seconds: int = 45) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout_seconds) as response:
+        return response.read()
+
+
+def write_t2_apt_sources(root: Path, codename: str) -> None:
+    trusted_dir = root / "etc/apt/trusted.gpg.d"
+    sources_dir = root / "etc/apt/sources.list.d"
+    trusted_dir.mkdir(parents=True, exist_ok=True)
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    key_ascii = root / "tmp/aegis-t2-key.gpg"
+    key_ascii.parent.mkdir(parents=True, exist_ok=True)
+    key_ascii.write_bytes(fetch_url_bytes(T2_APT_KEY_URL))
+
+    keyring = trusted_dir / "t2-ubuntu-repo.gpg"
+    result = subprocess.run(
+        [
+            "gpg",
+            "--dearmor",
+            "--yes",
+            "--output",
+            str(keyring),
+            str(key_ascii),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    key_ascii.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or "gpg --dearmor failed"
+        raise AegisError(f"Could not prepare T2 apt key: {detail}")
+
+    common_list = fetch_url_bytes(T2_COMMON_LIST_URL).decode("utf-8", errors="replace")
+    release_line = T2_RELEASE_REPO_TEMPLATE.format(codename=codename)
+    text = common_list.rstrip() + "\n" + release_line + "\n" + T2_APPLE_FIRMWARE_REPO + "\n"
+    atomic_write(sources_dir / "t2.list", text.encode("utf-8"), mode=0o644)
+
+
+def t2_package_install_command(packages: List[str]) -> List[str]:
+    return [
+        "/usr/bin/env",
+        "DEBIAN_FRONTEND=noninteractive",
+        "apt-get",
+        "-o",
+        "Dpkg::Use-Pty=0",
+        "install",
+        "-y",
+        "--no-install-recommends",
+        *packages,
+    ]
+
+
+def install_t2_packages_best_effort(target: Path, required: List[str], optional: List[str]) -> None:
+    if required:
+        run_chroot_checked(
+            target,
+            t2_package_install_command(required),
+            "install required Apple T2 support packages",
+        )
+
+    for package in optional:
+        result = run_chroot(target, t2_package_install_command([package]))
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+            log_line(f"Optional Apple T2 package {package} was not installed: {detail}")
+
+
+def newest_kernel_pair_matching(target: Path, needle: str) -> Optional[Tuple[Path, Path]]:
+    boot_dir = target / "boot"
+    pairs: List[Tuple[float, Path, Path]] = []
+
+    for kernel in boot_dir.glob("vmlinuz-*"):
+        version = kernel.name[len("vmlinuz-"):]
+        if needle not in version:
+            continue
+        initrd = boot_dir / f"initrd.img-{version}"
+        if initrd.exists():
+            pairs.append((kernel.stat().st_mtime, kernel, initrd))
+
+    if not pairs:
+        return None
+
+    pairs.sort(key=lambda item: item[0], reverse=True)
+    _, kernel, initrd = pairs[0]
+    return kernel, initrd
+
+
+@contextmanager
+def mounted_t2_local_repo_for_target(target: Path, codename: str):
+    source = T2_LOCAL_REPO_ROOT / codename
+    if not source.exists():
+        raise AegisError(
+            f"Apple T2 offline package repo for {codename} is missing from this recovery USB."
+        )
+
+    dest = target / str(source).lstrip("/")
+    dest.mkdir(parents=True, exist_ok=True)
+
+    mounted = False
+    try:
+        run_command(["mount", "--bind", str(source), str(dest)], check=True, capture=True)
+        mounted = True
+        yield
+    finally:
+        if mounted:
+            subprocess.run(["umount", "-lf", str(dest)], check=False, capture_output=True)
+
+
+def write_target_t2_local_apt_source(target: Path, codename: str) -> None:
+    sources_dir = target / "etc/apt/sources.list.d"
+    sources_dir.mkdir(parents=True, exist_ok=True)
+
+    source = f"deb [trusted=yes] file:{T2_LOCAL_REPO_ROOT}/{codename} ./\n"
+    atomic_write(sources_dir / "aegis-t2-local.list", source.encode("utf-8"), mode=0o644)
+
+
+def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
+    if not t2_support_available_in_recovery():
+        return False
+
+    if not is_apple_t2_hardware():
+        return False
+
+    codename = target_t2_codename(target)
+    update_stage(f"Applying Apple T2 support to restored system ({current_dmi_product_name()}, {codename})")
+
+    configure_t2_kernel_files(target)
+
+    with mounted_t2_local_repo_for_target(target, codename):
+        write_target_t2_local_apt_source(target, codename)
+
+        run_chroot_checked(
+            target,
+            [
+                "/usr/bin/env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "update",
+            ],
+            "apt update for local Apple T2 support repo",
+        )
+
+        install_t2_packages_best_effort(
+            target,
+            required=T2_REQUIRED_PACKAGES,
+            optional=T2_OPTIONAL_PACKAGES,
+        )
+
+    return True
 
 PORTABLE_PACKAGE_EXCLUDE_PATTERNS = [
     "linux-headers*",
@@ -3481,8 +3794,8 @@ def ensure_host_packages(packages: List[str]) -> None:
     run_command(["apt-get", "install", "-y", *missing], check=True, capture=True)
 
 
-def ensure_recovery_builder_prereqs() -> None:
-    ensure_host_packages([
+def ensure_recovery_builder_prereqs(include_t2_support: bool = False) -> None:
+    packages = [
         "debootstrap",
         "parted",
         "fdisk",
@@ -3491,7 +3804,12 @@ def ensure_recovery_builder_prereqs() -> None:
         "grub-pc-bin",
         "grub-efi-amd64-bin",
         "ca-certificates",
-    ])
+    ]
+
+    if include_t2_support:
+        packages.extend(["gnupg"])
+
+    ensure_host_packages(packages)
 
 
 def assert_safe_target_disk(device: str) -> str:
@@ -4930,8 +5248,12 @@ def prepare_portable_initramfs_for_local_disk_restore(target: Path) -> None:
     force_local_disk_initramfs_config(target)
     disable_dhcpcd_initramfs_hooks(target, "not needed for local-disk portable restore")
             
-def restored_primary_kernel_version(target: Path, metadata: Optional[SnapshotMetadata] = None) -> str:
-    kernel, _ = preferred_restored_kernel_pair(target, metadata)
+def restored_primary_kernel_version(
+    target: Path,
+    metadata: Optional[SnapshotMetadata] = None,
+    prefer_t2_kernel: bool = False,
+) -> str:
+    kernel, _ = preferred_restored_kernel_pair(target, metadata, prefer_t2_kernel=prefer_t2_kernel)
     return kernel.name[len("vmlinuz-"):]
 
 
@@ -4945,8 +5267,14 @@ def current_target_root_partuuid(target: Path) -> str:
 def preferred_restored_kernel_pair(
     target: Path,
     metadata: Optional[SnapshotMetadata] = None,
+    prefer_t2_kernel: bool = False,
 ) -> Tuple[Path, Path]:
     boot_dir = target / "boot"
+
+    if prefer_t2_kernel:
+        t2_pair = newest_kernel_pair_matching(target, "t2")
+        if t2_pair:
+            return t2_pair
 
     preferred_version = ""
     if metadata and metadata.kernel_release:
@@ -4976,8 +5304,13 @@ def rebuild_restored_primary_initramfs(
     target: Path,
     allow_dhcpcd_hook_workaround: bool = False,
     metadata: Optional[SnapshotMetadata] = None,
+    prefer_t2_kernel: bool = False,
 ) -> None:
-    kernel_version = restored_primary_kernel_version(target, metadata)
+    kernel_version = restored_primary_kernel_version(
+        target,
+        metadata,
+        prefer_t2_kernel=prefer_t2_kernel,
+    )
 
     if (target / "sbin/depmod").exists() or (target / "usr/sbin/depmod").exists():
         update_stage(f"Refreshing module metadata for {kernel_version}")
@@ -5152,13 +5485,18 @@ def newest_restored_kernel_pair(target: Path) -> Tuple[Path, Path]:
 def write_manual_systemd_boot_entry(
     target: Path,
     metadata: Optional[SnapshotMetadata] = None,
+    prefer_t2_kernel: bool = False,
 ) -> None:
     esp = target / "boot/efi"
     if not esp.exists():
         raise AegisError("EFI System Partition is not mounted at /boot/efi.")
 
     root_uuid = current_target_root_uuid(target)
-    kernel, initrd = preferred_restored_kernel_pair(target, metadata)
+    kernel, initrd = preferred_restored_kernel_pair(
+        target,
+        metadata,
+        prefer_t2_kernel=prefer_t2_kernel,
+    )
 
     dest_dir = esp / "EFI" / "Aegis"
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -5191,9 +5529,14 @@ def write_manual_systemd_boot_entry(
 def write_manual_grub_cfg(
     target: Path,
     metadata: Optional[SnapshotMetadata] = None,
+    prefer_t2_kernel: bool = False,
 ) -> None:
     root_uuid = current_target_root_uuid(target)
-    kernel, initrd = preferred_restored_kernel_pair(target, metadata)
+    kernel, initrd = preferred_restored_kernel_pair(
+        target,
+        metadata,
+        prefer_t2_kernel=prefer_t2_kernel,
+    )
 
     os_release_text = safe_read_text(str(target / "etc/os-release")).lower()
     title = "Pop!_OS (Aegis Restored)" if "pop" in os_release_text else "Linux (Aegis Restored)"
@@ -5527,6 +5870,8 @@ def best_effort_full_restore_post_actions(
         prepare_portable_initramfs_for_local_disk_restore(target)
 
     with mounted_chroot_bindings(target):
+        t2_restored_target = maybe_apply_t2_support_to_restored_target(target)
+
         if (target / "usr/sbin/update-initramfs").exists() or (target / "sbin/update-initramfs").exists():
             if portable_local_restore:
                 update_stage("Rebuilding portable initramfs for restored hardware")
@@ -5535,6 +5880,7 @@ def best_effort_full_restore_post_actions(
                 target,
                 allow_dhcpcd_hook_workaround=True,
                 metadata=metadata,
+                prefer_t2_kernel=t2_restored_target,
             )
         elif portable_local_restore:
             log_line("Portable restore skipped initramfs rebuild because update-initramfs is missing in the restored system.")
@@ -5563,7 +5909,11 @@ def best_effort_full_restore_post_actions(
                     log_line(f"kernelstub refresh failed, falling back to manual loader entry: {detail}")
 
             update_stage("Writing systemd-boot entry for restored disk")
-            write_manual_systemd_boot_entry(target, metadata)
+            write_manual_systemd_boot_entry(
+                target,
+                metadata,
+                prefer_t2_kernel=t2_restored_target,
+            )
 
             update_stage("Validating restored systemd-boot configuration")
             set_job_progress(99.0)
@@ -5594,7 +5944,11 @@ def best_effort_full_restore_post_actions(
         if portable_local_restore:
             update_stage("Writing GRUB menu for restored disk")
             set_job_progress(99.0)
-            write_manual_grub_cfg(target, metadata)
+            write_manual_grub_cfg(
+                target,
+                metadata,
+                prefer_t2_kernel=t2_restored_target,
+            )
         elif (target / "usr/sbin/update-grub").exists():
             update_stage("Generating restored GRUB menu")
             set_job_progress(99.0)
@@ -6143,9 +6497,126 @@ def guided_full_restore_from_bundle_url(url: str, password: str, target_disk: st
         guided_full_restore_from_bundle(temp, password, target_disk)
     finally:
         temp.unlink(missing_ok=True)
+def recovery_package_list(include_t2_support: bool) -> List[str]:
+    packages = [
+        "linux-t2" if include_t2_support else "linux-image-amd64",
+        "systemd-sysv",
+        "grub-common",
+        "grub2-common",
+        "grub-pc-bin",
+        "grub-efi-amd64-bin",
+        "python3",
+        "python3-tk",
+        "python3-cryptography",
+        "xorg",
+        "xinit",
+        "openbox",
+        "xterm",
+        "dbus-x11",
+        "network-manager",
+        "ca-certificates",
+        "curl",
+        "rsync",
+        "openssh-client",
+        "tar",
+        "parted",
+        "dosfstools",
+        "gdisk",
+        "e2fsprogs",
+        "btrfs-progs",
+        "xfsprogs",
+        "ntfs-3g",
+        "exfatprogs",
+        "util-linux",
+        "udisks2",
+        "nvme-cli",
+        "cryptsetup",
+        "mdadm",
+        "lvm2",
+        "dmsetup",
+        "usbutils",
+        "pciutils",
+        "firmware-misc-nonfree",
+        "firmware-brcm80211",
+        "firmware-iwlwifi",
+        "firmware-realtek",
+        "sudo",
+    ]
+
+    if include_t2_support:
+        packages.extend([
+            "dpkg-dev",
+            *T2_REQUIRED_PACKAGES,
+            *T2_OPTIONAL_PACKAGES,
+        ])
+
+    return dedupe(packages)
 
 
-def create_recovery_usb(device: str) -> None:
+def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
+    write_t2_apt_sources(mount_root, codename)
+
+    run_chroot_checked(
+        mount_root,
+        ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
+        f"apt update for Apple T2 package cache ({codename})",
+    )
+
+    repo_dir = T2_LOCAL_REPO_ROOT / codename
+    run_chroot_checked(
+        mount_root,
+        ["/bin/mkdir", "-p", str(repo_dir)],
+        f"create Apple T2 offline repo directory ({codename})",
+    )
+
+    all_packages = dedupe([*T2_REQUIRED_PACKAGES, *T2_OPTIONAL_PACKAGES])
+
+    for package in all_packages:
+        result = run_chroot(
+            mount_root,
+            [
+                "/bin/bash",
+                "-lc",
+                f"cd {shlex.quote(str(repo_dir))} && apt-get download {shlex.quote(package)}",
+            ],
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+            log_line(f"Could not cache Apple T2 package {package} for {codename}: {detail}")
+
+    result = run_chroot(
+        mount_root,
+        [
+            "/bin/bash",
+            "-lc",
+            f"cd {shlex.quote(str(repo_dir))} && dpkg-scanpackages . /dev/null > Packages",
+        ],
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        raise AegisError(f"Could not index Apple T2 offline repo for {codename}: {detail}")
+
+
+def prepare_recovery_t2_support(mount_root: Path) -> None:
+    update_stage("Adding Apple T2 support to recovery USB")
+
+    write_t2_apt_sources(mount_root, DEFAULT_RECOVERY_SUITE)
+    configure_t2_kernel_files(mount_root)
+
+    for codename in T2_RECOVERY_CODENAMES:
+        download_one_t2_package_set(mount_root, codename)
+
+    write_t2_apt_sources(mount_root, DEFAULT_RECOVERY_SUITE)
+    atomic_write(
+        mount_root / str(T2_SUPPORT_MARKER).lstrip("/"),
+        (
+            "Apple T2 support was included when this Aegis recovery USB was created.\n"
+            "Aegis only applies restored-system T2 support when booted on known Apple T2 hardware.\n"
+        ).encode("utf-8"),
+        mode=0o644,
+    )
+
+def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
     ensure_root()
     device = assert_safe_target_disk(device)
 
@@ -6153,7 +6624,7 @@ def create_recovery_usb(device: str) -> None:
     size = int((entry or {}).get("size") or 0) or observed_block_device_size_bytes(device)
     if size and size < MIN_RECOVERY_USB_BYTES:
         raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
-    ensure_recovery_builder_prereqs()
+    ensure_recovery_builder_prereqs(include_t2_support=include_t2_support)
     update_stage("Preparing recovery USB partitions")
     with mounted_recovery_usb_target(device) as (layout, mount_root):
         update_stage("Bootstrapping Debian recovery environment")
@@ -6175,9 +6646,17 @@ def create_recovery_usb(device: str) -> None:
             raise AegisError(f"Recovery USB target is not writable before package install: {exc}")
         with mounted_chroot_bindings(mount_root):
             update_stage("Installing recovery environment packages")
-            run_chroot_checked(mount_root, ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"], "apt-get update in recovery media")
-            packages = [
-                "linux-image-amd64",
+
+            if include_t2_support:
+                prepare_recovery_t2_support(mount_root)
+
+            run_chroot_checked(
+                mount_root,
+                ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
+                "apt-get update in recovery media",
+            )
+
+            packages = recovery_package_list(include_t2_support)
                 "systemd-sysv",
                 "grub-common",
                 "grub2-common",
@@ -6869,10 +7348,27 @@ def handle_request(request: Dict[str, Any]) -> Dict[str, Any]:
         }
     if action == "run_create_recovery_usb":
         device = str(request.get("device") or "").strip()
+        include_t2_support = bool(request.get("include_t2_support", False))
         if not device:
             raise AegisError("Choose a target USB disk first.")
-        run_job(f"Create recovery USB on {device}", lambda: create_recovery_usb(device))
-        return {"ok": True, "message": "Recovery USB creation started."}
+
+        job_name = (
+            f"Create Apple T2 recovery USB on {device}"
+            if include_t2_support
+            else f"Create recovery USB on {device}"
+        )
+        run_job(
+            job_name,
+            lambda: create_recovery_usb(device, include_t2_support=include_t2_support),
+        )
+        return {
+            "ok": True,
+            "message": (
+                "Recovery USB creation started with Apple T2 Mac support."
+                if include_t2_support
+                else "Recovery USB creation started."
+            ),
+        }
     if action == "run_guided_restore_repo":
         device = str(request.get("target_disk") or "").strip()
         snapshot_id = str(request.get("snapshot") or "").strip()
@@ -7332,11 +7828,15 @@ def list_disks_command() -> int:
         return 1
 
 
-def create_recovery_usb_command(device: str, direct: bool) -> int:
+def create_recovery_usb_command(device: str, direct: bool, include_t2_support: bool = False) -> int:
     try:
         if not direct:
             try:
-                response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
+                response = send_daemon_request({
+                    "action": "run_create_recovery_usb",
+                    "device": device,
+                    "include_t2_support": include_t2_support,
+                })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
                 print(response["message"])
@@ -7344,7 +7844,7 @@ def create_recovery_usb_command(device: str, direct: bool) -> int:
             except Exception:
                 pass
         ensure_root()
-        create_recovery_usb(device)
+        create_recovery_usb(device, include_t2_support=include_t2_support)
         print(f"Recovery USB created on {device}")
         return 0
     except Exception as exc:
@@ -7803,6 +8303,7 @@ def gui_main() -> int:
             self.repo_source_var = tk.StringVar(value="")
             self.repo_candidate_var = tk.StringVar(value="")
             self.recovery_usb_device_var = tk.StringVar(value="")
+            self.recovery_usb_t2_support_var = tk.BooleanVar(value=False)
             self.guided_target_disk_var = tk.StringVar(value="")
 
             self.peer_label_var = tk.StringVar()
@@ -7853,6 +8354,7 @@ def gui_main() -> int:
             self.previous_running_job_name = ""
 
             self.recovery_usb_device_var = tk.StringVar(value="")
+            self.recovery_usb_t2_support_var = tk.BooleanVar(value=False)
             self.guided_target_disk_var = tk.StringVar(value="")
             
             self.repo_size_var = tk.StringVar(value="Storage used by all backups: calculating...")
@@ -8707,10 +9209,30 @@ def gui_main() -> int:
                 usb_row = ttk.Frame(desktop)
                 usb_row.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 14))
                 usb_row.grid_columnconfigure(0, weight=1)
-                self.recovery_usb_combo = ttk.Combobox(usb_row, textvariable=self.recovery_usb_device_var, state="readonly")
+                self.recovery_usb_combo = ttk.Combobox(
+                    usb_row,
+                    textvariable=self.recovery_usb_device_var,
+                    state="readonly",
+                )
                 self.recovery_usb_combo.grid(row=0, column=0, sticky="ew")
-                ttk.Button(usb_row, text="Refresh", style="Compact.TButton", command=self.refresh_local_device_lists).grid(row=0, column=1, padx=(8, 0))
-                ttk.Button(usb_row, text="Create Recovery USB", style="Compact.TButton", command=self.create_recovery_usb_from_gui).grid(row=0, column=2, padx=(8, 0))
+                ttk.Button(
+                    usb_row,
+                    text="Refresh",
+                    style="Compact.TButton",
+                    command=self.refresh_local_device_lists,
+                ).grid(row=0, column=1, padx=(8, 0))
+                ttk.Button(
+                    usb_row,
+                    text="Create Recovery USB",
+                    style="Compact.TButton",
+                    command=self.create_recovery_usb_from_gui,
+                ).grid(row=0, column=2, padx=(8, 0))
+
+                ttk.Checkbutton(
+                    usb_row,
+                    text="Include Apple T2 Mac support for 2018–2020 Intel Macs",
+                    variable=self.recovery_usb_t2_support_var,
+                ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
                 ttk.Label(
                     desktop,
@@ -10175,7 +10697,11 @@ def gui_main() -> int:
             if not self.confirm_dangerous_action("Create Recovery USB", f"This will erase everything on {device}. Continue?"):
                 return
             try:
-                response = send_daemon_request({"action": "run_create_recovery_usb", "device": device})
+                response = send_daemon_request({
+                    "action": "run_create_recovery_usb",
+                    "device": device,
+                    "include_t2_support": bool(self.recovery_usb_t2_support_var.get()),
+                })
                 if not response.get("ok"):
                     raise AegisError(response.get("error", "Unknown daemon error"))
                 self.message_var.set(response.get("message", "Recovery USB creation started."))
@@ -10936,6 +11462,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     recovery = sub.add_parser("create-recovery-usb")
     recovery.add_argument("--device", required=True)
     recovery.add_argument("--direct", action="store_true")
+    recovery.add_argument("--t2-support", action="store_true")
 
     auth = sub.add_parser("authorize-socket")
     auth.add_argument("--user", required=True)
@@ -10988,7 +11515,7 @@ def main(argv: List[str]) -> int:
         if cmd == "restore":
             return restore_command(args)
         if cmd == "create-recovery-usb":
-            return create_recovery_usb_command(args.device, args.direct)
+            return create_recovery_usb_command(args.device, args.direct, bool(args.t2_support))
         if cmd == "authorize-socket":
             return authorize_socket_command(args.user)
         if cmd == "sync-peers":
