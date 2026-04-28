@@ -62,6 +62,9 @@ RECOVERY_MOUNT_ROOT = Path("/mnt/aegisvault-recovery")
 AUTO_MOUNT_ROOT = Path("/media/aegisvault")
 BACKUP_BROWSE_MOUNT_ROOT = Path("/media/aegisvault-browser")
 DEFAULT_RECOVERY_SUITE = "bookworm"
+# Normal recovery USBs stay on bookworm. T2 recovery USBs use trixie because
+# tiny-dfr, the Touch Bar userspace daemon, is not reliably available on bookworm.
+T2_RECOVERY_SUITE = "trixie"
 DEFAULT_RECOVERY_MIRROR = "https://deb.debian.org/debian"
 DEFAULT_REPO_SLUG = "MagnetosphereLabs/Aegis"
 T2_SUPPORT_MARKER = Path("/opt/aegisvault/t2-support-enabled")
@@ -84,10 +87,10 @@ T2_APPLE_FIRMWARE_REPO = (
     "https://github.com/AdityaGarg8/Apple-Firmware/releases/download/debian ./"
 )
 
-T2_RECOVERY_CODENAMES = ["bookworm", "trixie", "jammy", "noble"]
+T2_RECOVERY_CODENAMES = ["trixie", "bookworm", "jammy", "noble"]
 T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
+T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
 T2_OPTIONAL_PACKAGES = [
-    "tiny-dfr",
     "t2fanrd",
     "t2-apple-audio-dsp-mic",
     "t2-apple-audio-dsp-speakers161",
@@ -2438,7 +2441,7 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
             install_t2_packages_best_effort(
                 target,
                 required=T2_REQUIRED_PACKAGES,
-                optional=T2_OPTIONAL_PACKAGES,
+                optional=[*T2_TOUCHBAR_PACKAGES, *T2_OPTIONAL_PACKAGES],
             )
         finally:
             local_source_list.unlink(missing_ok=True)
@@ -6660,21 +6663,73 @@ def recovery_package_list(include_t2_support: bool) -> List[str]:
     ]
 
     if include_t2_support:
+        # These are required for a T2 recovery USB that can actually boot and
+        # use the internal Apple input stack, audio config, and Touch Bar daemon.
+        # Optional T2 packages are cached/installed best-effort elsewhere so one
+        # missing optional package never breaks the whole recovery USB.
         packages.extend([
             "dpkg-dev",
             *T2_REQUIRED_PACKAGES,
-            *T2_OPTIONAL_PACKAGES,
+            *T2_TOUCHBAR_PACKAGES,
         ])
 
     return dedupe(packages)
 
 
+def t2_chroot_apt_update_checked(root: Path, label: str) -> None:
+    """
+    GitHub release-backed apt repos can briefly serve an InRelease that points
+    at one Packages.gz while the CDN returns another. That is the exact
+    "File has unexpected size" failure from the log. For T2 repo updates, clear
+    only apt's downloaded index state and retry with no-cache headers.
+    """
+    last_detail = ""
+
+    for attempt in range(4):
+        run_chroot(
+            root,
+            [
+                "/bin/bash",
+                "-lc",
+                "rm -rf /var/lib/apt/lists/*github.com* "
+                "/var/lib/apt/lists/partial/* "
+                "/var/cache/apt/archives/partial/*",
+            ],
+        )
+
+        result = run_chroot(
+            root,
+            [
+                "/usr/bin/env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "-o",
+                "Acquire::Retries=5",
+                "-o",
+                "Acquire::http::No-Cache=true",
+                "-o",
+                "Acquire::https::No-Cache=true",
+                "-o",
+                "Acquire::http::Pipeline-Depth=0",
+                "update",
+            ],
+        )
+
+        if result.returncode == 0:
+            return
+
+        last_detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+        if attempt < 3:
+            time.sleep(2.0 * (attempt + 1))
+
+    raise AegisError(f"{label} failed after retrying apt metadata fetches: {last_detail}")
+
+
 def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
     write_t2_apt_sources(mount_root, codename)
 
-    run_chroot_checked(
+    t2_chroot_apt_update_checked(
         mount_root,
-        ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
         f"apt update for Apple T2 package cache ({codename})",
     )
 
@@ -6685,7 +6740,17 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
         f"create Apple T2 offline repo directory ({codename})",
     )
 
-    all_packages = dedupe([*T2_REQUIRED_PACKAGES, *T2_OPTIONAL_PACKAGES])
+    all_packages = dedupe([
+        *T2_REQUIRED_PACKAGES,
+        *T2_TOUCHBAR_PACKAGES,
+        *T2_OPTIONAL_PACKAGES,
+    ])
+
+    required_for_this_cache = set(T2_REQUIRED_PACKAGES)
+    if codename == T2_RECOVERY_SUITE:
+        required_for_this_cache.update(T2_TOUCHBAR_PACKAGES)
+
+    downloaded = 0
 
     for package in all_packages:
         result = run_chroot(
@@ -6698,7 +6763,17 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
         )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-            log_line(f"Could not cache Apple T2 package {package} for {codename}: {detail}")
+            if package in required_for_this_cache:
+                raise AegisError(
+                    f"Could not cache required Apple T2 package {package} for {codename}: {detail}"
+                )
+            log_line(f"Could not cache optional Apple T2 package {package} for {codename}: {detail}")
+            continue
+
+        downloaded += 1
+
+    if downloaded <= 0:
+        raise AegisError(f"No Apple T2 packages were cached for {codename}.")
 
     result = run_chroot(
         mount_root,
@@ -6716,12 +6791,11 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
 def prepare_recovery_t2_support(mount_root: Path) -> None:
     update_stage("Adding Apple T2 support to recovery USB")
 
-    write_t2_apt_sources(mount_root, DEFAULT_RECOVERY_SUITE)
+    write_t2_apt_sources(mount_root, T2_RECOVERY_SUITE)
     configure_t2_kernel_files(mount_root)
 
-    run_chroot_checked(
+    t2_chroot_apt_update_checked(
         mount_root,
-        ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
         "apt update before preparing Apple T2 package cache",
     )
 
@@ -6745,7 +6819,7 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
     for codename in T2_RECOVERY_CODENAMES:
         download_one_t2_package_set(mount_root, codename)
 
-    write_t2_apt_sources(mount_root, DEFAULT_RECOVERY_SUITE)
+    write_t2_apt_sources(mount_root, T2_RECOVERY_SUITE)
     atomic_write(
         mount_root / str(T2_SUPPORT_MARKER).lstrip("/"),
         (
@@ -6755,50 +6829,75 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
         mode=0o644,
     )
 
+
 def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
     ensure_root()
     device = assert_safe_target_disk(device)
+
+    recovery_suite = T2_RECOVERY_SUITE if include_t2_support else DEFAULT_RECOVERY_SUITE
 
     entry = find_block_device_entry(device)
     size = int((entry or {}).get("size") or 0) or observed_block_device_size_bytes(device)
     if size and size < MIN_RECOVERY_USB_BYTES:
         raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
     ensure_recovery_builder_prereqs(include_t2_support=include_t2_support)
-    
+
     if include_t2_support:
         update_stage("Checking Apple T2 package sources")
         preflight_t2_repository_assets()
-    
+
     update_stage("Preparing recovery USB partitions")
     with mounted_recovery_usb_target(device) as (layout, mount_root):
         update_stage("Bootstrapping Debian recovery environment")
-        run_command(["debootstrap", "--arch=amd64", DEFAULT_RECOVERY_SUITE, str(mount_root), DEFAULT_RECOVERY_MIRROR], check=True, capture=True)
+        run_command(
+            [
+                "debootstrap",
+                "--arch=amd64",
+                recovery_suite,
+                str(mount_root),
+                DEFAULT_RECOVERY_MIRROR,
+            ],
+            check=True,
+            capture=True,
+        )
+
         (mount_root / "etc/apt").mkdir(parents=True, exist_ok=True)
         atomic_write(
             mount_root / "etc/apt/sources.list",
-            f"deb {DEFAULT_RECOVERY_MIRROR} {DEFAULT_RECOVERY_SUITE} main contrib non-free non-free-firmware\n".encode("utf-8"),
+            (
+                f"deb {DEFAULT_RECOVERY_MIRROR} {recovery_suite} "
+                "main contrib non-free non-free-firmware\n"
+            ).encode("utf-8"),
             mode=0o644,
         )
+
         if Path("/etc/resolv.conf").exists():
             shutil.copy2("/etc/resolv.conf", mount_root / "etc/resolv.conf")
+
         (mount_root / "var/lib/aegisvault/keys").mkdir(parents=True, exist_ok=True)
+
         try:
             probe = mount_root / ".aegisvault-write-test"
             probe.write_text("ok", encoding="utf-8")
             probe.unlink()
         except OSError as exc:
             raise AegisError(f"Recovery USB target is not writable before package install: {exc}")
+
         with mounted_chroot_bindings(mount_root):
             update_stage("Installing recovery environment packages")
 
             if include_t2_support:
                 prepare_recovery_t2_support(mount_root)
-
-            run_chroot_checked(
-                mount_root,
-                ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
-                "apt-get update in recovery media",
-            )
+                t2_chroot_apt_update_checked(
+                    mount_root,
+                    "apt-get update in Apple T2 recovery media",
+                )
+            else:
+                run_chroot_checked(
+                    mount_root,
+                    ["/usr/bin/env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "update"],
+                    "apt-get update in recovery media",
+                )
 
             packages = recovery_package_list(include_t2_support)
             try:
@@ -6812,6 +6911,7 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
                         "Dpkg::Use-Pty=0",
                         "install",
                         "-y",
+                        "--no-install-recommends",
                         *packages,
                     ],
                     "package install in recovery media",
@@ -6886,6 +6986,7 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
             atomic_write(mount_root / "etc/aegisvault-recovery", recovery_notice.encode("utf-8"), mode=0o644)
             atomic_write(mount_root / "etc/hostname", b"aegis-recovery\n", mode=0o644)
             atomic_write(mount_root / "etc/hosts", b"127.0.0.1 localhost\n127.0.1.1 aegis-recovery\n", mode=0o644)
+
             fstab_text = textwrap.dedent(f"""
                 UUID={blkid_value(layout['root'], 'UUID')} / ext4 defaults,noatime 0 1
                 UUID={blkid_value(layout['efi'], 'UUID')} /boot/efi vfat umask=0077 0 1
@@ -6896,11 +6997,22 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
             run_chroot_checked(mount_root, ["/bin/systemctl", "enable", "NetworkManager.service"], "enable NetworkManager.service")
             run_chroot_checked(mount_root, ["/usr/sbin/update-initramfs", "-u", "-k", "all"], "update-initramfs in recovery media")
             run_chroot_checked(mount_root, ["/usr/sbin/grub-install", "--target=i386-pc", layout["disk"]], "BIOS grub-install for recovery media")
-            run_chroot_checked(mount_root, ["/usr/sbin/grub-install", "--target=x86_64-efi", "--efi-directory=/boot/efi", "--bootloader-id=AegisVaultRecovery", "--removable", "--recheck", "--no-nvram"], "UEFI grub-install for recovery media")
+            run_chroot_checked(
+                mount_root,
+                [
+                    "/usr/sbin/grub-install",
+                    "--target=x86_64-efi",
+                    "--efi-directory=/boot/efi",
+                    "--bootloader-id=AegisVaultRecovery",
+                    "--removable",
+                    "--recheck",
+                    "--no-nvram",
+                ],
+                "UEFI grub-install for recovery media",
+            )
             run_chroot_checked(mount_root, ["/usr/sbin/update-grub"], "update-grub in recovery media")
 
     update_stage(f"Recovery USB is ready on {device}")
-
 
 def encrypt_stream_to_bundle(source, dest, password: str) -> None:
     salt = os.urandom(16)
