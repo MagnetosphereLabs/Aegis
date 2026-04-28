@@ -114,12 +114,20 @@ T2_TOUCHBAR_OPTIONAL_CODENAMES: Set[str] = set()
 # t2_required_packages_for_codename().
 T2_REQUIRED_PACKAGES = [*T2_CORE_REQUIRED_PACKAGES]
 
-T2_OPTIONAL_PACKAGES = [
+T2_HARDWARE_REQUIRED_PACKAGES = [
     "t2fanrd",
     "t2-apple-audio-dsp-mic",
     "t2-apple-audio-dsp-speakers161",
     "apple-firmware",
     "apple-firmware-script",
+]
+
+T2_HARDWARE_REQUIRED_CODENAMES = {T2_RECOVERY_SUITE, "noble"}
+
+T2_OPTIONAL_PACKAGES = [
+    package
+    for package in T2_HARDWARE_REQUIRED_PACKAGES
+    if package not in T2_HARDWARE_REQUIRED_PACKAGES
 ]
 
 APPLE_T2_DMI_PRODUCTS = {
@@ -2418,20 +2426,25 @@ def t2_remote_apt_sources_text(codename: str) -> str:
 def t2_base_apt_sources_text(codename: str) -> str:
     codename = str(codename or "").strip().lower()
 
+    # by-hash=force prevents the exact "File has unexpected size / Mirror sync
+    # in progress" race where apt reads a fresh Release file but then receives
+    # an older Packages.xz from a syncing mirror/CDN edge.
+    source_opts = "trusted=yes by-hash=force"
+
     if codename in T2_CACHE_UBUNTU_CODENAMES:
         components = "main restricted universe multiverse"
         return textwrap.dedent(f"""\
-            deb [trusted=yes] {UBUNTU_APT_MIRROR} {codename} {components}
-            deb [trusted=yes] {UBUNTU_APT_MIRROR} {codename}-updates {components}
-            deb [trusted=yes] {UBUNTU_SECURITY_MIRROR} {codename}-security {components}
+            deb [{source_opts}] {UBUNTU_APT_MIRROR} {codename} {components}
+            deb [{source_opts}] {UBUNTU_APT_MIRROR} {codename}-updates {components}
+            deb [{source_opts}] {UBUNTU_SECURITY_MIRROR} {codename}-security {components}
         """)
 
     if codename in T2_CACHE_DEBIAN_CODENAMES:
         components = "main contrib non-free non-free-firmware"
         return textwrap.dedent(f"""\
-            deb [trusted=yes] {DEFAULT_RECOVERY_MIRROR} {codename} {components}
-            deb [trusted=yes] {DEFAULT_RECOVERY_MIRROR} {codename}-updates {components}
-            deb [trusted=yes] {DEBIAN_SECURITY_MIRROR} {codename}-security {components}
+            deb [{source_opts}] {DEFAULT_RECOVERY_MIRROR} {codename} {components}
+            deb [{source_opts}] {DEFAULT_RECOVERY_MIRROR} {codename}-updates {components}
+            deb [{source_opts}] {DEBIAN_SECURITY_MIRROR} {codename}-security {components}
         """)
 
     return ""
@@ -2550,6 +2563,9 @@ def t2_required_packages_for_codename(codename: str) -> List[str]:
 
     if cleaned in T2_TOUCHBAR_REQUIRED_CODENAMES:
         packages.extend(T2_TOUCHBAR_PACKAGES)
+
+    if cleaned in T2_HARDWARE_REQUIRED_CODENAMES:
+        packages.extend(T2_HARDWARE_REQUIRED_PACKAGES)
 
     return dedupe(packages)
 
@@ -7357,10 +7373,12 @@ def t2_cache_apt_options(state: str, repo_dir: Path) -> List[str]:
         "-o", f"Dir::Cache::archives={repo_dir}",
         "-o", "Acquire::Languages=none",
         "-o", "Acquire::Retries=5",
+        "-o", "Acquire::By-Hash=true",
         "-o", "Acquire::http::No-Cache=true",
         "-o", "Acquire::https::No-Cache=true",
         "-o", "Acquire::http::Pipeline-Depth=0",
         "-o", "APT::Get::List-Cleanup=0",
+        "-o", "APT::Sandbox::User=root",
     ]
 
 
@@ -7373,7 +7391,74 @@ def t2_cache_apt_get_command(state: str, repo_dir: Path, apt_args: List[str]) ->
         *apt_args,
     ]
 
+def apt_update_detail(result: subprocess.CompletedProcess) -> str:
+    return result.stderr.strip() or result.stdout.strip() or str(result.returncode)
 
+
+def apt_update_failure_is_transient(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    transient_needles = [
+        "file has unexpected size",
+        "mirror sync in progress",
+        "hash sum mismatch",
+        "failed to fetch",
+        "temporary failure",
+        "connection timed out",
+        "connection failed",
+        "connection reset",
+        "could not resolve",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "502",
+        "503",
+        "504",
+    ]
+    return any(needle in lowered for needle in transient_needles)
+
+
+def t2_cache_apt_update_checked(
+    mount_root: Path,
+    state: str,
+    repo_dir: Path,
+    label: str,
+) -> None:
+    last_detail = ""
+
+    quoted_state = shlex.quote(state)
+    quoted_repo = shlex.quote(str(repo_dir))
+
+    for attempt in range(6):
+        run_chroot(
+            mount_root,
+            [
+                "/bin/bash",
+                "-lc",
+                (
+                    f"rm -rf {quoted_state}/lists/* "
+                    f"{quoted_state}/lists/partial/* "
+                    f"{quoted_repo}/partial/* && "
+                    f"mkdir -p {quoted_state}/lists/partial {quoted_repo}/partial"
+                ),
+            ],
+        )
+
+        result = run_chroot(
+            mount_root,
+            t2_cache_apt_get_command(state, repo_dir, ["update"]),
+        )
+
+        if result.returncode == 0:
+            return
+
+        last_detail = apt_update_detail(result)
+
+        if not apt_update_failure_is_transient(last_detail) and attempt >= 1:
+            break
+
+        time.sleep(2.0 * (attempt + 1))
+
+    raise AegisError(f"apt update for {label} failed after retrying transient mirror/cache errors: {last_detail}")
 
 def t2_cache_package_has_candidate(
     mount_root: Path,
@@ -7416,15 +7501,12 @@ def cache_t2_package_closure(
 
     state = prepare_t2_cache_apt_state(mount_root, codename, repo_dir)
 
-    result = run_chroot(
-        mount_root,
-        t2_cache_apt_get_command(state, repo_dir, ["update"]),
-    )
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
+    try:
+        t2_cache_apt_update_checked(mount_root, state, repo_dir, label)
+    except Exception as exc:
         if required:
-            raise AegisError(f"apt update for {label} failed: {detail}")
-        log_line(f"Optional Apple T2 cache update failed for {label}: {detail}")
+            raise
+        log_line(f"Optional Apple T2 cache update failed for {label}: {exc}")
         return
 
     missing = [
