@@ -87,7 +87,6 @@ T2_APPLE_FIRMWARE_REPO = (
     "https://github.com/AdityaGarg8/Apple-Firmware/releases/download/debian ./"
 )
 
-T2_RECOVERY_CODENAMES = ["trixie", "bookworm", "jammy", "noble"]
 T2_CACHE_UBUNTU_CODENAMES = {"jammy", "noble"}
 T2_CACHE_DEBIAN_CODENAMES = {"bookworm", "trixie"}
 UBUNTU_APT_MIRROR = "https://archive.ubuntu.com/ubuntu"
@@ -96,11 +95,17 @@ DEBIAN_SECURITY_MIRROR = "https://security.debian.org/debian-security"
 T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
 T2_CORE_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
 
-# tiny-dfr is required where it must work:
-# - trixie: the T2 recovery USB itself
-# - jammy/noble: Pop!_OS / Ubuntu restored targets
-# Do not require it for bookworm, where it is not reliably available.
-T2_TOUCHBAR_REQUIRED_CODENAMES = {T2_RECOVERY_SUITE, "jammy", "noble"}
+T2_RECOVERY_CODENAMES = ["trixie", "noble", "jammy", "bookworm"]
+
+# These are the codenames that must have a complete offline T2 cache:
+# - trixie: the recovery USB itself
+# - noble: Pop!_OS 24.04 / Ubuntu 24.04 restored targets
+T2_OFFLINE_REQUIRED_CACHE_CODENAMES = {T2_RECOVERY_SUITE, "noble"}
+
+# tiny-dfr is mandatory where Touch Bar support must work.
+T2_TOUCHBAR_REQUIRED_CODENAMES = {T2_RECOVERY_SUITE, "noble"}
+
+T2_TOUCHBAR_OPTIONAL_CODENAMES = {"jammy"}
 
 # Keep this name as core-only compatibility. Codename-sensitive paths must use
 # t2_required_packages_for_codename().
@@ -7190,9 +7195,7 @@ def t2_offline_optional_cache_packages(codename: str) -> List[str]:
         *T2_RESTORED_GRAPHICS_PACKAGES,
     ]
 
-    # Try tiny-dfr opportunistically for other codenames, but do not let
-    # unavailable bookworm Touch Bar packaging block recovery USB creation.
-    if cleaned not in T2_TOUCHBAR_REQUIRED_CODENAMES:
+    if cleaned in T2_TOUCHBAR_OPTIONAL_CODENAMES:
         packages.extend(T2_TOUCHBAR_PACKAGES)
 
     if cleaned == T2_RECOVERY_SUITE:
@@ -7298,12 +7301,16 @@ def cache_t2_package_closure(
         log_line(f"Optional Apple T2 package dependency set was not fully cached for {label}: {detail}")
 
 
-def index_t2_offline_repo(mount_root: Path, codename: str, repo_dir: Path) -> None:
+def index_t2_offline_repo(mount_root: Path, codename: str, repo_dir: Path, required: bool = True) -> bool:
     repo_abs = mount_root / str(repo_dir).lstrip("/")
     debs = sorted(repo_abs.glob("*.deb"))
 
     if not debs:
-        raise AegisError(f"No Apple T2 packages were cached for {codename}.")
+        message = f"No Apple T2 packages were cached for {codename}."
+        if required:
+            raise AegisError(message)
+        log_line(f"Optional Apple T2 offline repo skipped for {codename}: {message}")
+        return False
 
     result = run_chroot(
         mount_root,
@@ -7319,13 +7326,18 @@ def index_t2_offline_repo(mount_root: Path, codename: str, repo_dir: Path) -> No
     )
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or str(result.returncode)
-        raise AegisError(f"Could not index Apple T2 offline repo for {codename}: {detail}")
+        if required:
+            raise AegisError(f"Could not index Apple T2 offline repo for {codename}: {detail}")
+        log_line(f"Optional Apple T2 offline repo was not indexed for {codename}: {detail}")
+        return False
+
+    return True
 
 
-def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
+def download_one_t2_package_set(mount_root: Path, codename: str, required: bool = True) -> bool:
     # Prepare the signed T2 keyring once inside the recovery filesystem.
-    # The actual cache resolver below uses an isolated source list so jammy/noble
-    # dependencies come from Ubuntu, and bookworm/trixie dependencies come from Debian.
+    # The actual cache resolver below uses an isolated source list so Ubuntu
+    # dependencies come from Ubuntu, and Debian dependencies come from Debian.
     write_t2_apt_sources(mount_root, codename)
 
     repo_dir = T2_LOCAL_REPO_ROOT / codename
@@ -7341,7 +7353,7 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
         repo_dir,
         t2_offline_required_cache_packages(codename),
         codename,
-        required=True,
+        required=required,
     )
 
     for package in t2_offline_optional_cache_packages(codename):
@@ -7354,7 +7366,7 @@ def download_one_t2_package_set(mount_root: Path, codename: str) -> None:
             required=False,
         )
 
-    index_t2_offline_repo(mount_root, codename, repo_dir)
+    return index_t2_offline_repo(mount_root, codename, repo_dir, required=required)
 
 
 def prepare_recovery_t2_support(mount_root: Path) -> None:
@@ -7387,7 +7399,17 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
     )
 
     for codename in T2_RECOVERY_CODENAMES:
-        download_one_t2_package_set(mount_root, codename)
+        codename_required = codename in T2_OFFLINE_REQUIRED_CACHE_CODENAMES
+        try:
+            download_one_t2_package_set(
+                mount_root,
+                codename,
+                required=codename_required,
+            )
+        except Exception as exc:
+            if codename_required:
+                raise
+            log_line(f"Optional Apple T2 offline package set skipped for {codename}: {exc}")
 
     write_t2_apt_sources(mount_root, T2_RECOVERY_SUITE)
     atomic_write(
