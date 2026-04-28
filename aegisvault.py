@@ -93,8 +93,8 @@ T2_CACHE_DEBIAN_CODENAMES = {"bookworm", "trixie"}
 UBUNTU_APT_MIRROR = "https://archive.ubuntu.com/ubuntu"
 UBUNTU_SECURITY_MIRROR = "https://security.ubuntu.com/ubuntu"
 DEBIAN_SECURITY_MIRROR = "https://security.debian.org/debian-security"
-T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
 T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
+T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config", *T2_TOUCHBAR_PACKAGES]
 T2_OPTIONAL_PACKAGES = [
     "t2fanrd",
     "t2-apple-audio-dsp-mic",
@@ -123,7 +123,13 @@ APPLE_T2_DMI_PRODUCTS = {
 }
 
 T2_KERNEL_CMDLINE = ["intel_iommu=on", "iommu=pt", "pm_async=off"]
-T2_INITRAMFS_MODULES = ["snd", "snd_pcm", "apple-bce"]
+T2_INITRAMFS_MODULES = [
+    "snd",
+    "snd_pcm",
+    "apple-bce",
+    "hid-appletb-bl",
+    "appletbdrm",
+]
 
 # Only used for Apple T2 recovery media / Apple T2 restore targets.
 # Intel T2 Macs should use the kernel i915 DRM driver plus Xorg modesetting.
@@ -2621,7 +2627,6 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
                 target,
                 required=T2_REQUIRED_PACKAGES,
                 optional=[
-                    *T2_TOUCHBAR_PACKAGES,
                     *T2_OPTIONAL_PACKAGES,
                     *T2_RESTORED_GRAPHICS_PACKAGES,
                 ],
