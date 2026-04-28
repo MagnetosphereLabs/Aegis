@@ -69,12 +69,18 @@ T2_LOCAL_REPO_ROOT = Path("/opt/aegisvault/t2-offline")
 
 T2_APT_KEY_URL = "https://adityagarg8.github.io/t2-ubuntu-repo/KEY.gpg"
 T2_COMMON_LIST_URL = "https://adityagarg8.github.io/t2-ubuntu-repo/t2.list"
+
+# Keep this repo signed, but do not use a globally trusted apt-key style key.
+# APT's _apt sandbox user must be able to read this file.
+T2_APT_KEYRING_PATH = "/etc/apt/keyrings/aegis-t2-ubuntu-repo.gpg"
+T2_APT_SIGNED_BY = f"signed-by={T2_APT_KEYRING_PATH}"
+
 T2_RELEASE_REPO_TEMPLATE = (
-    "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] "
+    f"deb [{T2_APT_SIGNED_BY}] "
     "https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/{codename} ./"
 )
 T2_APPLE_FIRMWARE_REPO = (
-    "deb [signed-by=/etc/apt/trusted.gpg.d/t2-ubuntu-repo.gpg] "
+    f"deb [{T2_APT_SIGNED_BY}] "
     "https://github.com/AdityaGarg8/Apple-Firmware/releases/download/debian ./"
 )
 
@@ -2182,38 +2188,143 @@ def fetch_url_bytes(url: str, timeout_seconds: int = 45) -> bytes:
         return response.read()
 
 
+_APT_DEB_LINE_RE = re.compile(
+    r"^(deb(?:-src)?)\s+(?:\[(?P<opts>[^\]]*)\]\s+)?(?P<rest>.+?)\s*$"
+)
+
+
+def t2_signed_apt_line(line: str) -> str:
+    raw = str(line or "").strip()
+    if not raw or raw.startswith("#"):
+        return raw
+
+    match = _APT_DEB_LINE_RE.match(raw)
+    if not match:
+        return raw
+
+    kind = match.group(1)
+    rest = match.group("rest").strip()
+    existing_opts = (match.group("opts") or "").split()
+
+    opts = [
+        opt
+        for opt in existing_opts
+        if not opt.startswith("signed-by=")
+    ]
+    opts.append(T2_APT_SIGNED_BY)
+
+    return f"{kind} [{' '.join(opts)}] {rest}"
+
+
+def normalize_t2_apt_sources_text(text: str) -> str:
+    lines: List[str] = []
+
+    for raw in str(text or "").splitlines():
+        normalized = t2_signed_apt_line(raw)
+        if normalized:
+            lines.append(normalized)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def t2_preflight_urls() -> List[str]:
+    urls = [
+        T2_APT_KEY_URL,
+        T2_COMMON_LIST_URL,
+        "https://adityagarg8.github.io/t2-ubuntu-repo/InRelease",
+        "https://github.com/AdityaGarg8/Apple-Firmware/releases/download/debian/InRelease",
+    ]
+
+    urls.extend(
+        f"https://github.com/AdityaGarg8/t2-ubuntu-repo/releases/download/{codename}/InRelease"
+        for codename in T2_RECOVERY_CODENAMES
+    )
+
+    return urls
+
+
+def preflight_t2_repository_assets() -> None:
+    failures: List[str] = []
+
+    for url in t2_preflight_urls():
+        try:
+            data = fetch_url_bytes(url, timeout_seconds=20)
+            if not data:
+                failures.append(f"{url}: empty response")
+        except Exception as exc:
+            failures.append(f"{url}: {exc}")
+
+    if failures:
+        raise AegisError(
+            "Apple T2 support package sources are unavailable right now, so Aegis did not erase the USB. "
+            "Try again when the network and T2 repositories are reachable.\n\n"
+            + "\n".join(failures[:8])
+        )
+
 def write_t2_apt_sources(root: Path, codename: str) -> None:
+    keyring = root / T2_APT_KEYRING_PATH.lstrip("/")
     trusted_dir = root / "etc/apt/trusted.gpg.d"
+    keyring.parent.mkdir(parents=True, exist_ok=True)
+
     sources_dir = root / "etc/apt/sources.list.d"
-    trusted_dir.mkdir(parents=True, exist_ok=True)
     sources_dir.mkdir(parents=True, exist_ok=True)
 
-    key_ascii = root / "tmp/aegis-t2-key.gpg"
+    # Remove the legacy location if an earlier failed run left it behind.
+    # Otherwise apt may warn that it cannot read the old 0600 keyring.
+    legacy_keyring = trusted_dir / "t2-ubuntu-repo.gpg"
+    if legacy_keyring != keyring:
+        legacy_keyring.unlink(missing_ok=True)
+
+    key_ascii = root / "tmp/aegis-t2-key.asc"
+    keyring_tmp = root / "tmp/aegis-t2-keyring.gpg"
     key_ascii.parent.mkdir(parents=True, exist_ok=True)
-    key_ascii.write_bytes(fetch_url_bytes(T2_APT_KEY_URL))
 
-    keyring = trusted_dir / "t2-ubuntu-repo.gpg"
-    result = subprocess.run(
-        [
-            "gpg",
-            "--dearmor",
-            "--yes",
-            "--output",
-            str(keyring),
-            str(key_ascii),
-        ],
-        capture_output=True,
-        text=True,
-    )
-    key_ascii.unlink(missing_ok=True)
+    try:
+        key_ascii.write_bytes(fetch_url_bytes(T2_APT_KEY_URL))
 
-    if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "gpg --dearmor failed"
-        raise AegisError(f"Could not prepare T2 apt key: {detail}")
+        result = subprocess.run(
+            [
+                "gpg",
+                "--dearmor",
+                "--yes",
+                "--output",
+                str(keyring_tmp),
+                str(key_ascii),
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "gpg --dearmor failed"
+            raise AegisError(f"Could not prepare Apple T2 apt key: {detail}")
+
+        if not keyring_tmp.exists() or keyring_tmp.stat().st_size <= 0:
+            raise AegisError("Could not prepare Apple T2 apt key: empty keyring was generated.")
+
+        # Critical fix: atomic_write with mode 0644 beats the daemon's UMask=0077.
+        # APT drops to _apt while reading repository metadata, so the signed-by
+        # keyring must be world-readable.
+        atomic_write(keyring, keyring_tmp.read_bytes(), mode=0o644)
+        os.chmod(keyring, 0o644)
+
+    finally:
+        key_ascii.unlink(missing_ok=True)
+        keyring_tmp.unlink(missing_ok=True)
 
     common_list = fetch_url_bytes(T2_COMMON_LIST_URL).decode("utf-8", errors="replace")
+    common_list = normalize_t2_apt_sources_text(common_list)
+
     release_line = T2_RELEASE_REPO_TEMPLATE.format(codename=codename)
-    text = common_list.rstrip() + "\n" + release_line + "\n" + T2_APPLE_FIRMWARE_REPO + "\n"
+    text = (
+        common_list.rstrip()
+        + "\n"
+        + t2_signed_apt_line(release_line)
+        + "\n"
+        + t2_signed_apt_line(T2_APPLE_FIRMWARE_REPO)
+        + "\n"
+    )
+
     atomic_write(sources_dir / "t2.list", text.encode("utf-8"), mode=0o644)
 
 
@@ -6653,6 +6764,11 @@ def create_recovery_usb(device: str, include_t2_support: bool = False) -> None:
     if size and size < MIN_RECOVERY_USB_BYTES:
         raise AegisError("Recovery USB target is too small. Use at least 8 GB.")
     ensure_recovery_builder_prereqs(include_t2_support=include_t2_support)
+    
+    if include_t2_support:
+        update_stage("Checking Apple T2 package sources")
+        preflight_t2_repository_assets()
+    
     update_stage("Preparing recovery USB partitions")
     with mounted_recovery_usb_target(device) as (layout, mount_root):
         update_stage("Bootstrapping Debian recovery environment")
