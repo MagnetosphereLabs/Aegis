@@ -94,7 +94,18 @@ UBUNTU_APT_MIRROR = "https://archive.ubuntu.com/ubuntu"
 UBUNTU_SECURITY_MIRROR = "https://security.ubuntu.com/ubuntu"
 DEBIAN_SECURITY_MIRROR = "https://security.debian.org/debian-security"
 T2_TOUCHBAR_PACKAGES = ["tiny-dfr"]
-T2_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config", *T2_TOUCHBAR_PACKAGES]
+T2_CORE_REQUIRED_PACKAGES = ["linux-t2", "apple-t2-audio-config"]
+
+# tiny-dfr is required where it must work:
+# - trixie: the T2 recovery USB itself
+# - jammy/noble: Pop!_OS / Ubuntu restored targets
+# Do not require it for bookworm, where it is not reliably available.
+T2_TOUCHBAR_REQUIRED_CODENAMES = {T2_RECOVERY_SUITE, "jammy", "noble"}
+
+# Keep this name as core-only compatibility. Codename-sensitive paths must use
+# t2_required_packages_for_codename().
+T2_REQUIRED_PACKAGES = [*T2_CORE_REQUIRED_PACKAGES]
+
 T2_OPTIONAL_PACKAGES = [
     "t2fanrd",
     "t2-apple-audio-dsp-mic",
@@ -2471,6 +2482,16 @@ def t2_package_install_command(packages: List[str]) -> List[str]:
     ]
 
 
+def t2_required_packages_for_codename(codename: str) -> List[str]:
+    cleaned = str(codename or "").strip().lower()
+
+    packages = [*T2_CORE_REQUIRED_PACKAGES]
+
+    if cleaned in T2_TOUCHBAR_REQUIRED_CODENAMES:
+        packages.extend(T2_TOUCHBAR_PACKAGES)
+
+    return dedupe(packages)
+
 def install_t2_packages_best_effort(target: Path, required: List[str], optional: List[str]) -> None:
     if required:
         run_chroot_checked(
@@ -2625,7 +2646,7 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
 
             install_t2_packages_best_effort(
                 target,
-                required=T2_REQUIRED_PACKAGES,
+                required=t2_required_packages_for_codename(codename),
                 optional=[
                     *T2_OPTIONAL_PACKAGES,
                     *T2_RESTORED_GRAPHICS_PACKAGES,
@@ -7094,8 +7115,7 @@ def recovery_package_list(include_t2_support: bool) -> List[str]:
         packages.extend([
             "dpkg-dev",
             "initramfs-tools",
-            *T2_REQUIRED_PACKAGES,
-            *T2_TOUCHBAR_PACKAGES,
+            *t2_required_packages_for_codename(T2_RECOVERY_SUITE),
             *T2_RECOVERY_GRAPHICS_PACKAGES,
         ])
 
@@ -7153,26 +7173,29 @@ def t2_chroot_apt_update_checked(root: Path, label: str) -> None:
 
 def t2_offline_required_cache_packages(codename: str) -> List[str]:
     packages = [
-        *T2_REQUIRED_PACKAGES,
+        *t2_required_packages_for_codename(codename),
         "initramfs-tools",
         "linux-base",
         "kmod",
     ]
 
-    if codename == T2_RECOVERY_SUITE:
-        packages.extend(T2_TOUCHBAR_PACKAGES)
-
     return dedupe(packages)
 
 
 def t2_offline_optional_cache_packages(codename: str) -> List[str]:
+    cleaned = str(codename or "").strip().lower()
+
     packages = [
-        *T2_TOUCHBAR_PACKAGES,
         *T2_OPTIONAL_PACKAGES,
         *T2_RESTORED_GRAPHICS_PACKAGES,
     ]
 
-    if codename == T2_RECOVERY_SUITE:
+    # Try tiny-dfr opportunistically for other codenames, but do not let
+    # unavailable bookworm Touch Bar packaging block recovery USB creation.
+    if cleaned not in T2_TOUCHBAR_REQUIRED_CODENAMES:
+        packages.extend(T2_TOUCHBAR_PACKAGES)
+
+    if cleaned == T2_RECOVERY_SUITE:
         packages.extend(T2_RECOVERY_GRAPHICS_PACKAGES)
 
     return dedupe(packages)
