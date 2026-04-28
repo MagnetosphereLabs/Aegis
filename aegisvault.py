@@ -119,6 +119,28 @@ APPLE_T2_DMI_PRODUCTS = {
 
 T2_KERNEL_CMDLINE = ["intel_iommu=on", "iommu=pt", "pm_async=off"]
 T2_INITRAMFS_MODULES = ["snd", "snd_pcm", "apple-bce"]
+
+# Only used for Apple T2 recovery media / Apple T2 restore targets.
+# Intel T2 Macs should use the kernel i915 DRM driver plus Xorg modesetting.
+# AMD-equipped T2 Macs should use amdgpu/radeon DRM plus Xorg modesetting.
+T2_GRAPHICS_MODULES = ["i915", "amdgpu", "radeon"]
+
+T2_RECOVERY_GRAPHICS_PACKAGES = [
+    "libgl1-mesa-dri",
+    "libglx-mesa0",
+    "xserver-xorg-video-amdgpu",
+    "xserver-xorg-video-radeon",
+    "firmware-amd-graphics",
+    "mesa-utils",
+]
+
+T2_RESTORED_GRAPHICS_PACKAGES = [
+    "libgl1-mesa-dri",
+    "libglx-mesa0",
+    "xserver-xorg-video-amdgpu",
+    "xserver-xorg-video-radeon",
+    "firmware-amd-graphics",
+]
 MIN_RECOVERY_USB_BYTES = 8 * 1000 * 1000 * 1000
 PREFERRED_RECOVERY_USB_MAX_BYTES = 256 * 1000 * 1000 * 1000
 BACKUP_PREFLIGHT_MIN_FREE_BYTES = 1024 * 1024 * 1024
@@ -2184,6 +2206,66 @@ def configure_t2_kernel_files(target: Path) -> None:
             lambda text: add_tokens_to_grub_cmdline_text(text, T2_KERNEL_CMDLINE),
         )
 
+def configure_t2_graphics_files(target: Path) -> None:
+    """
+    Apple T2-only graphics setup.
+
+    This intentionally does not force apple-gmux or choose Intel vs AMD.
+    It lets the kernel expose whatever GPU path is active, then tells Xorg to
+    use DRM/KMS modesetting for Intel i915, AMDGPU, or Radeon instead of
+    falling through to VESA/fbdev.
+    """
+    modules_load = target / "etc/modules-load.d/aegis-t2-graphics.conf"
+    modules_load.parent.mkdir(parents=True, exist_ok=True)
+    append_unique_lines(modules_load, T2_GRAPHICS_MODULES, mode=0o644)
+
+    initramfs_modules = target / "etc/initramfs-tools/modules"
+    initramfs_modules.parent.mkdir(parents=True, exist_ok=True)
+    append_unique_lines(
+        initramfs_modules,
+        [
+            "",
+            "# Added by Aegis for Apple T2 Intel/AMD graphics support:",
+            *T2_GRAPHICS_MODULES,
+        ],
+        mode=0o644,
+    )
+
+    xorg_dir = target / "etc/X11/xorg.conf.d"
+    xorg_dir.mkdir(parents=True, exist_ok=True)
+
+    xorg_text = textwrap.dedent("""\
+        # Managed by Aegis Apple T2 support.
+        # Force T2 Mac Intel/AMD GPUs through DRM/KMS modesetting.
+        # This prevents Xorg from falling back to VESA/fbdev on T2 recovery media.
+
+        Section "ServerFlags"
+            Option "AutoAddGPU" "true"
+        EndSection
+
+        Section "OutputClass"
+            Identifier "Aegis T2 Intel i915"
+            MatchDriver "i915"
+            Driver "modesetting"
+            Option "DRI" "3"
+        EndSection
+
+        Section "OutputClass"
+            Identifier "Aegis T2 AMDGPU"
+            MatchDriver "amdgpu"
+            Driver "modesetting"
+            Option "DRI" "3"
+        EndSection
+
+        Section "OutputClass"
+            Identifier "Aegis T2 Radeon fallback"
+            MatchDriver "radeon"
+            Driver "modesetting"
+            Option "DRI" "3"
+        EndSection
+    """)
+    atomic_write(xorg_dir / "10-aegis-t2-modesetting.conf", xorg_text.encode("utf-8"), mode=0o644)
+
 
 def fetch_url_bytes(url: str, timeout_seconds: int = 45) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/1.0"})
@@ -2420,6 +2502,7 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
     update_stage(f"Applying Apple T2 support to restored system ({current_dmi_product_name()}, {codename})")
 
     configure_t2_kernel_files(target)
+    configure_t2_graphics_files(target)
 
     local_source_list = target / "etc/apt/sources.list.d/aegis-t2-local.list"
 
@@ -2441,7 +2524,11 @@ def maybe_apply_t2_support_to_restored_target(target: Path) -> bool:
             install_t2_packages_best_effort(
                 target,
                 required=T2_REQUIRED_PACKAGES,
-                optional=[*T2_TOUCHBAR_PACKAGES, *T2_OPTIONAL_PACKAGES],
+                optional=[
+                    *T2_TOUCHBAR_PACKAGES,
+                    *T2_OPTIONAL_PACKAGES,
+                    *T2_RESTORED_GRAPHICS_PACKAGES,
+                ],
             )
         finally:
             local_source_list.unlink(missing_ok=True)
@@ -6666,11 +6753,15 @@ def recovery_package_list(include_t2_support: bool) -> List[str]:
         # T2 recovery media does not get Debian's normal linux-image-amd64 path.
         # Require initramfs-tools explicitly because update-initramfs is needed
         # after writing the Apple T2 initramfs module config.
+        #
+        # Also install only T2-scoped graphics support here. The non-T2 recovery
+        # image must remain unchanged.
         packages.extend([
             "dpkg-dev",
             "initramfs-tools",
             *T2_REQUIRED_PACKAGES,
             *T2_TOUCHBAR_PACKAGES,
+            *T2_RECOVERY_GRAPHICS_PACKAGES,
         ])
 
     return dedupe(packages)
@@ -6793,6 +6884,7 @@ def prepare_recovery_t2_support(mount_root: Path) -> None:
 
     write_t2_apt_sources(mount_root, T2_RECOVERY_SUITE)
     configure_t2_kernel_files(mount_root)
+    configure_t2_graphics_files(mount_root)
 
     t2_chroot_apt_update_checked(
         mount_root,
