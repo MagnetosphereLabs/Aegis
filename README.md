@@ -25,7 +25,7 @@ Uninstall with 1 command:
 curl -fsSL https://raw.githubusercontent.com/MagnetosphereLabs/Aegis/main/install.sh | sudo bash -s -- uninstall
 ```
 
-# Aegis: Architecture and Capabilities
+# Architecture and Capabilities
 
 Aegis is a compact, robust Linux backup and bare metal recovery application designed primarily for Debian based systems. It differs from traditional Linux backup tools by packing an entire suite of interfaces and engines into a standalone script, focusing heavily on deduplication, system portability, and hardware agnostic restores.
 
