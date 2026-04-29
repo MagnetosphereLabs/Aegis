@@ -54,7 +54,7 @@ SECURE_TMP_DIR = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 BUNDLE_MAGIC = b"AGBND1"
 OBJECT_MAGIC = b"AGOBJ1"
 DEFAULT_REPO = "/var/backups/aegisvault"
-DEFAULT_CHUNK_MIB = 300
+DEFAULT_CHUNK_MIB = 16
 BUFFER_SIZE = 1024 * 1024
 LOG_LIMIT = 250
 RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
@@ -9992,7 +9992,7 @@ def gui_main() -> int:
             self.notebook.tab(self.overview_tab, state="normal" if configured else "hidden")
             self.notebook.tab(self.backup_tab, state="normal" if configured else "hidden")
             self.notebook.tab(self.restore_tab, state="normal" if configured else "hidden")
-            self.notebook.tab(self.constellation_tab, state="normal" if configured else "hidden")
+            self.notebook.tab(self.constellation_tab, state="hidden")
             self.notebook.tab(self.settings_tab, state="normal" if configured else "hidden")
 
             if configured:
