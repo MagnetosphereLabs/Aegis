@@ -229,6 +229,13 @@ do_install() {
 do_update() {
   require_root
 
+  local lockfile="/var/lib/aegisvault/backup.lock"
+  if [ -f "${lockfile}" ] && lsof "${lockfile}" >/dev/null 2>&1; then
+    echo "Error: A backup, restore, or sync job is actively running in the background." >&2
+    echo "Wait for the job to finish before updating." >&2
+    exit 1
+  fi
+
   if [ -r /dev/tty ]; then
     echo >/dev/tty
     echo "Aegis update will restart the background service and any open Aegis desktop window." >/dev/tty
