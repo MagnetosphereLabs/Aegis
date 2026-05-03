@@ -34,7 +34,25 @@ apt_install() {
 
 install_app() {
   mkdir -p "${APP_DIR}"
-  curl -fsSL "${RAW_BASE}/aegisvault.py" -o "${APP_DIR}/aegisvault.py"
+  local tmp_file
+  tmp_file="$(mktemp)"
+  
+  echo "Downloading update..."
+  if ! curl -fsSL "${RAW_BASE}/aegisvault.py" -o "${tmp_file}"; then
+    echo "Error: Download failed. Update aborted." >&2
+    rm -f "${tmp_file}"
+    exit 1
+  fi
+
+  # Verify the Python file is fully intact and valid
+  if ! python3 -m py_compile "${tmp_file}" >/dev/null 2>&1; then
+    echo "Error: Downloaded file is corrupted or incomplete. Update aborted." >&2
+    rm -f "${tmp_file}"
+    exit 1
+  fi
+
+  # Atomic replacement
+  mv "${tmp_file}" "${APP_DIR}/aegisvault.py"
   chmod 0755 "${APP_DIR}/aegisvault.py"
 
   cat > "${BIN_PATH}" <<'EOF'
