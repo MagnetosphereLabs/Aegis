@@ -9949,13 +9949,10 @@ def gui_main() -> int:
             ttk.Combobox(
                 frame,
                 textvariable=self.schedule_preset_var,
-                values=["manual", "hourly", "daily", "weekly", "custom"],
+                values=["manual", "daily", "weekly"],
                 width=18,
                 state="readonly",
             ).grid(row=8, column=1, sticky="w", pady=(12, 0))
-
-            ttk.Label(frame, text="Custom minutes").grid(row=9, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(frame, textvariable=self.schedule_custom_var, width=12).grid(row=9, column=1, sticky="w", pady=(12, 0))
 
             ttk.Label(frame, text="I/O pause per chunk (ms)").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
             ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=10, column=1, sticky="w", pady=(12, 0))
@@ -10823,13 +10820,10 @@ def gui_main() -> int:
             ttk.Combobox(
                 schedule,
                 textvariable=self.schedule_preset_var,
-                values=["manual", "hourly", "daily", "weekly", "custom"],
+                values=["manual", "daily", "weekly"],
                 width=18,
                 state="readonly",
             ).grid(row=2, column=1, sticky="w", pady=(10, 0))
-
-            ttk.Label(schedule, text="Custom minutes").grid(row=3, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(schedule, textvariable=self.schedule_custom_var, width=12).grid(row=3, column=1, sticky="w", pady=(10, 0))
 
             ttk.Label(schedule, text="I/O pause per chunk (ms)").grid(row=4, column=0, sticky="w", pady=(10, 0))
             ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
