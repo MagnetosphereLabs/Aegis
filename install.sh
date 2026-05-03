@@ -229,11 +229,18 @@ do_install() {
 do_update() {
   require_root
 
+  if [ -r /dev/tty ]; then
+    echo "Checking system state..." >/dev/tty
+  fi
+
   local lockfile="/var/lib/aegisvault/backup.lock"
-  if [ -f "${lockfile}" ] && lsof "${lockfile}" >/dev/null 2>&1; then
-    echo "Error: A backup, restore, or sync job is actively running in the background." >&2
-    echo "Wait for the job to finish before updating." >&2
-    exit 1
+  if [ -f "${lockfile}" ]; then
+    # flock -n attempts an immediate, non-blocking lock. If it fails, Python is using it.
+    if ! flock -n "${lockfile}" -c "true" >/dev/null 2>&1; then
+      echo "Error: A backup, restore, or sync job is actively running in the background." >&2
+      echo "Wait for the job to finish before updating." >&2
+      exit 1
+    fi
   fi
 
   if [ -r /dev/tty ]; then
