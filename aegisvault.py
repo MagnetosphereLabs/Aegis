@@ -711,7 +711,7 @@ def resolve_settings_repo_path(settings: Settings, create_if_missing: bool = Fal
         refresh_repo_locator(settings, settings.repo_path)
         return settings.repo_path
 
-    scanned_match = best_matching_repo_candidate(repo_path, discover_repo_candidates())
+    scanned_match = best_matching_repo_candidate(repo_path, discover_repo_candidates(repo_path))
     if scanned_match:
         settings.repo_path = os.path.abspath(scanned_match)
         refresh_repo_locator(settings, settings.repo_path)
@@ -4128,14 +4128,15 @@ def find_block_device_entry(device: str) -> Optional[Dict[str, Any]]:
             return entry
     return None
 
-def discover_repo_candidates() -> List[str]:
+def discover_repo_candidates(current_repo: Optional[str] = None) -> List[str]:
     candidates: List[str] = []
     seen: Set[str] = set()
     search_roots = [Path("/media"), Path("/mnt"), Path("/run/media")]
 
-    current = Path(load_settings().repo_path)
-    if current.exists():
-        search_roots.insert(0, current)
+    if current_repo:
+        current = Path(current_repo)
+        if current.exists():
+            search_roots.insert(0, current)
 
     for root in search_roots:
         for candidate in iter_candidate_directories(root, max_depth=4):
@@ -11740,6 +11741,10 @@ def gui_main() -> int:
             try:
                 if self.recovery_mode and os.geteuid() == 0:
                     self.recovery_mounts = auto_mount_recovery_sources()
+
+                # Pass the UI's currently known path instead of reading the disk
+                current_repo = self.repo_path_var.get().strip()
+                self.repo_candidates = discover_repo_candidates(current_repo)
 
                 self.repo_candidates = discover_repo_candidates()
                 if hasattr(self, "repo_candidate_combo"):
