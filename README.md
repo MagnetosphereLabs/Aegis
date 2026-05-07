@@ -2,7 +2,7 @@
 
 The core backup, restore, and recovery USB features have been tested on Debian based systems (like Ubuntu and Pop!_OS) on my gaming PC, my 2011 Macbook Air, and my 2019 Macbook Pro with the T2 chip. I built Aegis to protect my own Linux systems. However, because system configurations vary wildly, this software is provided "as is" without absolute guarantees. Please be smart with your critical data and always maintain multiple backups across multiple physical devices. We are not liable for any data loss.
 
-<img src="Aegis.png" width="640" />
+<img src="Backup.png" width="640" />
 
 ## Install
 
@@ -52,6 +52,8 @@ The application runs a persistent background process bound to a Unix socket.
 Aegis uses standard archive tools to read your filesystem, ensuring POSIX permissions and extended attributes are preserved. However, saving massive single archives wastes storage. Standard block deduplication often fails on archive streams due to data shifting. If one file changes, every byte after it shifts, ruining subsequent block hashes.
 
 Aegis solves this by inspecting the byte stream in real time. It actively scans for standard archive header byte signatures. When the buffer reaches an optimal threshold, it cuts the chunk precisely at a file boundary. This guarantees that untouched files align perfectly and hash identically during future backups, saving immense disk space without requiring complex rolling hashes.
+
+<img src="Aegis.png" width="640" />
 
 ### Cryptography
 
