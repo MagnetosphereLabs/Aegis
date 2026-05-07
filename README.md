@@ -2,6 +2,7 @@
 
 The core backup, restore, and recovery USB features have been tested on Debian based systems (like Ubuntu and Pop!_OS) on my gaming PC, my 2011 Macbook Air, and my 2019 Macbook Pro with the T2 chip. I built Aegis to protect my own Linux systems. However, because system configurations vary wildly, this software is provided "as is" without absolute guarantees. Please be smart with your critical data and always maintain multiple backups across multiple physical devices. We are not liable for any data loss.
 
+<img src="Aegis.png" width="640" />
 
 ## Install
 
