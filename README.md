@@ -68,5 +68,5 @@ The Portable Migration feature solves this. During restoration, Aegis intercepts
 Aegis is not a magic bullet for every scenario. Please note these considerations before deploying it to production.
 
 * **No Native Cloud Transport:** Aegis requires a locally mounted block device or a network attached storage mount. It does not communicate natively with remote object storage APIs.
-* **File Level Tracking:** Because AegisVault utilizes file boundary chunking, it is highly optimized for standard operating system directories. It is less efficient at deduplicating minor changes inside massive monolithic files, such as active virtual machine disks or large database binary files.
+* **File Level Tracking:** Because Aegis utilizes file boundary chunking, it is highly optimized for standard operating system directories. It is less efficient at deduplicating minor changes inside massive monolithic files, such as active virtual machine disks or large database binary files.
 * **Target Scope:** It specifically targets Debian based distributions. Systems utilizing radically different package managers or immutable root filesystems will not benefit from the hardware scrubbing logic.
