@@ -9458,6 +9458,7 @@ def tui_main() -> int:
         return 130
 
 def gui_main() -> int:
+    import queue
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
     from tkinter.scrolledtext import ScrolledText
@@ -9549,6 +9550,12 @@ def gui_main() -> int:
             self.activity_bar_running = False
             self.last_seen_error = ""
             self.previous_running_job_name = ""
+            self.startup_loading = False
+            self.startup_progress_var = tk.DoubleVar(value=0.0)
+            self.startup_status_var = tk.StringVar(value="Opening Aegis")
+            self.dashboard_refresh_running = False
+            self.pending_dashboard_refresh = False
+            self.dashboard_result_queue = queue.Queue()
 
             self.recovery_usb_device_var = tk.StringVar(value="")
             self.recovery_usb_t2_support_var = tk.BooleanVar(value=False)
@@ -9569,6 +9576,7 @@ def gui_main() -> int:
             self.notebook = ttk.Notebook(outer)
             self.notebook.pack(fill="both", expand=True)
 
+            self.startup_tab = ttk.Frame(self.notebook, padding=16)
             self.setup_tab = ttk.Frame(self.notebook, padding=16)
             self.overview_tab = ttk.Frame(self.notebook, padding=16)
             self.backup_tab = ttk.Frame(self.notebook, padding=16)
@@ -9576,6 +9584,7 @@ def gui_main() -> int:
             self.constellation_tab = ttk.Frame(self.notebook, padding=16)
             self.settings_tab = ttk.Frame(self.notebook, padding=16)
 
+            self.notebook.add(self.startup_tab, text="Opening")
             self.notebook.add(self.setup_tab, text="Setup")
             self.notebook.add(self.overview_tab, text="Overview")
             self.notebook.add(self.backup_tab, text="Backup")
@@ -9583,13 +9592,23 @@ def gui_main() -> int:
             self.notebook.add(self.constellation_tab, text="Constellation")
             self.notebook.add(self.settings_tab, text="Settings")
 
+            self.build_startup_tab()
             self.build_setup_tab()
             self.build_overview_tab()
             self.build_backup_tab()
             self.build_restore_tab()
             self.build_constellation_tab()
             self.build_settings_tab()
-            self.apply_configuration_state(False)
+
+            try:
+                initial_configured = bool(load_settings().onboarding_complete)
+            except Exception:
+                initial_configured = False
+
+            if initial_configured or self.recovery_mode:
+                self.apply_startup_loading_state("Checking backup repository")
+            else:
+                self.apply_configuration_state(False)
 
             footer = ttk.Frame(outer)
             footer.pack(fill="x", pady=(12, 0))
@@ -9901,6 +9920,66 @@ def gui_main() -> int:
                     raise AegisError(response.get("error", "Unknown daemon error"))
                 return response
         
+        def build_startup_tab(self) -> None:
+            panel = ttk.Frame(self.startup_tab)
+            panel.place(relx=0.5, rely=0.45, anchor="center")
+            panel.grid_columnconfigure(0, weight=1)
+
+            ttk.Label(panel, text=APP_NAME, style="Header.TLabel").grid(row=0, column=0, sticky="ew")
+            ttk.Label(
+                panel,
+                textvariable=self.startup_status_var,
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, sticky="ew", pady=(10, 8))
+            ttk.Progressbar(
+                panel,
+                variable=self.startup_progress_var,
+                maximum=100,
+                length=360,
+                mode="determinate",
+                style="Aegis.Horizontal.TProgressbar",
+            ).grid(row=2, column=0, sticky="ew")
+
+        def set_startup_progress(self, value: float, text: str) -> None:
+            self.startup_progress_var.set(max(0.0, min(100.0, float(value))))
+            self.startup_status_var.set(text)
+            self.status_var.set(text)
+            self.message_var.set(text)
+
+        def pulse_startup_progress(self) -> None:
+            if not self.startup_loading or not self.dashboard_refresh_running:
+                return
+
+            current = float(self.startup_progress_var.get() or 0.0)
+            if current < 90.0:
+                next_value = min(90.0, current + 1.5)
+                if next_value < 35.0:
+                    text = "Connecting to Aegis"
+                elif next_value < 70.0:
+                    text = "Checking backup repository"
+                else:
+                    text = "Loading backups"
+                self.set_startup_progress(next_value, text)
+
+            self.root.after(350, self.pulse_startup_progress)
+
+        def apply_startup_loading_state(self, text: str = "Checking backup repository") -> None:
+            self.startup_loading = True
+            self.set_startup_progress(10.0, text)
+
+            for tab in (
+                self.setup_tab,
+                self.overview_tab,
+                self.backup_tab,
+                self.restore_tab,
+                self.constellation_tab,
+                self.settings_tab,
+            ):
+                self.notebook.tab(tab, state="hidden")
+
+            self.notebook.tab(self.startup_tab, state="normal")
+            self.notebook.select(self.startup_tab)
+
         def build_setup_tab(self) -> None:
             frame = self.make_scrollable_frame(self.setup_tab)
             frame.grid_columnconfigure(1, weight=1)
@@ -9968,6 +10047,10 @@ def gui_main() -> int:
             ttk.Button(buttons, text="Save Setup and Open App", command=self.complete_onboarding).pack(side="left")
 
         def apply_configuration_state(self, configured: bool) -> None:
+            self.startup_loading = False
+            if hasattr(self, "startup_tab"):
+                self.notebook.tab(self.startup_tab, state="hidden")
+
             if self.recovery_mode:
                 if self.ui_configured_state is True:
                     return
@@ -12032,18 +12115,58 @@ def gui_main() -> int:
                 self.activity_bar_running = True
         
         def refresh_dashboard(self) -> None:
+            if self.dashboard_refresh_running:
+                self.pending_dashboard_refresh = True
+                return
+
+            self.dashboard_refresh_running = True
+            if self.startup_loading:
+                self.set_startup_progress(15.0, "Connecting to Aegis")
+                self.root.after(250, self.pulse_startup_progress)
+
+            def worker() -> None:
+                try:
+                    self.dashboard_result_queue.put((self.daemon_dashboard(), None))
+                except Exception as exc:
+                    self.dashboard_result_queue.put((None, exc))
+
+            threading.Thread(target=worker, daemon=True).start()
+            self.root.after(100, self.finish_dashboard_refresh_if_ready)
+
+        def finish_dashboard_refresh_if_ready(self) -> None:
             try:
-                payload = self.daemon_dashboard()
+                payload, exc = self.dashboard_result_queue.get_nowait()
+            except queue.Empty:
+                self.root.after(100, self.finish_dashboard_refresh_if_ready)
+                return
+
+            self.dashboard_refresh_running = False
+
+            try:
+                if exc is not None:
+                    raise exc
+
+                if self.startup_loading:
+                    self.set_startup_progress(95.0, "Opening dashboard")
+
                 self.dashboard_payload = payload
                 self.populate_dashboard(payload)
+
+                if self.startup_loading:
+                    self.set_startup_progress(100.0, "Ready")
             except Exception as exc:
                 self.status_var.set("Needs attention")
-                if self.ui_configured_state is False:
-                    self.message_var.set(
-                        "Finish setup to start Aegis."
-                    )
+                if self.startup_loading:
+                    self.set_startup_progress(100.0, "Needs attention")
+                    self.message_var.set(str(exc))
+                elif self.ui_configured_state is False:
+                    self.message_var.set("Finish setup to start Aegis.")
                 else:
                     self.message_var.set(str(exc))
+
+            if self.pending_dashboard_refresh:
+                self.pending_dashboard_refresh = False
+                self.root.after(50, self.refresh_dashboard)
 
         def periodic_refresh(self) -> None:
             current_job = None
