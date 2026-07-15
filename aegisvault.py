@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import dataclasses
 import errno
 import fnmatch
@@ -29,6 +30,8 @@ import time
 import traceback
 import urllib.request
 import textwrap
+import zipfile
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -55,7 +58,9 @@ BUNDLE_MAGIC = b"AGBND1"
 OBJECT_MAGIC = b"AGOBJ1"
 DEFAULT_REPO = "/var/backups/aegisvault"
 DEFAULT_CHUNK_MIB = 16
-BUFFER_SIZE = 1024 * 1024
+BUFFER_SIZE = 8 * 1024 * 1024
+STAGING_MEMBER_BYTES = 1024 * 1024 * 1024
+BACKUP_CPU_FRACTION = 0.70
 LOG_LIMIT = 250
 RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
 RECOVERY_MOUNT_ROOT = Path("/mnt/aegisvault-recovery")
@@ -4803,6 +4808,602 @@ def verify_manifest_restore_stream(
                 f"{stderr.strip() or f'tar exited with status {returncode}'}"
             )
 
+
+@dataclass
+class StagedArchiveMember:
+    name: str
+    size: int
+    sha256: str
+
+
+@dataclass
+class StagedArchive:
+    path: Path
+    members: List[StagedArchiveMember]
+    total_bytes: int
+    sha256: str
+
+
+@dataclass
+class PreparedBackupChunk:
+    hash: str
+    plain_len: int
+    encoded: Optional[bytes]
+
+
+def backup_staging_root(repo: Path) -> Path:
+    return repo / ".staging"
+
+
+def cleanup_backup_staging(repo: Path) -> None:
+    staging_root = backup_staging_root(repo)
+    if staging_root.exists():
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def remove_staged_archive(stage: Optional[StagedArchive]) -> None:
+    if stage is None:
+        return
+
+    try:
+        stage.path.unlink(missing_ok=True)
+    finally:
+        current = stage.path.parent
+        staging_root = backup_staging_root(stage.path.parents[2])
+
+        while current != staging_root.parent:
+            try:
+                current.rmdir()
+            except OSError:
+                break
+            if current == staging_root:
+                break
+            current = current.parent
+
+
+def _fsync_path(path: Path) -> None:
+    with path.open("rb") as handle:
+        os.fsync(handle.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(str(path), flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def create_staged_backup_archive(
+    settings: Settings,
+    run_id: str,
+    kind: str,
+    includes: List[str],
+    excludes: List[str],
+    estimate_bytes: int,
+    progress_callback=None,
+) -> StagedArchive:
+    repo = Path(settings.repo_path)
+    staging_dir = backup_staging_root(repo) / run_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(backup_staging_root(repo), 0o700)
+    os.chmod(staging_dir, 0o700)
+
+    final_path = staging_dir / f"{kind}.zip"
+    partial_path = staging_dir / f".{kind}.zip.partial"
+    final_path.unlink(missing_ok=True)
+    partial_path.unlink(missing_ok=True)
+
+    members: List[StagedArchiveMember] = []
+    archive_hasher = hashlib.sha256()
+    total_bytes = 0
+    last_report_at = 0.0
+    proc: Optional[subprocess.Popen] = None
+
+    with tempfile.TemporaryFile(mode="w+b") as stderr_file:
+        try:
+            cmd = build_tar_backup_command(includes, excludes)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+            )
+            assert proc.stdout is not None
+
+            with zipfile.ZipFile(
+                partial_path,
+                mode="w",
+                compression=zipfile.ZIP_STORED,
+                allowZip64=True,
+            ) as archive:
+                member_writer = None
+                member_name = ""
+                member_size = 0
+                member_hasher = hashlib.sha256()
+                member_index = 0
+
+                try:
+                    while True:
+                        block = read_exact(proc.stdout, BUFFER_SIZE)
+                        if not block:
+                            break
+
+                        offset = 0
+                        while offset < len(block):
+                            if member_writer is None:
+                                member_name = f"archive/part-{member_index:06d}.tar"
+                                info = zipfile.ZipInfo(
+                                    member_name,
+                                    date_time=time.localtime()[:6],
+                                )
+                                info.compress_type = zipfile.ZIP_STORED
+                                info.create_system = 3
+                                info.external_attr = 0o600 << 16
+                                member_writer = archive.open(
+                                    info,
+                                    mode="w",
+                                    force_zip64=True,
+                                )
+                                member_size = 0
+                                member_hasher = hashlib.sha256()
+
+                            take = min(
+                                len(block) - offset,
+                                STAGING_MEMBER_BYTES - member_size,
+                            )
+                            piece = block[offset:offset + take]
+                            member_writer.write(piece)
+                            member_hasher.update(piece)
+                            archive_hasher.update(piece)
+                            member_size += take
+                            total_bytes += take
+                            offset += take
+
+                            if member_size == STAGING_MEMBER_BYTES:
+                                member_writer.close()
+                                member_writer = None
+                                members.append(
+                                    StagedArchiveMember(
+                                        name=member_name,
+                                        size=member_size,
+                                        sha256=member_hasher.hexdigest(),
+                                    )
+                                )
+                                member_index += 1
+
+                        now = time.monotonic()
+                        if progress_callback and now - last_report_at >= 0.35:
+                            progress_callback(
+                                total_bytes,
+                                max(total_bytes, estimate_bytes),
+                                f"Copied {human_bytes(total_bytes)} into the uncompressed staging archive.",
+                            )
+                            last_report_at = now
+
+                finally:
+                    if member_writer is not None:
+                        member_writer.close()
+                        if member_size > 0:
+                            members.append(
+                                StagedArchiveMember(
+                                    name=member_name,
+                                    size=member_size,
+                                    sha256=member_hasher.hexdigest(),
+                                )
+                            )
+
+            returncode = proc.wait()
+            stderr_file.seek(0)
+            stderr_data = stderr_file.read().decode("utf-8", errors="ignore")
+
+            if returncode not in (0, 1):
+                raise AegisError(
+                    f"tar backup failed for {kind_label(kind)}: "
+                    f"{stderr_data.strip() or returncode}"
+                )
+
+            if total_bytes <= 10240 or not members:
+                raise AegisError(
+                    f"The staged {kind_label(kind)} restore stream is empty or incomplete."
+                )
+
+            _fsync_path(partial_path)
+            os.replace(partial_path, final_path)
+            _fsync_directory(staging_dir)
+
+            if progress_callback:
+                progress_callback(
+                    total_bytes,
+                    total_bytes,
+                    f"Finished staging {human_bytes(total_bytes)} without compression.",
+                )
+
+            return StagedArchive(
+                path=final_path,
+                members=members,
+                total_bytes=total_bytes,
+                sha256=archive_hasher.hexdigest(),
+            )
+
+        except Exception:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            partial_path.unlink(missing_ok=True)
+            final_path.unlink(missing_ok=True)
+            raise
+
+
+def verify_staged_backup_archive(
+    stage: StagedArchive,
+    progress_callback=None,
+) -> None:
+    expected_names = [member.name for member in stage.members]
+    expected_by_name = {member.name: member for member in stage.members}
+    archive_hasher = hashlib.sha256()
+    total_bytes = 0
+    last_report_at = 0.0
+
+    with tempfile.TemporaryFile(mode="w+b") as tar_stderr:
+        tar_proc = subprocess.Popen(
+            ["tar", "-tf", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=tar_stderr,
+        )
+        assert tar_proc.stdin is not None
+
+        try:
+            with zipfile.ZipFile(stage.path, mode="r") as archive:
+                infos = archive.infolist()
+                actual_names = [info.filename for info in infos]
+
+                if actual_names != expected_names:
+                    raise AegisError(
+                        "The staging ZIP member list changed after it was written."
+                    )
+
+                for info in infos:
+                    expected = expected_by_name[info.filename]
+
+                    if info.compress_type != zipfile.ZIP_STORED:
+                        raise AegisError(
+                            f"Staging member {info.filename} was unexpectedly compressed."
+                        )
+
+                    if int(info.file_size) != int(expected.size):
+                        raise AegisError(
+                            f"Staging member {info.filename} has the wrong size."
+                        )
+
+                    member_hasher = hashlib.sha256()
+                    member_bytes = 0
+
+                    with archive.open(info, mode="r") as source:
+                        while True:
+                            block = source.read(BUFFER_SIZE)
+                            if not block:
+                                break
+
+                            member_hasher.update(block)
+                            archive_hasher.update(block)
+                            member_bytes += len(block)
+                            total_bytes += len(block)
+
+                            try:
+                                tar_proc.stdin.write(block)
+                            except BrokenPipeError as exc:
+                                raise AegisError(
+                                    "The staged backup is not a readable tar restore stream."
+                                ) from exc
+
+                            now = time.monotonic()
+                            if progress_callback and now - last_report_at >= 0.35:
+                                progress_callback(
+                                    total_bytes,
+                                    stage.total_bytes,
+                                    f"Verified {human_bytes(total_bytes)} of the staging archive.",
+                                )
+                                last_report_at = now
+
+                    if member_bytes != expected.size:
+                        raise AegisError(
+                            f"Staging member {info.filename} ended at the wrong length."
+                        )
+
+                    if member_hasher.hexdigest() != expected.sha256:
+                        raise AegisError(
+                            f"Staging member {info.filename} failed its SHA-256 check."
+                        )
+
+            tar_proc.stdin.close()
+            returncode = tar_proc.wait()
+            tar_stderr.seek(0)
+            tar_error = tar_stderr.read().decode("utf-8", errors="ignore")
+
+            if returncode != 0:
+                raise AegisError(
+                    "The staging ZIP passed its container checks but did not contain "
+                    f"a readable tar restore stream: {tar_error.strip() or returncode}"
+                )
+
+        except Exception:
+            try:
+                tar_proc.stdin.close()
+            except Exception:
+                pass
+            if tar_proc.poll() is None:
+                tar_proc.terminate()
+                try:
+                    tar_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    tar_proc.kill()
+                    tar_proc.wait()
+            raise
+
+    if total_bytes != stage.total_bytes:
+        raise AegisError(
+            f"The staging archive verified {human_bytes(total_bytes)}, "
+            f"but {human_bytes(stage.total_bytes)} was originally written."
+        )
+
+    if archive_hasher.hexdigest() != stage.sha256:
+        raise AegisError(
+            "The staging archive SHA-256 does not match the source tar stream."
+        )
+
+    if progress_callback:
+        progress_callback(
+            total_bytes,
+            total_bytes,
+            "The uncompressed staging ZIP, every member CRC, every member SHA-256, "
+            "the full stream SHA-256, and the tar structure were verified.",
+        )
+
+
+class ArchiveChunkSplitter:
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = max(512, (int(chunk_size) // 512) * 512)
+        self.flush_threshold = int(self.chunk_size * 0.8)
+        self.buffer = bytearray()
+
+    def write(self, data: bytes) -> List[bytes]:
+        pieces: List[bytes] = []
+        self.buffer.extend(data)
+
+        if len(self.buffer) >= self.flush_threshold:
+            marker_position = ((self.flush_threshold + 511) // 512) * 512 + 257
+            cut_index = -1
+
+            while True:
+                marker_position = self.buffer.find(b"ustar", marker_position)
+                if marker_position < 0:
+                    break
+
+                candidate = marker_position - 257
+                if candidate >= self.flush_threshold and candidate % 512 == 0:
+                    cut_index = candidate
+                    break
+
+                marker_position += 1
+
+            if cut_index != -1:
+                pieces.append(bytes(self.buffer[:cut_index]))
+                del self.buffer[:cut_index]
+
+        while len(self.buffer) >= self.chunk_size:
+            pieces.append(bytes(self.buffer[:self.chunk_size]))
+            del self.buffer[:self.chunk_size]
+
+        return pieces
+
+    def finish(self) -> List[bytes]:
+        if not self.buffer:
+            return []
+
+        piece = bytes(self.buffer)
+        self.buffer.clear()
+        return [piece]
+
+
+def _available_memory_bytes() -> int:
+    try:
+        for line in Path("/proc/meminfo").read_text(
+            encoding="utf-8",
+            errors="ignore",
+        ).splitlines():
+            if line.startswith("MemAvailable:"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    return int(parts[1]) * 1024
+    except Exception:
+        pass
+    return 0
+
+
+def backup_worker_plan(chunk_size: int) -> Tuple[int, int]:
+    logical_cpus = max(1, int(os.cpu_count() or 1))
+    cpu_limit = max(1, int(logical_cpus * BACKUP_CPU_FRACTION))
+
+    available_memory = _available_memory_bytes()
+    if available_memory > 0:
+        memory_budget = max(chunk_size * 3, available_memory // 4)
+        inflight_limit = max(1, memory_budget // max(1, chunk_size * 3))
+        workers = max(1, min(cpu_limit, inflight_limit))
+        max_inflight = max(workers, min(inflight_limit, workers * 2))
+    else:
+        workers = cpu_limit
+        max_inflight = max(workers, workers * 2)
+
+    return workers, max_inflight
+
+
+class ParallelRepoObjectWriter:
+    def __init__(
+        self,
+        settings: Settings,
+        repo: Path,
+        machine: str,
+        key: Optional[bytes],
+        protected_snapshot_ids: Optional[Set[str]] = None,
+    ) -> None:
+        self.settings = settings
+        self.repo = repo
+        self.machine = machine
+        self.key = key
+        self.protected_snapshot_ids = set(protected_snapshot_ids or set())
+        self.protected_hashes: Set[str] = set()
+        self.repo_size_bytes = (
+            get_repo_size_bytes(repo)
+            if self.settings.max_repo_size_gb > 0
+            else 0
+        )
+        self.state_lock = threading.Lock()
+
+    def prepare_chunk(self, plaintext: bytes) -> PreparedBackupChunk:
+        digest = sha256_hex(plaintext)
+        obj = object_path(self.repo, self.machine, digest)
+
+        with self.state_lock:
+            already_stored = obj.exists()
+            self.protected_hashes.add(digest)
+
+        encoded = None if already_stored else object_encode(plaintext, self.key)
+        return PreparedBackupChunk(
+            hash=digest,
+            plain_len=len(plaintext),
+            encoded=encoded,
+        )
+
+    def commit_chunk(self, prepared: PreparedBackupChunk) -> ChunkRef:
+        obj = object_path(self.repo, self.machine, prepared.hash)
+
+        with self.state_lock:
+            if not obj.exists():
+                encoded = prepared.encoded
+                if encoded is None:
+                    raise AegisError(
+                        f"Backup object {prepared.hash} disappeared while the backup was running."
+                    )
+
+                if self.settings.max_repo_size_gb > 0:
+                    limit_bytes = repo_size_limit_bytes(self.settings)
+                    if self.repo_size_bytes + len(encoded) > limit_bytes:
+                        prune_repo_for_incoming_bytes(
+                            self.settings,
+                            self.repo,
+                            len(encoded),
+                            protected_snapshot_ids=self.protected_snapshot_ids,
+                            protected_hashes=self.protected_hashes,
+                        )
+                        self.repo_size_bytes = get_repo_size_bytes(self.repo)
+
+                obj.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write(obj, encoded, mode=0o600)
+
+                if self.settings.max_repo_size_gb > 0:
+                    self.repo_size_bytes += len(encoded)
+
+            self.protected_hashes.add(prepared.hash)
+
+        return ChunkRef(hash=prepared.hash, plain_len=prepared.plain_len)
+
+
+def process_staged_backup_archive(
+    settings: Settings,
+    stage: StagedArchive,
+    chunk_size: int,
+    machine_key_value: Optional[bytes],
+    protected_snapshot_ids: Optional[Set[str]] = None,
+    progress_callback=None,
+) -> Tuple[List[ChunkRef], int, int]:
+    workers, max_inflight = backup_worker_plan(chunk_size)
+    splitter = ArchiveChunkSplitter(chunk_size)
+    object_writer = ParallelRepoObjectWriter(
+        settings,
+        Path(settings.repo_path),
+        settings.machine_id,
+        machine_key_value,
+        protected_snapshot_ids=protected_snapshot_ids,
+    )
+
+    refs: List[ChunkRef] = []
+    pending = deque()
+    committed_bytes = 0
+    last_report_at = 0.0
+
+    def commit_oldest() -> None:
+        nonlocal committed_bytes, last_report_at
+        future = pending.popleft()
+        prepared = future.result()
+        ref = object_writer.commit_chunk(prepared)
+        refs.append(ref)
+        committed_bytes += ref.plain_len
+
+        now = time.monotonic()
+        if progress_callback and now - last_report_at >= 0.35:
+            progress_callback(
+                committed_bytes,
+                stage.total_bytes,
+                f"Processed {human_bytes(committed_bytes)} with {workers} worker thread"
+                f"{'s' if workers != 1 else ''}.",
+            )
+            last_report_at = now
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=workers,
+        thread_name_prefix="aegis-backup",
+    ) as executor:
+        with zipfile.ZipFile(stage.path, mode="r") as archive:
+            for member in stage.members:
+                with archive.open(member.name, mode="r") as source:
+                    remaining = member.size
+
+                    while remaining > 0:
+                        block = read_exact(source, min(BUFFER_SIZE, remaining))
+                        if not block:
+                            raise AegisError(
+                                f"Staging member {member.name} ended early during processing."
+                            )
+                        remaining -= len(block)
+
+                        for piece in splitter.write(block):
+                            pending.append(
+                                executor.submit(object_writer.prepare_chunk, piece)
+                            )
+                            if len(pending) >= max_inflight:
+                                commit_oldest()
+
+            for piece in splitter.finish():
+                pending.append(
+                    executor.submit(object_writer.prepare_chunk, piece)
+                )
+
+            while pending:
+                commit_oldest()
+
+    if committed_bytes != stage.total_bytes:
+        raise AegisError(
+            f"Parallel backup processing committed {human_bytes(committed_bytes)}, "
+            f"but the staged restore stream contains {human_bytes(stage.total_bytes)}."
+        )
+
+    if progress_callback:
+        progress_callback(
+            committed_bytes,
+            committed_bytes,
+            f"Finished parallel deduplication and encryption with {workers} worker thread"
+            f"{'s' if workers != 1 else ''}.",
+        )
+
+    return refs, committed_bytes, workers
+
+
 class RepoWriter:
     def __init__(
         self,
@@ -4818,43 +5419,61 @@ class RepoWriter:
         self.repo = repo
         self.machine = machine
         self.protected_snapshot_ids = set(protected_snapshot_ids or set())
-        # Ensure chunk size is perfectly aligned to 512-byte tar blocks
-        self.chunk_size = (chunk_size // 512) * 512
-        # Target an 80% threshold to search for natural file boundaries
+
+        # Ensure chunk size is perfectly aligned to 512-byte tar blocks.
+        self.chunk_size = max(512, (chunk_size // 512) * 512)
+
+        # Search near the end of each chunk for a natural tar file boundary.
         self.flush_threshold = int(self.chunk_size * 0.8)
         self.key = key
-        self.io_yield_ms = max(0, io_yield_ms)
+
+        # Maximum-throughput mode. The old per-chunk sleep could add many
+        # minutes to large backups and did not improve correctness.
+        self.io_yield_ms = 0
+
         self.buffer = bytearray()
         self.refs: List[ChunkRef] = []
         self.total_plaintext = 0
         self.hasher = hashlib.sha256()
 
+        # Keep these incrementally instead of rebuilding a set and walking the
+        # entire repository for every new chunk when a repository cap is set.
+        self.protected_hashes: Set[str] = set()
+        self.repo_size_bytes = (
+            get_repo_size_bytes(repo)
+            if self.settings.max_repo_size_gb > 0
+            else 0
+        )
+
     def write(self, data: bytes) -> None:
         self.buffer.extend(data)
-        
-        # Look for file boundaries to prevent "Tar Shift" deduplication failure.
+
+        # bytearray.find() performs the marker search in optimized C. The old
+        # Python loop checked every 512-byte block and repeatedly rescanned the
+        # same buffer region while large files streamed in.
         if len(self.buffer) >= self.flush_threshold:
-            search_start = ((self.flush_threshold + 511) // 512) * 512
+            marker_position = ((self.flush_threshold + 511) // 512) * 512 + 257
             cut_index = -1
-            
-            # Create the memory view to search quickly
-            view = memoryview(self.buffer)
-            for i in range(search_start, len(self.buffer) - 262, 512):
-                # Byte 257 of a tar header block is always 'ustar'
-                if view[i+257:i+262] == b"ustar":
-                    cut_index = i
+
+            while True:
+                marker_position = self.buffer.find(b"ustar", marker_position)
+                if marker_position < 0:
                     break
-            
-            # Release the memory lock before modifying the bytearray
-            view.release()
-            
-            # If we found a boundary, safely cut and store it now that the lock is gone
+
+                candidate = marker_position - 257
+                if candidate >= self.flush_threshold and candidate % 512 == 0:
+                    cut_index = candidate
+                    break
+
+                marker_position += 1
+
             if cut_index != -1:
                 piece = bytes(self.buffer[:cut_index])
                 del self.buffer[:cut_index]
                 self._store_chunk(piece)
-                    
-        # If no boundary is found (e.g. inside a massive file), force a cut.
+
+        # If no natural boundary exists, such as inside a very large file,
+        # retain the existing fixed-size fallback.
         while len(self.buffer) >= self.chunk_size:
             piece = bytes(self.buffer[:self.chunk_size])
             del self.buffer[:self.chunk_size]
@@ -4869,26 +5488,36 @@ class RepoWriter:
     def _store_chunk(self, plaintext: bytes) -> None:
         self.hasher.update(plaintext)
         self.total_plaintext += len(plaintext)
+
         digest = sha256_hex(plaintext)
         obj = object_path(self.repo, self.machine, digest)
+
         if not obj.exists():
             encoded = object_encode(plaintext, self.key)
 
             if self.settings.max_repo_size_gb > 0:
-                prune_repo_for_incoming_bytes(
-                    self.settings,
-                    self.repo,
-                    len(encoded),
-                    protected_snapshot_ids=self.protected_snapshot_ids,
-                    protected_hashes={ref.hash for ref in self.refs},
-                )
+                limit_bytes = repo_size_limit_bytes(self.settings)
+
+                # Only perform an expensive repository walk/prune when the
+                # cached size says the next object would actually cross the cap.
+                if self.repo_size_bytes + len(encoded) > limit_bytes:
+                    prune_repo_for_incoming_bytes(
+                        self.settings,
+                        self.repo,
+                        len(encoded),
+                        protected_snapshot_ids=self.protected_snapshot_ids,
+                        protected_hashes=self.protected_hashes,
+                    )
+                    self.repo_size_bytes = get_repo_size_bytes(self.repo)
 
             obj.parent.mkdir(parents=True, exist_ok=True)
             atomic_write(obj, encoded, mode=0o600)
-        self.refs.append(ChunkRef(hash=digest, plain_len=len(plaintext)))
-        if self.io_yield_ms:
-            time.sleep(self.io_yield_ms / 1000.0)
 
+            if self.settings.max_repo_size_gb > 0:
+                self.repo_size_bytes += len(encoded)
+
+        self.refs.append(ChunkRef(hash=digest, plain_len=len(plaintext)))
+        self.protected_hashes.add(digest)
 
 def kind_label(kind: str) -> str:
     return BACKUP_PROFILE_LABELS.get(kind, kind or BACKUP_PROFILE_LABELS["both"])
@@ -5102,7 +5731,10 @@ def get_repo_size_bytes(repo_path: Path) -> int:
     if not repo_path.exists():
         return 0
     total = 0
-    for dirpath, _, filenames in os.walk(repo_path):
+    for dirpath, dirnames, filenames in os.walk(repo_path):
+        # Staging data is temporary plaintext working space, not persistent
+        # repository usage and not part of the configured repository cap.
+        dirnames[:] = [name for name in dirnames if name != ".staging"]
         for f in filenames:
             fp = os.path.join(dirpath, f)
             try:
@@ -5230,10 +5862,9 @@ def enforce_repo_size_limit(settings: Settings, already_locked: bool = False) ->
 
 
 def backup_kinds_for_profile(profile: str) -> List[str]:
-    normalized = normalize_backup_profile(profile)
-    if normalized == "both":
-        return list(BACKUP_JOB_KIND_ORDER)
-    return [normalized]
+    # Full Recovery and Portable Migration serve different restore cases.
+    # Always create both in the established order.
+    return list(BACKUP_JOB_KIND_ORDER)
 
 
 def estimated_backup_stream_bytes(settings: Settings, kind: str) -> int:
@@ -5260,6 +5891,10 @@ def capture_backup_kind(
     kind_label_text = kind_label(kind)
     kind_span = 88.0 / max(1, total_kinds)
     kind_base = 3.0 + (kind_index * kind_span)
+    stage_end = kind_base + (kind_span * 0.50)
+    stage_verify_end = kind_base + (kind_span * 0.65)
+    process_end = kind_base + (kind_span * 0.90)
+    final_progress = min(91.0, kind_base + kind_span - 1.0)
 
     set_job_progress(
         kind_base,
@@ -5270,110 +5905,174 @@ def capture_backup_kind(
     metadata = collect_snapshot_metadata(kind)
     includes = build_include_paths(settings, kind)
     excludes = build_exclude_paths(settings, kind)
-
     estimate_bytes = estimated_backup_stream_bytes(settings, kind)
-    set_job_progress(
-        kind_base + 1.0,
-        f"Capturing {kind_label_text}",
-        bytes_done=0,
-        bytes_total=estimate_bytes,
-        detail="Scanning files, packing a tar stream, encrypting chunks, and reusing unchanged data.",
-        phase=kind,
-    )
+    stage: Optional[StagedArchive] = None
 
-    writer = RepoWriter(
-        settings,
-        Path(settings.repo_path),
-        settings.machine_id,
-        chunk_size,
-        machine_key_value,
-        settings.io_yield_ms,
-        protected_snapshot_ids=protected_snapshot_ids,
-    )
-    cmd = build_tar_backup_command(includes, excludes)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    assert proc.stdout is not None
+    def report_stage(done: int, total: int, detail: str) -> None:
+        fraction = min(1.0, done / max(1, total))
+        progress = kind_base + 1.0 + (
+            fraction * max(1.0, stage_end - kind_base - 1.0)
+        )
+        set_job_progress(
+            progress,
+            f"Staging {kind_label_text} - {human_bytes(done)} copied",
+            bytes_done=done,
+            bytes_total=total,
+            detail=detail,
+            phase=kind,
+        )
 
-    streamed_bytes = 0
-    last_report_at = 0.0
+    def report_stage_verification(done: int, total: int, detail: str) -> None:
+        fraction = min(1.0, done / max(1, total))
+        progress = stage_end + (fraction * max(1.0, stage_verify_end - stage_end))
+        set_job_progress(
+            progress,
+            f"Verifying staged {kind_label_text} - {human_bytes(done)} checked",
+            bytes_done=done,
+            bytes_total=total,
+            detail=detail,
+            phase=kind,
+        )
 
-    while True:
-        # Use read_exact to ensure tar blocks are never misaligned in the buffer.
-        chunk = read_exact(proc.stdout, BUFFER_SIZE)
-        if not chunk:
-            break
+    def report_processing(done: int, total: int, detail: str) -> None:
+        fraction = min(1.0, done / max(1, total))
+        progress = stage_verify_end + (
+            fraction * max(1.0, process_end - stage_verify_end)
+        )
+        set_job_progress(
+            progress,
+            f"Processing {kind_label_text} - {human_bytes(done)} committed",
+            bytes_done=done,
+            bytes_total=total,
+            detail=detail,
+            phase=kind,
+        )
 
-        writer.write(chunk)
-        streamed_bytes += len(chunk)
+    try:
+        set_job_progress(
+            kind_base + 1.0,
+            f"Staging {kind_label_text}",
+            bytes_done=0,
+            bytes_total=estimate_bytes,
+            detail=(
+                "Copying the exact tar restore stream to an uncompressed ZIP "
+                "on the backup drive before encryption or deduplication."
+            ),
+            phase=kind,
+        )
+        stage = create_staged_backup_archive(
+            settings=settings,
+            run_id=run_id,
+            kind=kind,
+            includes=includes,
+            excludes=excludes,
+            estimate_bytes=estimate_bytes,
+            progress_callback=report_stage,
+        )
 
-        now = time.monotonic()
-        if now - last_report_at >= 0.35:
-            capture_fraction = min(1.0, streamed_bytes / max(1, estimate_bytes))
-            progress = kind_base + 1.0 + (capture_fraction * max(1.0, kind_span - 3.0))
-            set_job_progress(
-                progress,
-                f"Capturing {kind_label_text} - {human_bytes(streamed_bytes)} streamed",
-                bytes_done=streamed_bytes,
-                bytes_total=estimate_bytes,
-                detail="Aegis is scanning files and storing only new unique encrypted chunks.",
-                phase=kind,
+        set_job_progress(
+            stage_end,
+            f"Verifying staged {kind_label_text}",
+            bytes_done=0,
+            bytes_total=stage.total_bytes,
+            detail=(
+                "Checking ZIP CRCs, member SHA-256 hashes, the complete stream "
+                "SHA-256, and tar readability before processing."
+            ),
+            phase=kind,
+        )
+        verify_staged_backup_archive(
+            stage,
+            progress_callback=report_stage_verification,
+        )
+
+        workers, _ = backup_worker_plan(chunk_size)
+        set_job_progress(
+            stage_verify_end,
+            f"Parallel processing {kind_label_text}",
+            bytes_done=0,
+            bytes_total=stage.total_bytes,
+            detail=(
+                f"Using up to {workers} worker thread"
+                f"{'s' if workers != 1 else ''} to hash, deduplicate, and encrypt "
+                "the verified immutable staging stream."
+            ),
+            phase=kind,
+        )
+        refs, total_bytes, actual_workers = process_staged_backup_archive(
+            settings=settings,
+            stage=stage,
+            chunk_size=chunk_size,
+            machine_key_value=machine_key_value,
+            protected_snapshot_ids=protected_snapshot_ids,
+            progress_callback=report_processing,
+        )
+
+        if total_bytes != stage.total_bytes:
+            raise AegisError(
+                f"The processed {kind_label_text} stream is {human_bytes(total_bytes)}, "
+                f"but the verified staging stream is {human_bytes(stage.total_bytes)}."
             )
-            last_report_at = now
 
-    stderr_data = proc.stderr.read().decode("utf-8", errors="ignore") if proc.stderr else ""
-    returncode = proc.wait()
-    if returncode not in (0, 1):
-        raise AegisError(f"tar backup failed for {kind_label_text}: {stderr_data.strip() or returncode}")
+        manifest = SnapshotManifest(
+            version=1,
+            id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
+            run_id=run_id,
+            machine_id=settings.machine_id,
+            machine_label=settings.machine_label,
+            hostname=hostname(),
+            created_at=now_rfc3339(),
+            kind=kind,
+            source_paths=includes,
+            exclude_paths=excludes,
+            chunk_size=chunk_size,
+            archive_refs=refs,
+            archive_plaintext_bytes=total_bytes,
+            archive_sha256=stage.sha256,
+            metadata=metadata,
+            notes=list(metadata.notes),
+        )
 
-    refs, total_bytes, archive_sha = writer.finish()
-    
-    set_job_progress(
-        min(91.0, kind_base + kind_span - 1.0),
-        f"Verifying restore stream for {kind_label_text}",
-        bytes_done=total_bytes,
-        bytes_total=max(total_bytes, estimate_bytes),
-        detail="Checking that this snapshot can reconstruct a complete restore archive.",
-        phase=kind,
-    )
-    
-    manifest = SnapshotManifest(
-        version=1,
-        id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
-        run_id=run_id,
-        machine_id=settings.machine_id,
-        machine_label=settings.machine_label,
-        hostname=hostname(),
-        created_at=now_rfc3339(),
-        kind=kind,
-        source_paths=includes,
-        exclude_paths=excludes,
-        chunk_size=chunk_size,
-        archive_refs=refs,
-        archive_plaintext_bytes=total_bytes,
-        archive_sha256=archive_sha,
-        metadata=metadata,
-        notes=list(metadata.notes),
-    )
-    
-    verify_manifest_restore_stream(
-        Path(settings.repo_path),
-        manifest,
-        machine_key_value,
-        validate_tar_headers=False,
-    )
-    
-    set_job_progress(
-        min(91.0, kind_base + kind_span - 1.0),
-        f"Writing manifest for {kind_label_text}",
-        bytes_done=total_bytes,
-        bytes_total=max(total_bytes, estimate_bytes),
-        detail="The point-in-time restore manifest is being written.",
-        phase=kind,
-    )
-    
-    write_manifest(settings, manifest)
-    log_line(f"Created {kind_label_text}: {manifest.id} ({human_bytes(total_bytes)} restore stream)")
-    return manifest.id
+        set_job_progress(
+            process_end,
+            f"Verifying final encrypted restore stream for {kind_label_text}",
+            bytes_done=0,
+            bytes_total=total_bytes,
+            detail=(
+                "Rereading and decrypting every stored object, checking every "
+                "length, and reconstructing the complete recorded archive digest."
+            ),
+            phase=kind,
+        )
+        verify_manifest_restore_stream(
+            Path(settings.repo_path),
+            manifest,
+            machine_key_value,
+            validate_tar_headers=False,
+        )
+
+        set_job_progress(
+            final_progress,
+            f"Writing manifest for {kind_label_text}",
+            bytes_done=total_bytes,
+            bytes_total=total_bytes,
+            detail=(
+                f"The fully verified point-in-time restore manifest is being written "
+                f"after processing with {actual_workers} worker thread"
+                f"{'s' if actual_workers != 1 else ''}."
+            ),
+            phase=kind,
+        )
+        write_manifest(settings, manifest)
+        log_line(
+            f"Created {kind_label_text}: {manifest.id} "
+            f"({human_bytes(total_bytes)} verified restore stream)"
+        )
+        return manifest.id
+
+    finally:
+        remove_staged_archive(stage)
+
 
 
 def perform_backup(settings: Settings, profile: str, recovery_password: Optional[str] = None) -> List[str]:
@@ -5393,6 +6092,7 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
 
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
+        cleanup_backup_staging(Path(settings.repo_path))
         set_job_progress(1.0, "Starting backup", detail="Preparing repository and encryption state.", phase="start")
 
         protected_snapshot_ids: Set[str] = set()
