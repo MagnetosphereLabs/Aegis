@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import concurrent.futures
 import dataclasses
 import errno
@@ -50,6 +51,7 @@ SOCKET_PATH = "/run/aegisvault/daemon.sock"
 VAR_DIR = Path("/var/lib/aegisvault")
 CONFIG_PATH = VAR_DIR / "settings.json"
 STATE_PATH = VAR_DIR / "state.json"
+REPO_SIZE_CACHE_PATH = VAR_DIR / "repo-size-cache.json"
 LEGACY_KEY_DIR = VAR_DIR / "keys"  # for migration from previous versions only, we will never write new keys here
 LOCK_PATH = VAR_DIR / "backup.lock"
 CREDSTORE_DIR = Path("/etc/credstore.encrypted")
@@ -61,7 +63,7 @@ DEFAULT_CHUNK_MIB = 16
 BUFFER_SIZE = 8 * 1024 * 1024
 STAGING_MEMBER_BYTES = 1024 * 1024 * 1024
 BACKUP_CPU_FRACTION = 0.70
-LOG_LIMIT = 250
+LOG_LIMIT = 1000
 RECOVERY_MARKER = Path("/etc/aegisvault-recovery")
 RECOVERY_MOUNT_ROOT = Path("/mnt/aegisvault-recovery")
 AUTO_MOUNT_ROOT = Path("/media/aegisvault")
@@ -217,22 +219,78 @@ CONSTELLATION_STUN_SERVERS = [
 CONSTELLATION_DIRECT_CONNECT_TIMEOUT = 5
 CONSTELLATION_CANDIDATE_LIMIT = 32
 _STUN_PUBLIC_IPV4_CACHE: Optional[List[str]] = None
+_REPO_SIZE_CACHE_LOCK = threading.Lock()
+_REPO_SIZE_REFRESHING: Set[str] = set()
+
+
+def normalize_schedule_time(value: str) -> str:
+    cleaned = str(value or "").strip()
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", cleaned)
+    if not match:
+        return "02:00"
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return "02:00"
+    return f"{hour:02d}:{minute:02d}"
+
+
+def latest_schedule_slot_epoch(schedule: "ScheduleSettings", now_epoch: Optional[float] = None) -> Optional[float]:
+    now_value = time.time() if now_epoch is None else float(now_epoch)
+    local_now = time.localtime(now_value)
+    hour_text, minute_text = normalize_schedule_time(schedule.start_time).split(":", 1)
+    hour = int(hour_text)
+    minute = int(minute_text)
+
+    def local_epoch(year: int, month: int, day: int) -> float:
+        return time.mktime((year, month, day, hour, minute, 0, -1, -1, -1))
+
+    if schedule.preset == "daily":
+        candidate = local_epoch(local_now.tm_year, local_now.tm_mon, local_now.tm_mday)
+        if candidate > now_value:
+            previous = time.localtime(now_value - 86400)
+            candidate = local_epoch(previous.tm_year, previous.tm_mon, previous.tm_mday)
+        return candidate
+
+    if schedule.preset == "weekly":
+        wanted = max(0, min(6, int(schedule.weekday)))
+        days_back = (local_now.tm_wday - wanted) % 7
+        day_value = time.localtime(now_value - days_back * 86400)
+        candidate = local_epoch(day_value.tm_year, day_value.tm_mon, day_value.tm_mday)
+        if candidate > now_value:
+            day_value = time.localtime(now_value - (days_back + 7) * 86400)
+            candidate = local_epoch(day_value.tm_year, day_value.tm_mon, day_value.tm_mday)
+        return candidate
+
+    if schedule.preset == "monthly":
+        day = max(1, min(28, int(schedule.month_day)))
+        candidate = local_epoch(local_now.tm_year, local_now.tm_mon, day)
+        if candidate > now_value:
+            year = local_now.tm_year
+            month = local_now.tm_mon - 1
+            if month < 1:
+                month = 12
+                year -= 1
+            candidate = local_epoch(year, month, day)
+        return candidate
+
+    return None
+
 
 @dataclass
 class ScheduleSettings:
     enabled: bool = False
-    preset: str = "manual"  # manual, hourly, daily, weekly, custom
+    preset: str = "manual"  # manual, hourly, daily, weekly, monthly, custom
     custom_minutes: int = 60
+    start_time: str = "02:00"
+    weekday: int = 0
+    month_day: int = 1
 
     def interval_minutes(self) -> Optional[int]:
         if not self.enabled:
             return None
         if self.preset == "hourly":
             return 60
-        if self.preset == "daily":
-            return 60 * 24
-        if self.preset == "weekly":
-            return 60 * 24 * 7
         if self.preset == "custom":
             return max(5, int(self.custom_minutes))
         return None
@@ -277,7 +335,7 @@ class Settings:
     default_backup_profile: str = "both"
     schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
     chunk_size_mib: int = DEFAULT_CHUNK_MIB
-    io_yield_ms: int = 50
+    io_yield_ms: int = 0  # legacy config field; active writers never pause
     max_repo_size_gb: int = 0  # 0 means unlimited
     apply_packages_on_portable_restore: bool = True
     full_excludes: List[str] = field(default_factory=list)
@@ -2983,6 +3041,14 @@ def read_machine_key_credential(machine: str) -> bytes:
         out_path.unlink(missing_ok=True)
 
 
+
+def local_machine_key_material_present(machine: str) -> bool:
+    service_cred_dir = os.environ.get("CREDENTIALS_DIRECTORY", "").strip()
+    if service_cred_dir and (Path(service_cred_dir) / credential_name_for_machine(machine)).exists():
+        return True
+    return local_key_credential_path(machine).exists() or local_key_path(machine).exists()
+
+
 def has_local_machine_key(machine: str) -> bool:
     try:
         key = read_local_machine_key(machine)
@@ -3081,6 +3147,7 @@ def settings_to_dict(settings: Settings) -> Dict[str, Any]:
     return asdict(settings)
 
 
+
 def settings_from_dict(data: Dict[str, Any]) -> Settings:
     schedule_data = data.get("schedule") or {}
     peers_data = data.get("peers") or []
@@ -3102,9 +3169,12 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
             enabled=bool(schedule_data.get("enabled", False)),
             preset=str(schedule_data.get("preset", "manual")),
             custom_minutes=int(schedule_data.get("custom_minutes", 60)),
+            start_time=normalize_schedule_time(str(schedule_data.get("start_time") or "02:00")),
+            weekday=max(0, min(6, int(schedule_data.get("weekday", 0)))),
+            month_day=max(1, min(28, int(schedule_data.get("month_day", 1)))),
         ),
         chunk_size_mib=int(data.get("chunk_size_mib", DEFAULT_CHUNK_MIB)),
-        io_yield_ms=int(data.get("io_yield_ms", 2)),
+        io_yield_ms=0,
         max_repo_size_gb=int(data.get("max_repo_size_gb", 0)),
         apply_packages_on_portable_restore=bool(data.get("apply_packages_on_portable_restore", True)),
         full_excludes=list(data.get("full_excludes") or []),
@@ -3143,13 +3213,10 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
         settings.machine_label = hostname()
     if not settings.full_excludes:
         settings.full_excludes = default_full_excludes(settings.repo_path)
-
     if not settings.portable_includes or settings.portable_includes == LEGACY_PORTABLE_INCLUDES:
         settings.portable_includes = default_portable_includes()
-
     if not settings.portable_excludes or settings.portable_excludes == LEGACY_PORTABLE_EXCLUDES:
         settings.portable_excludes = default_portable_excludes()
-
     return settings
 
 
@@ -4562,9 +4629,14 @@ def snapshot_from_dict(data: Dict[str, Any]) -> SnapshotManifest:
     )
 
 
-def list_snapshots(settings: Settings) -> List[Dict[str, Any]]:
+def list_snapshots(
+    settings: Settings,
+    repo_override: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     try:
-        repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
+        repo = Path(repo_override) if repo_override is not None else Path(
+            resolve_settings_repo_path(settings, create_if_missing=False)
+        )
     except Exception:
         return []
 
@@ -4883,6 +4955,7 @@ def create_staged_backup_archive(
     excludes: List[str],
     estimate_bytes: int,
     progress_callback=None,
+    protected_snapshot_ids: Optional[Set[str]] = None,
 ) -> StagedArchive:
     repo = Path(settings.repo_path)
     staging_dir = backup_staging_root(repo) / run_id
@@ -4932,6 +5005,19 @@ def create_staged_backup_archive(
                         offset = 0
                         while offset < len(block):
                             if member_writer is None:
+                                remaining_estimate = max(0, int(estimate_bytes) - total_bytes)
+                                next_member_reservation = (
+                                    min(STAGING_MEMBER_BYTES, max(BUFFER_SIZE, remaining_estimate))
+                                    if remaining_estimate > 0
+                                    else STAGING_MEMBER_BYTES
+                                )
+                                prune_repo_for_incoming_bytes(
+                                    settings,
+                                    repo,
+                                    next_member_reservation,
+                                    protected_snapshot_ids=protected_snapshot_ids,
+                                    temporary_bytes=get_staging_size_bytes(repo),
+                                )
                                 member_name = f"archive/part-{member_index:06d}.tar"
                                 info = zipfile.ZipInfo(
                                     member_name,
@@ -5166,6 +5252,337 @@ def verify_staged_backup_archive(
         )
 
 
+
+class StagedArchiveConcatReader:
+    def __init__(self, stage: StagedArchive) -> None:
+        self.stage = stage
+        self.archive = zipfile.ZipFile(stage.path, mode="r")
+        self.member_index = 0
+        self.member_stream = None
+        self.bytes_read = 0
+
+    def close(self) -> None:
+        if self.member_stream is not None:
+            self.member_stream.close()
+            self.member_stream = None
+        self.archive.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    def _open_next(self) -> bool:
+        if self.member_stream is not None:
+            self.member_stream.close()
+            self.member_stream = None
+        if self.member_index >= len(self.stage.members):
+            return False
+        member = self.stage.members[self.member_index]
+        self.member_index += 1
+        self.member_stream = self.archive.open(member.name, mode="r")
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        if size == 0:
+            return b""
+        if size < 0:
+            chunks: List[bytes] = []
+            while True:
+                block = self.read(BUFFER_SIZE)
+                if not block:
+                    break
+                chunks.append(block)
+            return b"".join(chunks)
+
+        chunks: List[bytes] = []
+        remaining = size
+        while remaining > 0:
+            if self.member_stream is None and not self._open_next():
+                break
+            assert self.member_stream is not None
+            block = self.member_stream.read(remaining)
+            if not block:
+                self.member_stream.close()
+                self.member_stream = None
+                continue
+            chunks.append(block)
+            self.bytes_read += len(block)
+            remaining -= len(block)
+        return b"".join(chunks)
+
+
+class StagedZipStreamWriter:
+    def __init__(self, archive: zipfile.ZipFile) -> None:
+        self.archive = archive
+        self.members: List[StagedArchiveMember] = []
+        self.archive_hasher = hashlib.sha256()
+        self.total_bytes = 0
+        self.member_writer = None
+        self.member_name = ""
+        self.member_size = 0
+        self.member_hasher = hashlib.sha256()
+        self.member_index = 0
+
+    def _open_member(self) -> None:
+        self.member_name = f"archive/part-{self.member_index:06d}.tar"
+        info = zipfile.ZipInfo(self.member_name, date_time=time.localtime()[:6])
+        info.compress_type = zipfile.ZIP_STORED
+        info.create_system = 3
+        info.external_attr = 0o600 << 16
+        self.member_writer = self.archive.open(info, mode="w", force_zip64=True)
+        self.member_size = 0
+        self.member_hasher = hashlib.sha256()
+
+    def _close_member(self) -> None:
+        if self.member_writer is None:
+            return
+        self.member_writer.close()
+        self.member_writer = None
+        if self.member_size > 0:
+            self.members.append(
+                StagedArchiveMember(
+                    name=self.member_name,
+                    size=self.member_size,
+                    sha256=self.member_hasher.hexdigest(),
+                )
+            )
+            self.member_index += 1
+
+    def write(self, data: bytes) -> None:
+        offset = 0
+        while offset < len(data):
+            if self.member_writer is None:
+                self._open_member()
+            take = min(len(data) - offset, STAGING_MEMBER_BYTES - self.member_size)
+            piece = data[offset:offset + take]
+            assert self.member_writer is not None
+            self.member_writer.write(piece)
+            self.member_hasher.update(piece)
+            self.archive_hasher.update(piece)
+            self.member_size += take
+            self.total_bytes += take
+            offset += take
+            if self.member_size == STAGING_MEMBER_BYTES:
+                self._close_member()
+
+    def finish(self) -> Tuple[List[StagedArchiveMember], int, str]:
+        self._close_member()
+        return self.members, self.total_bytes, self.archive_hasher.hexdigest()
+
+
+def _parse_tar_number(field: bytes) -> int:
+    if not field:
+        return 0
+    if field[0] & 0x80:
+        raw = bytes([field[0] & 0x7F]) + field[1:]
+        return int.from_bytes(raw, "big", signed=False)
+    cleaned = field.split(b"\0", 1)[0].strip() or b"0"
+    try:
+        return int(cleaned, 8)
+    except ValueError as exc:
+        raise AegisError(f"Invalid tar numeric field: {field!r}") from exc
+
+
+def _decode_tar_text(value: bytes) -> str:
+    return value.split(b"\0", 1)[0].decode("utf-8", errors="surrogateescape")
+
+
+def _header_member_name(header: bytes) -> str:
+    name = _decode_tar_text(header[0:100])
+    prefix = _decode_tar_text(header[345:500])
+    return f"{prefix}/{name}" if prefix else name
+
+
+def _pax_path(payload: bytes) -> str:
+    offset = 0
+    while offset < len(payload):
+        space = payload.find(b" ", offset)
+        if space < 0:
+            break
+        try:
+            record_len = int(payload[offset:space])
+        except ValueError:
+            break
+        if record_len <= 0 or offset + record_len > len(payload):
+            break
+        record = payload[space + 1:offset + record_len]
+        if record.endswith(b"\n"):
+            record = record[:-1]
+        if b"=" in record:
+            key, value = record.split(b"=", 1)
+            if key == b"path":
+                return value.decode("utf-8", errors="surrogateescape")
+        offset += record_len
+    return ""
+
+
+def _normalized_archive_path(value: str) -> str:
+    cleaned = str(value or "").replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned.lstrip("/").rstrip("/")
+
+
+def _archive_path_selected(path: str, includes: List[str], excludes: List[str]) -> bool:
+    normalized = _normalized_archive_path(path)
+    include_patterns = [_normalized_archive_path(item) for item in includes if str(item).strip()]
+    exclude_patterns = [_normalized_archive_path(item) for item in excludes if str(item).strip()]
+
+    include_all = not include_patterns or any(str(item).strip() == "." for item in includes)
+    included = include_all
+    if not include_all:
+        for pattern in include_patterns:
+            if (
+                normalized == pattern
+                or normalized.startswith(pattern.rstrip("/") + "/")
+                or fnmatch.fnmatchcase(normalized, pattern)
+            ):
+                included = True
+                break
+    if not included:
+        return False
+
+    for pattern in exclude_patterns:
+        if pattern and fnmatch.fnmatchcase(normalized, pattern):
+            return False
+    return True
+
+
+def derive_staged_backup_archive(
+    settings: Settings,
+    run_id: str,
+    kind: str,
+    source_stage: StagedArchive,
+    includes: List[str],
+    excludes: List[str],
+    progress_callback=None,
+) -> StagedArchive:
+    repo = Path(settings.repo_path)
+    staging_dir = backup_staging_root(repo) / run_id
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(backup_staging_root(repo), 0o700)
+    os.chmod(staging_dir, 0o700)
+
+    final_path = staging_dir / f"{kind}.zip"
+    partial_path = staging_dir / f".{kind}.zip.partial"
+    final_path.unlink(missing_ok=True)
+    partial_path.unlink(missing_ok=True)
+
+    pending_records: List[bytes] = []
+    pending_pax_path = ""
+    pending_long_name = ""
+    last_report_at = 0.0
+    kept_entries = 0
+    skipped_entries = 0
+
+    try:
+        with StagedArchiveConcatReader(source_stage) as source:
+            with zipfile.ZipFile(
+                partial_path,
+                mode="w",
+                compression=zipfile.ZIP_STORED,
+                allowZip64=True,
+            ) as output_zip:
+                writer = StagedZipStreamWriter(output_zip)
+
+                while True:
+                    header = source.read(512)
+                    if not header:
+                        break
+                    if len(header) != 512:
+                        raise AegisError("The Full Recovery staging stream ended inside a tar header.")
+
+                    if header == b"\0" * 512:
+                        writer.write(header)
+                        while True:
+                            block = source.read(BUFFER_SIZE)
+                            if not block:
+                                break
+                            writer.write(block)
+                        break
+
+                    size = _parse_tar_number(header[124:136])
+                    padded_size = ((size + 511) // 512) * 512
+                    payload = source.read(padded_size)
+                    if len(payload) != padded_size:
+                        raise AegisError("The Full Recovery staging stream ended inside a tar member.")
+
+                    record = header + payload
+                    typeflag = header[156:157] or b"\0"
+
+                    if typeflag in {b"x", b"L", b"K"}:
+                        pending_records.append(record)
+                        if typeflag == b"x":
+                            pending_pax_path = _pax_path(payload[:size]) or pending_pax_path
+                        elif typeflag == b"L":
+                            pending_long_name = _decode_tar_text(payload[:size])
+                        continue
+
+                    if typeflag == b"g":
+                        writer.write(record)
+                        continue
+
+                    member_name = pending_pax_path or pending_long_name or _header_member_name(header)
+                    if _archive_path_selected(member_name, includes, excludes):
+                        for pending in pending_records:
+                            writer.write(pending)
+                        writer.write(record)
+                        kept_entries += 1
+                    else:
+                        skipped_entries += 1
+
+                    pending_records.clear()
+                    pending_pax_path = ""
+                    pending_long_name = ""
+
+                    now = time.monotonic()
+                    if progress_callback and now - last_report_at >= 0.35:
+                        progress_callback(
+                            source.bytes_read,
+                            source_stage.total_bytes,
+                            f"Scanned {human_bytes(source.bytes_read)} from Full Recovery staging; "
+                            f"retained {human_bytes(writer.total_bytes)} after Portable exclusions.",
+                        )
+                        last_report_at = now
+
+                members, total_bytes, digest = writer.finish()
+
+        if pending_records:
+            raise AegisError("The Full Recovery tar stream ended after an unattached metadata header.")
+        if total_bytes <= 10240 or not members:
+            raise AegisError("The derived Portable Migration restore stream is empty or incomplete.")
+
+        _fsync_path(partial_path)
+        os.replace(partial_path, final_path)
+        _fsync_directory(staging_dir)
+
+        if progress_callback:
+            progress_callback(
+                source_stage.total_bytes,
+                source_stage.total_bytes,
+                f"Derived {human_bytes(total_bytes)} from one immutable Full Recovery capture; "
+                f"kept {kept_entries} tar entries and excluded {skipped_entries}.",
+            )
+
+        log_line(
+            f"Portable Migration derivation kept {kept_entries} tar entries, excluded "
+            f"{skipped_entries}, and produced {human_bytes(total_bytes)} without rereading the live source."
+        )
+        return StagedArchive(
+            path=final_path,
+            members=members,
+            total_bytes=total_bytes,
+            sha256=digest,
+        )
+
+    except Exception:
+        partial_path.unlink(missing_ok=True)
+        final_path.unlink(missing_ok=True)
+        raise
+
+
 class ArchiveChunkSplitter:
     def __init__(self, chunk_size: int) -> None:
         self.chunk_size = max(512, (int(chunk_size) // 512) * 512)
@@ -5243,6 +5660,7 @@ def backup_worker_plan(chunk_size: int) -> Tuple[int, int]:
     return workers, max_inflight
 
 
+
 class ParallelRepoObjectWriter:
     def __init__(
         self,
@@ -5258,31 +5676,20 @@ class ParallelRepoObjectWriter:
         self.key = key
         self.protected_snapshot_ids = set(protected_snapshot_ids or set())
         self.protected_hashes: Set[str] = set()
-        self.repo_size_bytes = (
-            get_repo_size_bytes(repo)
-            if self.settings.max_repo_size_gb > 0
-            else 0
-        )
+        self.repo_size_bytes = get_repo_size_bytes(repo)
         self.state_lock = threading.Lock()
 
     def prepare_chunk(self, plaintext: bytes) -> PreparedBackupChunk:
         digest = sha256_hex(plaintext)
         obj = object_path(self.repo, self.machine, digest)
-
         with self.state_lock:
             already_stored = obj.exists()
             self.protected_hashes.add(digest)
-
         encoded = None if already_stored else object_encode(plaintext, self.key)
-        return PreparedBackupChunk(
-            hash=digest,
-            plain_len=len(plaintext),
-            encoded=encoded,
-        )
+        return PreparedBackupChunk(hash=digest, plain_len=len(plaintext), encoded=encoded)
 
     def commit_chunk(self, prepared: PreparedBackupChunk) -> ChunkRef:
         obj = object_path(self.repo, self.machine, prepared.hash)
-
         with self.state_lock:
             if not obj.exists():
                 encoded = prepared.encoded
@@ -5291,26 +5698,30 @@ class ParallelRepoObjectWriter:
                         f"Backup object {prepared.hash} disappeared while the backup was running."
                     )
 
-                if self.settings.max_repo_size_gb > 0:
-                    limit_bytes = repo_size_limit_bytes(self.settings)
-                    if self.repo_size_bytes + len(encoded) > limit_bytes:
-                        prune_repo_for_incoming_bytes(
-                            self.settings,
-                            self.repo,
-                            len(encoded),
-                            protected_snapshot_ids=self.protected_snapshot_ids,
-                            protected_hashes=self.protected_hashes,
-                        )
-                        self.repo_size_bytes = get_repo_size_bytes(self.repo)
+                temporary = get_staging_size_bytes(self.repo)
+                limit_bytes = repo_size_limit_bytes(self.settings)
+                free_bytes = int(shutil.disk_usage(str(self.repo)).free)
+                cap_needs_space = (
+                    limit_bytes > 0
+                    and self.repo_size_bytes + temporary + len(encoded) > limit_bytes
+                )
+                disk_needs_space = free_bytes < len(encoded) + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+                if cap_needs_space or disk_needs_space:
+                    prune_repo_for_incoming_bytes(
+                        self.settings,
+                        self.repo,
+                        len(encoded),
+                        protected_snapshot_ids=self.protected_snapshot_ids,
+                        protected_hashes=self.protected_hashes,
+                        temporary_bytes=temporary,
+                    )
+                    self.repo_size_bytes = get_repo_size_bytes(self.repo)
 
                 obj.parent.mkdir(parents=True, exist_ok=True)
                 atomic_write(obj, encoded, mode=0o600)
-
-                if self.settings.max_repo_size_gb > 0:
-                    self.repo_size_bytes += len(encoded)
+                self.repo_size_bytes += len(encoded)
 
             self.protected_hashes.add(prepared.hash)
-
         return ChunkRef(hash=prepared.hash, plain_len=prepared.plain_len)
 
 
@@ -5628,19 +6039,27 @@ def build_tar_backup_command(includes: List[str], excludes: List[str]) -> List[s
     return cmd
 
 
-def write_manifest(settings: Settings, manifest: SnapshotManifest) -> None:
+
+def write_manifest(
+    settings: Settings,
+    manifest: SnapshotManifest,
+    protected_snapshot_ids: Optional[Set[str]] = None,
+) -> None:
     repo = Path(settings.repo_path)
     path = manifest_path(repo, manifest.machine_id, manifest.id)
     payload = asdict(manifest)
     payload_bytes = json.dumps(payload, indent=2, sort_keys=False).encode("utf-8")
+    protected_ids = set(protected_snapshot_ids or set())
+    protected_ids.add(manifest.id)
 
     if settings.max_repo_size_gb > 0:
         prune_repo_for_incoming_bytes(
             settings,
             repo,
             len(payload_bytes),
-            protected_snapshot_ids={manifest.id},
+            protected_snapshot_ids=protected_ids,
             protected_hashes={ref.hash for ref in manifest.archive_refs},
+            temporary_bytes=get_staging_size_bytes(repo),
         )
 
     atomic_write(path, payload_bytes, mode=0o600)
@@ -5721,10 +6140,14 @@ def _delete_snapshot_from_repo_locked(
     return manifest, removed_objects
 
 
+
 def delete_snapshot_from_repo(settings: Settings, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     with file_lock(LOCK_PATH):
-        return _delete_snapshot_from_repo_locked(settings, repo, snapshot_id)
+        result = _delete_snapshot_from_repo_locked(settings, repo, snapshot_id)
+        refresh_repo_size_cache(repo)
+        return result
+
 
 
 def get_repo_size_bytes(repo_path: Path) -> int:
@@ -5732,21 +6155,97 @@ def get_repo_size_bytes(repo_path: Path) -> int:
         return 0
     total = 0
     for dirpath, dirnames, filenames in os.walk(repo_path):
-        # Staging data is temporary plaintext working space, not persistent
-        # repository usage and not part of the configured repository cap.
         dirnames[:] = [name for name in dirnames if name != ".staging"]
-        for f in filenames:
-            fp = os.path.join(dirpath, f)
+        for name in filenames:
+            path = os.path.join(dirpath, name)
             try:
-                if not os.path.islink(fp):
-                    total += os.path.getsize(fp)
+                if not os.path.islink(path):
+                    total += os.path.getsize(path)
             except OSError:
                 continue
     return total
 
 
+
+def get_staging_size_bytes(repo: Path) -> int:
+    staging_root = backup_staging_root(repo)
+    if not staging_root.exists():
+        return 0
+    total = 0
+    for dirpath, _, filenames in os.walk(staging_root):
+        for name in filenames:
+            path = Path(dirpath) / name
+            try:
+                if not path.is_symlink():
+                    total += path.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def load_repo_size_cache(repo: Path) -> Optional[int]:
+    key = os.path.abspath(str(repo))
+    try:
+        with _REPO_SIZE_CACHE_LOCK:
+            payload = load_json(REPO_SIZE_CACHE_PATH)
+        entry = (payload.get("repositories") or {}).get(key)
+        if not isinstance(entry, dict):
+            return None
+        return max(0, int(entry.get("size_bytes")))
+    except Exception:
+        return None
+
+
+def save_repo_size_cache(repo: Path, size_bytes: int) -> None:
+    key = os.path.abspath(str(repo))
+    try:
+        with _REPO_SIZE_CACHE_LOCK:
+            payload = load_json(REPO_SIZE_CACHE_PATH)
+            repositories = payload.get("repositories")
+            if not isinstance(repositories, dict):
+                repositories = {}
+            repositories[key] = {
+                "size_bytes": max(0, int(size_bytes)),
+                "updated_at": now_rfc3339(),
+            }
+            save_json(
+                REPO_SIZE_CACHE_PATH,
+                {"version": 1, "repositories": repositories},
+                mode=0o600,
+            )
+    except Exception as exc:
+        log_line(f"Could not update repository size cache: {exc}")
+
+
+def refresh_repo_size_cache(repo: Path) -> int:
+    size = get_repo_size_bytes(repo)
+    save_repo_size_cache(repo, size)
+    return size
+
+
+def schedule_repo_size_cache_refresh(repo: Path) -> None:
+    key = os.path.abspath(str(repo))
+    with _REPO_SIZE_CACHE_LOCK:
+        if key in _REPO_SIZE_REFRESHING:
+            return
+        _REPO_SIZE_REFRESHING.add(key)
+
+    def worker() -> None:
+        try:
+            size = refresh_repo_size_cache(repo)
+            log_line(f"Repository storage usage calculated in the background: {human_bytes(size)}.")
+        except Exception as exc:
+            log_line(f"Repository storage usage calculation failed: {exc}")
+        finally:
+            with _REPO_SIZE_CACHE_LOCK:
+                _REPO_SIZE_REFRESHING.discard(key)
+
+    threading.Thread(target=worker, daemon=True, name="aegis-repo-size-cache").start()
+
+
 def repo_size_limit_bytes(settings: Settings) -> int:
     return max(0, int(settings.max_repo_size_gb)) * 1024 * 1024 * 1024
+
 
 def prune_repo_for_incoming_bytes(
     settings: Settings,
@@ -5754,39 +6253,61 @@ def prune_repo_for_incoming_bytes(
     incoming_bytes: int,
     protected_snapshot_ids: Optional[Set[str]] = None,
     protected_hashes: Optional[Set[str]] = None,
+    temporary_bytes: int = 0,
 ) -> None:
     limit_bytes = repo_size_limit_bytes(settings)
-    if limit_bytes <= 0:
-        return
-
     incoming = max(0, int(incoming_bytes))
+    temporary = max(0, int(temporary_bytes))
     protected_snapshot_ids = set(protected_snapshot_ids or set())
     protected_hashes = set(protected_hashes or set())
 
-    if incoming > limit_bytes:
+    if limit_bytes > 0 and temporary + incoming > limit_bytes:
         raise AegisError(
-            f"The repository cap is {human_bytes(limit_bytes)}, but one new backup chunk needs "
-            f"{human_bytes(incoming)}. Increase Maximum repository size GB or lower the chunk size."
+            f"The configured repository cap is {human_bytes(limit_bytes)}, but active staging "
+            f"and the next write require at least {human_bytes(temporary + incoming)}. "
+            "Increase Maximum repository size GB or choose a larger backup location."
         )
 
-    while get_repo_size_bytes(repo) + incoming > limit_bytes:
+    while True:
+        repo_size = get_repo_size_bytes(repo)
+        usage = shutil.disk_usage(str(repo))
+        cap_ok = limit_bytes <= 0 or repo_size + temporary + incoming <= limit_bytes
+        free_ok = int(usage.free) >= incoming + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+        if cap_ok and free_ok:
+            return
+
         snapshots = [
             snap for snap in list_snapshots(settings)
             if str(snap.get("id") or "") not in protected_snapshot_ids
         ]
-
         if not snapshots:
+            reasons: List[str] = []
+            if not cap_ok:
+                reasons.append(
+                    f"the repository cap permits {human_bytes(limit_bytes)} but "
+                    f"{human_bytes(repo_size + temporary + incoming)} is required"
+                )
+            if not free_ok:
+                reasons.append(
+                    f"the filesystem has {human_bytes(int(usage.free))} free but "
+                    f"{human_bytes(incoming + BACKUP_PREFLIGHT_MIN_FREE_BYTES)} is required"
+                )
             raise AegisError(
-                f"Aegis cannot keep the repository under {human_bytes(limit_bytes)}. "
-                f"The next backup needs {human_bytes(incoming)} more, but there are no older backups "
-                "left that can be safely deleted. Increase Maximum repository size GB or delete/export backups manually."
+                "Aegis cannot make enough room for this backup: "
+                + "; ".join(reasons)
+                + ". There are no older unprotected backups left to remove."
             )
 
         oldest_id = str(snapshots[-1].get("id") or "")
         if not oldest_id:
             raise AegisError("Could not identify the oldest backup to prune.")
 
-        update_stage(f"Making room for the next backup by deleting oldest backup {oldest_id}")
+        update_stage(f"Making room by deleting oldest backup {oldest_id}")
+        log_line(
+            f"Capacity planning: deleting {oldest_id}. Persistent data: {human_bytes(repo_size)}; "
+            f"active staging: {human_bytes(temporary)}; next write: {human_bytes(incoming)}; "
+            f"free space: {human_bytes(int(usage.free))}."
+        )
         _delete_snapshot_from_repo_locked(
             settings,
             repo,
@@ -5794,63 +6315,110 @@ def prune_repo_for_incoming_bytes(
             protected_hashes=protected_hashes,
         )
  
+
 def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
-    repo_size = get_repo_size_bytes(repo)
+    cached_size = load_repo_size_cache(repo)
+    repo_size = cached_size if cached_size is not None else get_repo_size_bytes(repo)
+    if cached_size is None:
+        save_repo_size_cache(repo, repo_size)
+
+    staging_size = get_staging_size_bytes(repo)
     limit_bytes = repo_size_limit_bytes(settings)
     usage = shutil.disk_usage(str(repo))
+    estimated_full_stage = estimated_backup_stream_bytes(settings, "full_recovery")
+    # Conservative peak before deduplication: Full staging + possible new Full
+    # objects + derived Portable staging. It is informational only; deletion is
+    # driven incrementally by actual bytes so estimates cannot over-prune.
+    estimated_peak_additional = estimated_full_stage * 3
     warnings: List[str] = []
 
-    if limit_bytes > 0:
-        if repo_size >= limit_bytes:
-            warnings.append(
-                f"The repository is already at or above the configured cap ({human_bytes(repo_size)} / {human_bytes(limit_bytes)}). "
-                "Aegis will prune the oldest snapshots after the new backup finishes, while preserving at least one backup."
-            )
-        elif repo_size >= int(limit_bytes * 0.90):
-            warnings.append(
-                f"The repository is close to the configured cap ({human_bytes(repo_size)} / {human_bytes(limit_bytes)}). "
-                "Older snapshots may be pruned after this backup."
-            )
-
-    if usage.free < BACKUP_PREFLIGHT_MIN_FREE_BYTES:
+    projected_peak = repo_size + staging_size + estimated_peak_additional
+    if limit_bytes > 0 and projected_peak > limit_bytes:
         warnings.append(
-            f"The backup filesystem has very little free space ({human_bytes(usage.free)} available). "
-            "The backup may fail unless space is freed or the repository cap prunes old data after completion."
+            f"The conservative pre-deduplication peak is about {human_bytes(projected_peak)} "
+            f"including persistent data and temporary staging, above the "
+            f"{human_bytes(limit_bytes)} cap. Aegis will measure actual writes and remove the "
+            "oldest backups only as needed; it will cancel if the protected new restore points cannot fit."
+        )
+    elif limit_bytes > 0 and projected_peak >= int(limit_bytes * 0.90):
+        warnings.append(
+            f"The conservative working-space estimate is close to the configured cap "
+            f"({human_bytes(projected_peak)} / {human_bytes(limit_bytes)})."
+        )
+
+    required_free = estimated_peak_additional + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+    if usage.free < required_free:
+        warnings.append(
+            f"The backup filesystem has {human_bytes(usage.free)} free. A conservative no-deduplication "
+            f"working-space estimate is {human_bytes(estimated_peak_additional)} plus "
+            f"{human_bytes(BACKUP_PREFLIGHT_MIN_FREE_BYTES)} safety space. Aegis will account for actual "
+            "staging and object bytes, prune older backups incrementally, and cancel cleanly if space still runs out."
         )
 
     return {
         "repo_path": str(repo),
         "repo_size_bytes": repo_size,
+        "staging_size_bytes": staging_size,
+        "estimated_full_stage_bytes": estimated_full_stage,
+        "estimated_peak_additional_bytes": estimated_peak_additional,
         "limit_bytes": limit_bytes,
         "free_bytes": int(usage.free),
         "warnings": warnings,
     }
 
 
+
 def assert_backup_storage_preflight(settings: Settings) -> None:
     info = backup_preflight_info(settings)
-    if int(info.get("free_bytes") or 0) <= 0:
-        raise AegisError("The backup location reports no free space.")
+    repo = Path(str(info["repo_path"]))
+    estimated_stage = int(info.get("estimated_full_stage_bytes") or 0)
+    initial_reservation = min(
+        STAGING_MEMBER_BYTES,
+        max(BUFFER_SIZE, estimated_stage),
+    )
+
+    # Reserve only the first sequential staging member here. Later members are
+    # checked against the actual bytes written, so an approximate source-size
+    # estimate can never cause unnecessary deletion of all older snapshots.
+    prune_repo_for_incoming_bytes(
+        settings,
+        repo,
+        initial_reservation,
+        temporary_bytes=get_staging_size_bytes(repo),
+    )
 
 
-def enforce_repo_size_limit(settings: Settings, already_locked: bool = False) -> None:
+def enforce_repo_size_limit(
+    settings: Settings,
+    already_locked: bool = False,
+    protected_snapshot_ids: Optional[Set[str]] = None,
+) -> None:
     if settings.max_repo_size_gb <= 0:
         return
 
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     limit_bytes = repo_size_limit_bytes(settings)
+    protected_ids = set(protected_snapshot_ids or set())
     if limit_bytes <= 0:
         return
 
     def prune_until_under_limit() -> None:
         while get_repo_size_bytes(repo) > limit_bytes:
-            snaps = list_snapshots(settings)
-            if len(snaps) <= 1:
-                # Safety catch: never automatically delete the last remaining backup.
-                break
+            snaps = [
+                snap for snap in list_snapshots(settings, repo)
+                if str(snap.get("id") or "") not in protected_ids
+            ]
+            if not snaps:
+                raise AegisError(
+                    f"The repository is over its {human_bytes(limit_bytes)} cap, but all remaining "
+                    "snapshots are protected by the active backup run. Increase Maximum repository size GB."
+                )
 
-            oldest_id = snaps[-1]["id"]
+            oldest_id = str(snaps[-1].get("id") or "")
+            if not oldest_id:
+                raise AegisError("Could not identify the oldest backup to prune.")
+
             update_stage(f"Auto-pruning oldest backup ({oldest_id}) to stay under repository size limit")
             _delete_snapshot_from_repo_locked(settings, repo, oldest_id)
 
@@ -5887,130 +6455,104 @@ def capture_backup_kind(
     chunk_size: int,
     machine_key_value: Optional[bytes],
     protected_snapshot_ids: Optional[Set[str]] = None,
-) -> str:
-    kind_label_text = kind_label(kind)
-    kind_span = 88.0 / max(1, total_kinds)
-    kind_base = 3.0 + (kind_index * kind_span)
-    stage_end = kind_base + (kind_span * 0.50)
-    stage_verify_end = kind_base + (kind_span * 0.65)
-    process_end = kind_base + (kind_span * 0.90)
-    final_progress = min(91.0, kind_base + kind_span - 1.0)
+    source_stage: Optional[StagedArchive] = None,
+    retain_stage: bool = False,
+) -> Tuple[str, Optional[StagedArchive]]:
+    label = kind_label(kind)
+    span = 88.0 / max(1, total_kinds)
+    base = 3.0 + kind_index * span
+    stage_end = base + span * 0.50
+    verify_end = base + span * 0.65
+    process_end = base + span * 0.90
+    final_progress = min(91.0, base + span - 1.0)
 
-    set_job_progress(
-        kind_base,
-        f"Collecting metadata for {kind_label_text}",
-        detail="Reading package lists, OS metadata, disk layout, and restore hints.",
-        phase=kind,
-    )
+    set_job_progress(base, f"Collecting metadata for {label}",
+                     detail="Reading package lists, OS metadata, disk layout, and restore hints.", phase=kind)
+    log_line(f"{label}: collecting restore metadata.")
     metadata = collect_snapshot_metadata(kind)
     includes = build_include_paths(settings, kind)
     excludes = build_exclude_paths(settings, kind)
-    estimate_bytes = estimated_backup_stream_bytes(settings, kind)
+    estimate = source_stage.total_bytes if source_stage else estimated_backup_stream_bytes(settings, kind)
     stage: Optional[StagedArchive] = None
+    published = False
 
-    def report_stage(done: int, total: int, detail: str) -> None:
+    def stage_progress(done: int, total: int, detail: str) -> None:
         fraction = min(1.0, done / max(1, total))
-        progress = kind_base + 1.0 + (
-            fraction * max(1.0, stage_end - kind_base - 1.0)
-        )
-        set_job_progress(
-            progress,
-            f"Staging {kind_label_text} - {human_bytes(done)} copied",
-            bytes_done=done,
-            bytes_total=total,
-            detail=detail,
-            phase=kind,
-        )
+        set_job_progress(base + 1.0 + fraction * max(1.0, stage_end - base - 1.0),
+                         f"Staging {label} - {human_bytes(done)} copied",
+                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
 
-    def report_stage_verification(done: int, total: int, detail: str) -> None:
+    def verify_progress(done: int, total: int, detail: str) -> None:
         fraction = min(1.0, done / max(1, total))
-        progress = stage_end + (fraction * max(1.0, stage_verify_end - stage_end))
-        set_job_progress(
-            progress,
-            f"Verifying staged {kind_label_text} - {human_bytes(done)} checked",
-            bytes_done=done,
-            bytes_total=total,
-            detail=detail,
-            phase=kind,
-        )
+        set_job_progress(stage_end + fraction * max(1.0, verify_end - stage_end),
+                         f"Verifying staged {label} - {human_bytes(done)} checked",
+                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
 
-    def report_processing(done: int, total: int, detail: str) -> None:
+    def process_progress(done: int, total: int, detail: str) -> None:
         fraction = min(1.0, done / max(1, total))
-        progress = stage_verify_end + (
-            fraction * max(1.0, process_end - stage_verify_end)
-        )
-        set_job_progress(
-            progress,
-            f"Processing {kind_label_text} - {human_bytes(done)} committed",
-            bytes_done=done,
-            bytes_total=total,
-            detail=detail,
-            phase=kind,
-        )
+        set_job_progress(verify_end + fraction * max(1.0, process_end - verify_end),
+                         f"Processing {label} - {human_bytes(done)} committed",
+                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
 
     try:
-        set_job_progress(
-            kind_base + 1.0,
-            f"Staging {kind_label_text}",
-            bytes_done=0,
-            bytes_total=estimate_bytes,
-            detail=(
-                "Copying the exact tar restore stream to an uncompressed ZIP "
-                "on the backup drive before encryption or deduplication."
-            ),
-            phase=kind,
-        )
-        stage = create_staged_backup_archive(
-            settings=settings,
-            run_id=run_id,
-            kind=kind,
-            includes=includes,
-            excludes=excludes,
-            estimate_bytes=estimate_bytes,
-            progress_callback=report_stage,
-        )
+        repo = Path(settings.repo_path)
+        if source_stage is None:
+            log_line(f"{label}: starting the single live source capture; estimated stream {human_bytes(estimate)}.")
+            initial_reservation = min(
+                STAGING_MEMBER_BYTES,
+                max(BUFFER_SIZE, estimate),
+            )
+            prune_repo_for_incoming_bytes(
+                settings, repo, initial_reservation,
+                protected_snapshot_ids=protected_snapshot_ids,
+                temporary_bytes=get_staging_size_bytes(repo),
+            )
+            set_job_progress(base + 1.0, f"Staging {label}", bytes_done=0, bytes_total=estimate,
+                             detail="Copying the exact tar restore stream to an uncompressed ZIP on the backup drive.",
+                             phase=kind)
+            stage = create_staged_backup_archive(
+                settings, run_id, kind, includes, excludes, estimate,
+                progress_callback=stage_progress,
+                protected_snapshot_ids=protected_snapshot_ids,
+            )
+        else:
+            log_line(f"{label}: deriving from the verified Full Recovery staging ZIP; the live source will not be scanned again.")
+            prune_repo_for_incoming_bytes(
+                settings, repo, source_stage.total_bytes,
+                protected_snapshot_ids=protected_snapshot_ids,
+                temporary_bytes=get_staging_size_bytes(repo),
+            )
+            set_job_progress(base + 1.0, f"Deriving {label} from Full Recovery staging",
+                             bytes_done=0, bytes_total=source_stage.total_bytes,
+                             detail="Filtering complete tar records with the existing Portable include/exclude rules.",
+                             phase=kind)
+            stage = derive_staged_backup_archive(
+                settings, run_id, kind, source_stage, includes, excludes,
+                progress_callback=stage_progress,
+            )
 
-        set_job_progress(
-            stage_end,
-            f"Verifying staged {kind_label_text}",
-            bytes_done=0,
-            bytes_total=stage.total_bytes,
-            detail=(
-                "Checking ZIP CRCs, member SHA-256 hashes, the complete stream "
-                "SHA-256, and tar readability before processing."
-            ),
-            phase=kind,
-        )
-        verify_staged_backup_archive(
-            stage,
-            progress_callback=report_stage_verification,
-        )
+        log_line(f"{label}: staged {human_bytes(stage.total_bytes)} in {len(stage.members)} uncompressed ZIP member(s).")
+        set_job_progress(stage_end, f"Verifying staged {label}", bytes_done=0, bytes_total=stage.total_bytes,
+                         detail="Checking ZIP CRCs, member hashes, full-stream hash, and tar readability.", phase=kind)
+        verify_staged_backup_archive(stage, progress_callback=verify_progress)
+        log_line(f"{label}: staging verification passed for {human_bytes(stage.total_bytes)}.")
+
+        if source_stage is not None:
+            remove_staged_archive(source_stage)
+            log_line("Portable staging is verified; released the Full Recovery staging ZIP before Portable object processing.")
 
         workers, _ = backup_worker_plan(chunk_size)
-        set_job_progress(
-            stage_verify_end,
-            f"Parallel processing {kind_label_text}",
-            bytes_done=0,
-            bytes_total=stage.total_bytes,
-            detail=(
-                f"Using up to {workers} worker thread"
-                f"{'s' if workers != 1 else ''} to hash, deduplicate, and encrypt "
-                "the verified immutable staging stream."
-            ),
-            phase=kind,
-        )
+        log_line(f"{label}: processing with up to {workers} worker thread(s), {human_bytes(chunk_size)} repository chunks.")
+        set_job_progress(verify_end, f"Parallel processing {label}", bytes_done=0, bytes_total=stage.total_bytes,
+                         detail=f"Hashing, deduplicating, and encrypting with up to {workers} worker thread(s).", phase=kind)
         refs, total_bytes, actual_workers = process_staged_backup_archive(
-            settings=settings,
-            stage=stage,
-            chunk_size=chunk_size,
-            machine_key_value=machine_key_value,
+            settings, stage, chunk_size, machine_key_value,
             protected_snapshot_ids=protected_snapshot_ids,
-            progress_callback=report_processing,
+            progress_callback=process_progress,
         )
-
         if total_bytes != stage.total_bytes:
             raise AegisError(
-                f"The processed {kind_label_text} stream is {human_bytes(total_bytes)}, "
+                f"The processed {label} stream is {human_bytes(total_bytes)}, "
                 f"but the verified staging stream is {human_bytes(stage.total_bytes)}."
             )
 
@@ -6033,45 +6575,30 @@ def capture_backup_kind(
             notes=list(metadata.notes),
         )
 
-        set_job_progress(
-            process_end,
-            f"Verifying final encrypted restore stream for {kind_label_text}",
-            bytes_done=0,
-            bytes_total=total_bytes,
-            detail=(
-                "Rereading and decrypting every stored object, checking every "
-                "length, and reconstructing the complete recorded archive digest."
-            ),
-            phase=kind,
-        )
-        verify_manifest_restore_stream(
-            Path(settings.repo_path),
-            manifest,
-            machine_key_value,
-            validate_tar_headers=False,
-        )
+        log_line(f"{label}: rereading and decrypting every final object before publishing the manifest.")
+        set_job_progress(process_end, f"Verifying final encrypted restore stream for {label}",
+                         bytes_done=0, bytes_total=total_bytes,
+                         detail="Checking every object length and reconstructing the complete archive digest.", phase=kind)
+        verify_manifest_restore_stream(Path(settings.repo_path), manifest, machine_key_value, validate_tar_headers=False)
+        log_line(f"{label}: final encrypted restore-stream verification passed.")
 
-        set_job_progress(
-            final_progress,
-            f"Writing manifest for {kind_label_text}",
-            bytes_done=total_bytes,
-            bytes_total=total_bytes,
-            detail=(
-                f"The fully verified point-in-time restore manifest is being written "
-                f"after processing with {actual_workers} worker thread"
-                f"{'s' if actual_workers != 1 else ''}."
-            ),
-            phase=kind,
-        )
-        write_manifest(settings, manifest)
-        log_line(
-            f"Created {kind_label_text}: {manifest.id} "
-            f"({human_bytes(total_bytes)} verified restore stream)"
-        )
-        return manifest.id
-
+        set_job_progress(final_progress, f"Writing manifest for {label}",
+                         bytes_done=total_bytes, bytes_total=total_bytes,
+                         detail=f"Publishing the verified manifest after processing with {actual_workers} worker thread(s).",
+                         phase=kind)
+        write_manifest(settings, manifest, protected_snapshot_ids)
+        log_line(f"Created {label}: {manifest.id} ({human_bytes(total_bytes)}, {len(refs)} chunk refs).")
+        if settings.notifications_enabled:
+            send_desktop_notification(
+                f"{label} complete",
+                f"{human_bytes(total_bytes)} was verified and is ready to restore.",
+                urgency="low",
+            )
+        published = True
+        return manifest.id, stage if retain_stage else None
     finally:
-        remove_staged_archive(stage)
+        if not retain_stage or not published:
+            remove_staged_archive(stage)
 
 
 
@@ -6083,57 +6610,83 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
     save_state(state)
 
     materialize_settings(settings, recovery_password=recovery_password)
-    assert_backup_storage_preflight(settings)
 
     created: List[str] = []
     chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
     machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
     kinds = backup_kinds_for_profile(profile)
+    full_stage: Optional[StagedArchive] = None
 
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
-        cleanup_backup_staging(Path(settings.repo_path))
+        repo = Path(settings.repo_path)
+        cleanup_backup_staging(repo)
+        assert_backup_storage_preflight(settings)
+        usage = shutil.disk_usage(str(repo))
+        workers, inflight = backup_worker_plan(chunk_size)
         set_job_progress(1.0, "Starting backup", detail="Preparing repository and encryption state.", phase="start")
-
-        protected_snapshot_ids: Set[str] = set()
+        estimated_stream = estimated_backup_stream_bytes(settings, "full_recovery")
+        log_line(
+            f"Backup {run_id} started. Repository {repo}; persistent usage {human_bytes(get_repo_size_bytes(repo))}; "
+            f"free {human_bytes(int(usage.free))}; cap "
+            f"{human_bytes(repo_size_limit_bytes(settings)) if settings.max_repo_size_gb > 0 else 'unlimited'}; "
+            f"estimated Full stream {human_bytes(estimated_stream)}; conservative temporary/unique-data peak "
+            f"{human_bytes(estimated_stream * 3)} before deduplication; chunk target {human_bytes(chunk_size)}; "
+            f"worker plan {workers}/{inflight}."
+        )
+        protected: Set[str] = set()
 
         if settings.max_repo_size_gb > 0:
-            set_job_progress(
-                0.5,
-                "Preparing repository size limit",
-                detail="Deleting older backups first if the repository is already over the configured cap.",
-                phase="prune",
-            )
+            set_job_progress(0.5, "Preparing repository size limit",
+                             detail="Pruning older backups if persistent data plus staging would exceed the cap.",
+                             phase="prune")
             enforce_repo_size_limit(settings, already_locked=True)
 
-        for index, kind in enumerate(kinds):
-            snapshot_id = capture_backup_kind(
-                settings=settings,
-                run_id=run_id,
-                kind=kind,
-                kind_index=index,
-                total_kinds=len(kinds),
-                chunk_size=chunk_size,
-                machine_key_value=machine_key_value,
-                protected_snapshot_ids=protected_snapshot_ids,
+        try:
+            for index, kind in enumerate(kinds):
+                if kind == "full_recovery":
+                    snapshot_id, full_stage = capture_backup_kind(
+                        settings, run_id, kind, index, len(kinds), chunk_size, machine_key_value,
+                        protected_snapshot_ids=protected, retain_stage=True,
+                    )
+                else:
+                    snapshot_id, _ = capture_backup_kind(
+                        settings, run_id, kind, index, len(kinds), chunk_size, machine_key_value,
+                        protected_snapshot_ids=protected, source_stage=full_stage,
+                    )
+                    full_stage = None
+                created.append(snapshot_id)
+                protected.add(snapshot_id)
+
+            if settings.peers_enabled and settings.peers:
+                set_job_progress(93.0, "Syncing Constellation peers",
+                                 detail="Copying encrypted repository namespaces to configured targets.", phase="sync")
+                log_line("Backup snapshots complete; starting Constellation peer synchronization.")
+                sync_peers(settings, raise_on_error=False)
+
+            set_job_progress(96.0, "Checking repository size limits",
+                             detail="Pruning old snapshots if the final cap requires it.", phase="prune")
+            enforce_repo_size_limit(
+                settings,
+                already_locked=True,
+                protected_snapshot_ids=protected,
             )
-            created.append(snapshot_id)
-            protected_snapshot_ids.add(snapshot_id)
 
-        if settings.peers_enabled and settings.peers:
-            set_job_progress(93.0, "Syncing Constellation peers", detail="Copying encrypted repository namespaces to configured storage targets.", phase="sync")
-            sync_peers(settings, raise_on_error=False)
+            state = load_state()
+            state.last_run_at = start_stamp
+            state.last_success_at = now_rfc3339()
+            state.last_error = ""
+            save_state(state)
+        finally:
+            remove_staged_archive(full_stage)
+            refresh_repo_size_cache(repo)
 
-        set_job_progress(96.0, "Checking repository size limits", detail="Pruning old snapshots if the configured repository cap requires it.", phase="prune")
-        enforce_repo_size_limit(settings, already_locked=True)
-
-        state = load_state()
-        state.last_run_at = start_stamp
-        state.last_success_at = now_rfc3339()
-        state.last_error = ""
-        save_state(state)
-
-    set_job_progress(100.0, "Backup complete", detail="Full Recovery and Portable Migration restore points are ready.", phase="complete")
+    set_job_progress(100.0, "Backup complete",
+                     detail="Full Recovery and Portable Migration restore points are ready.", phase="complete")
+    log_line(
+        f"Backup {run_id} completed with {len(created)} verified restore point(s). "
+        f"Persistent repository usage is {human_bytes(load_repo_size_cache(Path(settings.repo_path)) or 0)}."
+    )
     return created
 
 def build_tar_restore_command(target: Path, member: Optional[str], excludes: Optional[List[str]] = None, includes: Optional[List[str]] = None) -> subprocess.Popen:
@@ -8978,6 +9531,7 @@ def sync_peers(settings: Settings, raise_on_error: bool = True) -> None:
     if errors and raise_on_error:
         raise AegisError("Constellation sync needs attention: " + "; ".join(errors))
 
+
 def dashboard() -> Dashboard:
     settings = load_settings()
     state = load_state()
@@ -8996,19 +9550,25 @@ def dashboard() -> Dashboard:
         warnings.append(
             "A legacy plaintext local key still exists. Open settings once to migrate it into the system credential store."
         )
-    elif settings.encryption_enabled and not has_local_machine_key(settings.machine_id):
+    elif settings.encryption_enabled and not local_machine_key_material_present(settings.machine_id):
         warnings.append("Encryption is enabled but the local unlock credential is missing.")
     if settings.peers_enabled and not settings.peers:
         warnings.append("Constellation mode is enabled but no peers are configured.")
-        
+
     with RUNTIME.lock:
         current_job = dataclasses.replace(RUNTIME.current_job) if RUNTIME.current_job else None
         logs = list(RUNTIME.logs)
-        
+
     repo_size = 0
     try:
         if settings.repo_path and Path(settings.repo_path).exists():
-            repo_size = get_repo_size_bytes(Path(settings.repo_path))
+            repo = Path(settings.repo_path)
+            cached = load_repo_size_cache(repo)
+            if cached is None:
+                schedule_repo_size_cache_refresh(repo)
+                warnings.append("Repository storage usage is being calculated in the background.")
+            else:
+                repo_size = cached
     except Exception:
         pass
 
@@ -9016,24 +9576,40 @@ def dashboard() -> Dashboard:
         settings=settings,
         persistent=state,
         current_job=current_job,
-        snapshots=list_snapshots(settings),
+        snapshots=list_snapshots(settings, Path(settings.repo_path) if settings.repo_path else None),
         warnings=warnings,
         logs=logs,
         repo_size_bytes=repo_size,
     )
 
 
+
 def schedule_due(settings: Settings, state: PersistentState) -> bool:
-    interval = settings.schedule.interval_minutes()
-    if interval is None:
+    schedule = settings.schedule
+    if not schedule.enabled or schedule.preset == "manual":
+        return False
+
+    now_epoch = time.time()
+    interval = schedule.interval_minutes()
+    if interval is not None:
+        if not state.last_run_at:
+            return True
+        try:
+            last_epoch = calendar.timegm(time.strptime(state.last_run_at, "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            return True
+        return now_epoch >= last_epoch + interval * 60
+
+    latest_slot = latest_schedule_slot_epoch(schedule, now_epoch)
+    if latest_slot is None or now_epoch < latest_slot:
         return False
     if not state.last_run_at:
         return True
     try:
-        last_epoch = int(time.mktime(time.strptime(state.last_run_at, "%Y-%m-%dT%H:%M:%SZ")))
+        last_epoch = calendar.timegm(time.strptime(state.last_run_at, "%Y-%m-%dT%H:%M:%SZ"))
     except Exception:
         return True
-    return time.time() >= last_epoch + interval * 60
+    return last_epoch < latest_slot
 
 
 def run_job(name: str, func):
@@ -10184,7 +10760,9 @@ def gui_main() -> int:
             self.schedule_enabled_var = tk.BooleanVar(value=False)
             self.schedule_preset_var = tk.StringVar(value="manual")
             self.schedule_custom_var = tk.StringVar(value="60")
-            self.io_yield_var = tk.StringVar(value="50")
+            self.schedule_time_var = tk.StringVar(value="02:00")
+            self.schedule_weekday_var = tk.StringVar(value="Monday")
+            self.schedule_month_day_var = tk.StringVar(value="1")
             self.max_repo_size_var = tk.StringVar(value="0")
             self.apply_packages_var = tk.BooleanVar(value=True)
             self.peers_enabled_var = tk.BooleanVar(value=False)
@@ -10300,15 +10878,10 @@ def gui_main() -> int:
             self.build_constellation_tab()
             self.build_settings_tab()
 
-            try:
-                initial_configured = bool(load_settings().onboarding_complete)
-            except Exception:
-                initial_configured = False
-
-            if initial_configured or self.recovery_mode:
-                self.apply_startup_loading_state("Checking backup repository")
-            else:
-                self.apply_configuration_state(False)
+            # The GUI is normally unprivileged while settings are root-owned.
+            # Keep the visible Opening screen up until the daemon returns the
+            # authoritative onboarding state instead of guessing "first setup".
+            self.apply_startup_loading_state("Connecting to Aegis")
 
             footer = ttk.Frame(outer)
             footer.pack(fill="x", pady=(12, 0))
@@ -10332,15 +10905,25 @@ def gui_main() -> int:
                     self.recovery_mounts = auto_mount_recovery_sources()
                 except Exception:
                     self.recovery_mounts = []
-            self.refresh_local_device_lists()
-            self.scan_repository_candidates(auto_use=self.recovery_mode)
+            # Draw the Opening tab before any optional block-device scans.
+            # Normal startup only needs daemon metadata; recovery inventory is
+            # deferred until after Tk has rendered.
+            self.root.after_idle(self.refresh_dashboard)
             if self.recovery_mode:
+                self.root.after(400, self.initialize_recovery_startup)
+            self.root.after(2500, self.periodic_refresh)
+
+        def initialize_recovery_startup(self) -> None:
+            try:
+                self.set_startup_progress(35.0, "Scanning recovery devices")
+                self.refresh_local_device_lists()
+                self.scan_repository_candidates(auto_use=True)
                 hint = "Recovery mode: connect the backup drive, let Aegis find the backup repository, and use Guided Full Restore."
                 if self.recovery_mounts:
                     hint += f" Mounted source volumes: {', '.join(self.recovery_mounts)}."
                 self.message_var.set(hint)
-            self.root.after(150, self.refresh_dashboard)
-            self.root.after(2500, self.periodic_refresh)
+            except Exception as exc:
+                self.message_var.set(f"Recovery device scan needs attention: {exc}")
 
         def configure_theme(self) -> None:
             self.root.configure(bg="#0e1116")
@@ -10728,22 +11311,34 @@ def gui_main() -> int:
             ttk.Combobox(
                 frame,
                 textvariable=self.schedule_preset_var,
-                values=["manual", "daily", "weekly"],
+                values=["manual", "daily", "weekly", "monthly"],
                 width=18,
                 state="readonly",
             ).grid(row=8, column=1, sticky="w", pady=(12, 0))
 
-            ttk.Label(frame, text="I/O pause per chunk (ms)").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
-            ttk.Entry(frame, textvariable=self.io_yield_var, width=12).grid(row=10, column=1, sticky="w", pady=(12, 0))
+            ttk.Label(frame, text="Start time (24-hour HH:MM)").grid(row=9, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.schedule_time_var, width=12).grid(row=9, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Weekly day").grid(row=10, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Combobox(
+                frame,
+                textvariable=self.schedule_weekday_var,
+                values=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                width=18,
+                state="readonly",
+            ).grid(row=10, column=1, sticky="w", pady=(12, 0))
+
+            ttk.Label(frame, text="Monthly day (1-28)").grid(row=11, column=0, sticky="w", padx=(0, 12), pady=(12, 0))
+            ttk.Entry(frame, textvariable=self.schedule_month_day_var, width=12).grid(row=11, column=1, sticky="w", pady=(12, 0))
 
             ttk.Checkbutton(
                 frame,
                 text="Apply package list after portable restore to /",
                 variable=self.apply_packages_var,
-            ).grid(row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+            ).grid(row=12, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
             buttons = ttk.Frame(frame)
-            buttons.grid(row=12, column=0, columnspan=3, sticky="w", pady=(22, 0))
+            buttons.grid(row=13, column=0, columnspan=3, sticky="w", pady=(22, 0))
             ttk.Button(buttons, text="Save Setup and Open App", command=self.complete_onboarding).pack(side="left")
 
         def apply_configuration_state(self, configured: bool) -> None:
@@ -11021,7 +11616,7 @@ def gui_main() -> int:
 
             if self.backup_progress_logs:
                 backup_lines = [line for line in logs[-40:] if "backup" in line.lower() or "snapshot" in line.lower() or "prun" in line.lower()]
-                self.fill_text(self.backup_progress_logs, "\n".join(backup_lines[-20:]) if backup_lines else "Waiting for backup log entries...")
+                self.fill_text(self.backup_progress_logs, "\n".join(backup_lines[-100:]) if backup_lines else "Waiting for backup log entries...", scroll_to_end=True)
 
         def finish_backup_progress_window(self, success: bool, message: str) -> None:
             if not self.backup_progress_window or not self.backup_progress_window.winfo_exists():
@@ -11596,29 +12191,41 @@ def gui_main() -> int:
             schedule = ttk.Frame(outer)
             schedule.grid(row=0, column=1, sticky="nsew", padx=(14, 0))
             schedule.grid_columnconfigure(1, weight=1)
-            ttk.Label(schedule, text="Scheduling and smoothing", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+            ttk.Label(schedule, text="Automatic backup schedule", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
             ttk.Checkbutton(schedule, text="Enable automatic backups", variable=self.schedule_enabled_var).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
             ttk.Label(schedule, text="Preset").grid(row=2, column=0, sticky="w", pady=(10, 0))
             ttk.Combobox(
                 schedule,
                 textvariable=self.schedule_preset_var,
-                values=["manual", "daily", "weekly"],
+                values=["manual", "daily", "weekly", "monthly"],
                 width=18,
                 state="readonly",
             ).grid(row=2, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(schedule, text="I/O pause per chunk (ms)").grid(row=4, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(schedule, textvariable=self.io_yield_var, width=12).grid(row=4, column=1, sticky="w", pady=(10, 0))
+            ttk.Label(schedule, text="Start time (24-hour HH:MM)").grid(row=3, column=0, sticky="w", pady=(10, 0))
+            ttk.Entry(schedule, textvariable=self.schedule_time_var, width=12).grid(row=3, column=1, sticky="w", pady=(10, 0))
 
-            ttk.Label(schedule, text="Maximum repository size GB").grid(row=5, column=0, sticky="w", pady=(10, 0))
-            ttk.Entry(schedule, textvariable=self.max_repo_size_var, width=12).grid(row=5, column=1, sticky="w", pady=(10, 0))
+            ttk.Label(schedule, text="Weekly day").grid(row=4, column=0, sticky="w", pady=(10, 0))
+            ttk.Combobox(
+                schedule,
+                textvariable=self.schedule_weekday_var,
+                values=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+                width=18,
+                state="readonly",
+            ).grid(row=4, column=1, sticky="w", pady=(10, 0))
+
+            ttk.Label(schedule, text="Monthly day (1-28)").grid(row=5, column=0, sticky="w", pady=(10, 0))
+            ttk.Entry(schedule, textvariable=self.schedule_month_day_var, width=12).grid(row=5, column=1, sticky="w", pady=(10, 0))
+
+            ttk.Label(schedule, text="Maximum repository size GB").grid(row=6, column=0, sticky="w", pady=(10, 0))
+            ttk.Entry(schedule, textvariable=self.max_repo_size_var, width=12).grid(row=6, column=1, sticky="w", pady=(10, 0))
             ttk.Label(
                 schedule,
-                text="0 means unlimited. This cap applies to unique stored repository data, not the sum of Restore Size values shown in the timeline.",
+                text="0 means unlimited. Active staging ZIPs count toward capacity planning; older backups are pruned before writes when needed.",
                 wraplength=520,
                 style="Muted.TLabel",
-            ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(6, 0))
+            ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
             advanced_summary = ttk.Frame(outer)
             advanced_summary.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(24, 0))
@@ -12980,7 +13587,7 @@ def gui_main() -> int:
             )
 
             self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
-            self.fill_text(self.logs_text, "\n".join(logs[-100:]) if logs else "No activity yet.")
+            self.fill_text(self.logs_text, "\n".join(logs[-500:]) if logs else "No activity yet.", scroll_to_end=True)
             self.fill_snapshot_tree(self.backup_tree, snapshots)
             self.fill_snapshot_tree(self.restore_tree, snapshots)
             if hasattr(self, "constellation_shell"):
@@ -13003,7 +13610,10 @@ def gui_main() -> int:
                 self.schedule_enabled_var.set(bool(schedule.get("enabled", False)))
                 self.schedule_preset_var.set(schedule.get("preset", "manual"))
                 self.schedule_custom_var.set(str(schedule.get("custom_minutes", 60)))
-                self.io_yield_var.set(str(settings.get("io_yield_ms", 2)))
+                self.schedule_time_var.set(normalize_schedule_time(str(schedule.get("start_time") or "02:00")))
+                weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                self.schedule_weekday_var.set(weekday_names[max(0, min(6, int(schedule.get("weekday", 0))))])
+                self.schedule_month_day_var.set(str(max(1, min(28, int(schedule.get("month_day", 1))))))
                 self.max_repo_size_var.set(str(settings.get("max_repo_size_gb", 0)))
                 self.apply_packages_var.set(bool(settings.get("apply_packages_on_portable_restore", True)))
                 self.peers_enabled_var.set(bool(settings.get("peers_enabled", False)))
@@ -13069,9 +13679,20 @@ def gui_main() -> int:
                         str(peer.get("port", CONSTELLATION_DEFAULT_SSH_PORT)),
                     ))
 
-        def fill_text(self, widget: ScrolledText, text: str) -> None:
+        def fill_text(self, widget: ScrolledText, text: str, scroll_to_end: bool = False) -> None:
+            try:
+                first, last = widget.yview()
+                was_at_end = last >= 0.995
+            except Exception:
+                first, was_at_end = 0.0, True
+
             widget.delete("1.0", "end")
             widget.insert("1.0", text)
+
+            if scroll_to_end and was_at_end:
+                widget.see("end")
+            elif not was_at_end:
+                widget.yview_moveto(first)
 
         def on_snapshot_select(self, event) -> None:
             tree = event.widget
@@ -13418,7 +14039,20 @@ def gui_main() -> int:
             schedule_preset = self.schedule_preset_var.get().strip() or ("daily" if schedule_enabled else "manual")
             if not schedule_enabled:
                 schedule_preset = "manual"
-            
+
+            raw_schedule_time = self.schedule_time_var.get().strip()
+            schedule_time = normalize_schedule_time(raw_schedule_time)
+            if raw_schedule_time != schedule_time:
+                raise AegisError("Backup start time must use 24-hour HH:MM format, such as 02:30.")
+
+            weekday_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+            weekday_name = self.schedule_weekday_var.get().strip() or "Monday"
+            weekday = weekday_names.index(weekday_name) if weekday_name in weekday_names else 0
+
+            month_day = int(self.schedule_month_day_var.get().strip() or "1")
+            if not 1 <= month_day <= 28:
+                raise AegisError("Monthly backup day must be between 1 and 28.")
+
             return {
                 "version": 2,
                 "onboarding_complete": onboarding_complete,
@@ -13436,9 +14070,12 @@ def gui_main() -> int:
                     "enabled": schedule_enabled,
                     "preset": schedule_preset,
                     "custom_minutes": int(self.schedule_custom_var.get().strip() or "60"),
+                    "start_time": schedule_time,
+                    "weekday": weekday,
+                    "month_day": month_day,
                 },
                 "chunk_size_mib": self.dashboard_payload.get("settings", {}).get("chunk_size_mib", DEFAULT_CHUNK_MIB),
-                "io_yield_ms": int(self.io_yield_var.get().strip() or "50"),
+                "io_yield_ms": 0,
                 "max_repo_size_gb": int(self.max_repo_size_var.get().strip() or "0"),
                 "apply_packages_on_portable_restore": bool(self.apply_packages_var.get()),
                 "full_excludes": full_excludes,
