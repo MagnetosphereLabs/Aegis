@@ -4881,6 +4881,166 @@ def verify_manifest_restore_stream(
             )
 
 
+def verify_reused_child_restore_streams(
+    repo: Path,
+    parent: SnapshotManifest,
+    child: SnapshotManifest,
+    key: Optional[bytes],
+    child_parent_indexes: Optional[List[int]] = None,
+    progress_callback=None,
+) -> None:
+    """
+    Verify Full and Portable in one Full-object read.
+
+    Shared Portable refs reuse the plaintext already read for their mapped Full
+    chunk. Only the small Portable-specific exclusion-boundary objects are read
+    separately, in their exact manifest order.
+    """
+
+    if parent.machine_id != child.machine_id:
+        raise AegisError("Full and Portable manifests belong to different machines.")
+    if parent.kind != "full_recovery" or child.kind != "portable_state":
+        raise AegisError("Expected a Full parent and Portable child manifest.")
+    if not parent.archive_refs or not child.archive_refs:
+        raise AegisError("Full and Portable manifests must both contain chunk refs.")
+
+    parent_expected = int(parent.archive_plaintext_bytes or 0)
+    child_expected = int(child.archive_plaintext_bytes or 0)
+    if parent_expected <= 10240 or child_expected <= 10240:
+        raise AegisError("Full or Portable restore stream is empty or incomplete.")
+
+    if sum(int(ref.plain_len or 0) for ref in parent.archive_refs) != parent_expected:
+        raise AegisError("Full manifest chunk refs do not total its archive size.")
+    if sum(int(ref.plain_len or 0) for ref in child.archive_refs) != child_expected:
+        raise AegisError("Portable manifest chunk refs do not total its archive size.")
+
+    if child_parent_indexes is None:
+        # Backward-compatible fallback for a child made entirely from parent
+        # refs. Current backups pass the exact mapping, including -1 for the
+        # rare Portable-specific boundary object.
+        mapping: List[int] = []
+        parent_cursor = 0
+        for child_ref in child.archive_refs:
+            while parent_cursor < len(parent.archive_refs):
+                parent_ref = parent.archive_refs[parent_cursor]
+                current_index = parent_cursor
+                parent_cursor += 1
+                if (
+                    parent_ref.hash == child_ref.hash
+                    and int(parent_ref.plain_len) == int(child_ref.plain_len)
+                ):
+                    mapping.append(current_index)
+                    break
+            else:
+                raise AegisError(
+                    "Portable refs are not an ordered subset of the Full backup."
+                )
+    else:
+        mapping = [int(value) for value in child_parent_indexes]
+
+    if len(mapping) != len(child.archive_refs):
+        raise AegisError("Portable chunk-source mapping has the wrong length.")
+
+    previous_parent_index = -1
+    for child_ref, parent_index in zip(child.archive_refs, mapping):
+        if parent_index < 0:
+            if parent_index != -1:
+                raise AegisError("Portable chunk-source mapping contains an invalid marker.")
+            continue
+        if parent_index <= previous_parent_index:
+            raise AegisError("Portable shared Full-chunk indexes are not strictly ordered.")
+        if parent_index >= len(parent.archive_refs):
+            raise AegisError("Portable references an invalid Full chunk index.")
+
+        parent_ref = parent.archive_refs[parent_index]
+        if (
+            parent_ref.hash != child_ref.hash
+            or int(parent_ref.plain_len) != int(child_ref.plain_len)
+        ):
+            raise AegisError(
+                "Portable shared-chunk mapping does not match the Full manifest."
+            )
+        previous_parent_index = parent_index
+
+    parent_hasher = hashlib.sha256()
+    child_hasher = hashlib.sha256()
+    parent_done = 0
+    child_done = 0
+    child_cursor = 0
+    parent_validator = TarStreamValidator("Final Full Recovery restore stream")
+    child_validator = TarStreamValidator("Final Portable Migration restore stream")
+
+    def read_ref(ref: ChunkRef, machine: str) -> bytes:
+        obj = object_path(repo, machine, ref.hash)
+        if not obj.exists():
+            raise AegisError(f"Missing backup data object: {ref.hash}")
+        plaintext = object_decode(obj.read_bytes(), key)
+        if len(plaintext) != int(ref.plain_len or 0):
+            raise AegisError(f"Backup data object length mismatch: {ref.hash}")
+        return plaintext
+
+    def emit_unique_children() -> None:
+        nonlocal child_cursor, child_done
+        while child_cursor < len(child.archive_refs) and mapping[child_cursor] == -1:
+            child_ref = child.archive_refs[child_cursor]
+            child_plaintext = read_ref(child_ref, child.machine_id)
+            child_hasher.update(child_plaintext)
+            child_validator.write(child_plaintext)
+            child_done += len(child_plaintext)
+            child_cursor += 1
+
+    try:
+        for parent_index, ref in enumerate(parent.archive_refs):
+            emit_unique_children()
+
+            plaintext = read_ref(ref, parent.machine_id)
+            parent_hasher.update(plaintext)
+            parent_validator.write(plaintext)
+            parent_done += len(plaintext)
+
+            if (
+                child_cursor < len(child.archive_refs)
+                and mapping[child_cursor] == parent_index
+            ):
+                child_hasher.update(plaintext)
+                child_validator.write(plaintext)
+                child_done += len(plaintext)
+                child_cursor += 1
+
+            if progress_callback:
+                progress_callback(parent_done, parent_expected)
+
+        emit_unique_children()
+        if child_cursor != len(child.archive_refs):
+            raise AegisError(
+                "Portable shared-chunk mapping did not resolve during Full readback."
+            )
+
+        parent_validator.finish()
+        child_validator.finish()
+
+    except Exception:
+        parent_validator.abort()
+        child_validator.abort()
+        raise
+
+    if parent_done != parent_expected:
+        raise AegisError(
+            f"Full restore stream decoded {human_bytes(parent_done)}, "
+            f"but expected {human_bytes(parent_expected)}."
+        )
+    if child_done != child_expected:
+        raise AegisError(
+            f"Portable restore stream decoded {human_bytes(child_done)}, "
+            f"but expected {human_bytes(child_expected)}."
+        )
+
+    if parent.archive_sha256 and parent_hasher.hexdigest() != parent.archive_sha256:
+        raise AegisError("Full archive integrity mismatch during final readback.")
+    if child.archive_sha256 and child_hasher.hexdigest() != child.archive_sha256:
+        raise AegisError("Portable archive integrity mismatch during final readback.")
+
+
 @dataclass
 class StagedArchiveMember:
     name: str
@@ -4901,6 +5061,22 @@ class PreparedBackupChunk:
     hash: str
     plain_len: int
     encoded: Optional[bytes]
+
+@dataclass
+class ProcessedBackupStreams:
+    full_refs: List[ChunkRef]
+    full_bytes: int
+    full_sha256: str
+    portable_refs: List[ChunkRef]
+    portable_bytes: int
+    portable_sha256: str
+    portable_parent_indexes: List[int]
+    portable_unique_bytes: int
+    portable_safe: bool
+    portable_unsafe_reason: str
+    workers: int
+    kept_entries: int = 0
+    skipped_entries: int = 0
 
 
 def backup_staging_root(repo: Path) -> Path:
@@ -5253,13 +5429,40 @@ def verify_staged_backup_archive(
 
 
 
+
 class StagedArchiveConcatReader:
+    """Sequentially read the ZIP members as one verified tar byte stream."""
+
     def __init__(self, stage: StagedArchive) -> None:
         self.stage = stage
         self.archive = zipfile.ZipFile(stage.path, mode="r")
+        self.infos = self.archive.infolist()
         self.member_index = 0
         self.member_stream = None
+        self.current_expected: Optional[StagedArchiveMember] = None
+        self.current_size = 0
+        self.current_hasher = hashlib.sha256()
+        self.archive_hasher = hashlib.sha256()
         self.bytes_read = 0
+        self.verified = False
+
+        expected_names = [member.name for member in stage.members]
+        actual_names = [info.filename for info in self.infos]
+        if actual_names != expected_names:
+            self.archive.close()
+            raise AegisError("The staging ZIP member list changed after it was written.")
+
+        for info, expected in zip(self.infos, stage.members):
+            if info.compress_type != zipfile.ZIP_STORED:
+                self.archive.close()
+                raise AegisError(
+                    f"Staging member {info.filename} was unexpectedly compressed."
+                )
+            if int(info.file_size) != int(expected.size):
+                self.archive.close()
+                raise AegisError(
+                    f"Staging member {info.filename} has the wrong size."
+                )
 
     def close(self) -> None:
         if self.member_stream is not None:
@@ -5271,18 +5474,73 @@ class StagedArchiveConcatReader:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
+        try:
+            if exc_type is None:
+                self.verify_complete()
+        finally:
+            self.close()
+
+    def _finish_current_member(self) -> None:
+        if self.member_stream is None or self.current_expected is None:
+            return
+
+        # Reading through EOF makes zipfile validate the member CRC.
+        self.member_stream.close()
+        self.member_stream = None
+
+        if self.current_size != int(self.current_expected.size):
+            raise AegisError(
+                f"Staging member {self.current_expected.name} ended at the wrong length."
+            )
+        if self.current_hasher.hexdigest() != self.current_expected.sha256:
+            raise AegisError(
+                f"Staging member {self.current_expected.name} failed its SHA-256 check."
+            )
+
+        self.current_expected = None
+        self.current_size = 0
+        self.current_hasher = hashlib.sha256()
 
     def _open_next(self) -> bool:
-        if self.member_stream is not None:
-            self.member_stream.close()
-            self.member_stream = None
+        self._finish_current_member()
+
         if self.member_index >= len(self.stage.members):
             return False
-        member = self.stage.members[self.member_index]
+
+        expected = self.stage.members[self.member_index]
+        info = self.infos[self.member_index]
         self.member_index += 1
-        self.member_stream = self.archive.open(member.name, mode="r")
+        self.current_expected = expected
+        self.current_size = 0
+        self.current_hasher = hashlib.sha256()
+        self.member_stream = self.archive.open(info, mode="r")
         return True
+
+    def verify_complete(self) -> None:
+        if self.verified:
+            return
+        if self.member_stream is not None:
+            # Ensure the current ZipExtFile reached EOF so its CRC is checked.
+            trailing = self.member_stream.read(1)
+            if trailing:
+                raise AegisError(
+                    f"Staging member {self.current_expected.name if self.current_expected else '?'} "
+                    "was not read completely."
+                )
+            self._finish_current_member()
+
+        if self.member_index != len(self.stage.members):
+            raise AegisError("The staging ZIP was not read through its final member.")
+        if self.bytes_read != int(self.stage.total_bytes):
+            raise AegisError(
+                f"The staging archive yielded {human_bytes(self.bytes_read)}, "
+                f"but {human_bytes(self.stage.total_bytes)} was originally written."
+            )
+        if self.archive_hasher.hexdigest() != self.stage.sha256:
+            raise AegisError(
+                "The staging archive SHA-256 does not match the source tar stream."
+            )
+        self.verified = True
 
     def read(self, size: int = -1) -> bytes:
         if size == 0:
@@ -5298,19 +5556,28 @@ class StagedArchiveConcatReader:
 
         chunks: List[bytes] = []
         remaining = size
+
         while remaining > 0:
-            if self.member_stream is None and not self._open_next():
-                break
+            if self.member_stream is None:
+                if not self._open_next():
+                    self.verify_complete()
+                    break
+
             assert self.member_stream is not None
             block = self.member_stream.read(remaining)
             if not block:
-                self.member_stream.close()
-                self.member_stream = None
+                self._finish_current_member()
                 continue
+
             chunks.append(block)
+            self.current_hasher.update(block)
+            self.archive_hasher.update(block)
+            self.current_size += len(block)
             self.bytes_read += len(block)
             remaining -= len(block)
+
         return b"".join(chunks)
+
 
 
 class StagedZipStreamWriter:
@@ -5324,8 +5591,11 @@ class StagedZipStreamWriter:
         self.member_size = 0
         self.member_hasher = hashlib.sha256()
         self.member_index = 0
+        self.finished = False
 
     def _open_member(self) -> None:
+        if self.finished:
+            raise AegisError("Cannot write to a finished staging ZIP stream.")
         self.member_name = f"archive/part-{self.member_index:06d}.tar"
         info = zipfile.ZipInfo(self.member_name, date_time=time.localtime()[:6])
         info.compress_type = zipfile.ZIP_STORED
@@ -5350,7 +5620,13 @@ class StagedZipStreamWriter:
             )
             self.member_index += 1
 
+    def close(self) -> None:
+        """Close an active ZIP member without publishing a successful result."""
+        self._close_member()
+
     def write(self, data: bytes) -> None:
+        if self.finished:
+            raise AegisError("Cannot write to a finished staging ZIP stream.")
         offset = 0
         while offset < len(data):
             if self.member_writer is None:
@@ -5368,21 +5644,35 @@ class StagedZipStreamWriter:
                 self._close_member()
 
     def finish(self) -> Tuple[List[StagedArchiveMember], int, str]:
-        self._close_member()
-        return self.members, self.total_bytes, self.archive_hasher.hexdigest()
+        if not self.finished:
+            self._close_member()
+            self.finished = True
+        return list(self.members), self.total_bytes, self.archive_hasher.hexdigest()
+
 
 
 def _parse_tar_number(field: bytes) -> int:
     if not field:
         return 0
-    if field[0] & 0x80:
-        raw = bytes([field[0] & 0x7F]) + field[1:]
-        return int.from_bytes(raw, "big", signed=False)
-    cleaned = field.split(b"\0", 1)[0].strip() or b"0"
+
+    # GNU/POSIX base-256 representation. Positive values start with 0x80;
+    # negative values start with 0xff. Tar sizes must never be negative.
+    if field[0] == 0x80:
+        return int.from_bytes(field[1:], "big", signed=False)
+    if field[0] == 0xFF:
+        value = int.from_bytes(field, "big", signed=True)
+        if value < 0:
+            raise AegisError(f"Negative tar numeric field is invalid here: {field!r}")
+        return value
+
+    cleaned = field.strip(b"\0 ") or b"0"
     try:
-        return int(cleaned, 8)
+        value = int(cleaned, 8)
     except ValueError as exc:
         raise AegisError(f"Invalid tar numeric field: {field!r}") from exc
+    if value < 0:
+        raise AegisError(f"Negative tar numeric field is invalid here: {field!r}")
+    return value
 
 
 def _decode_tar_text(value: bytes) -> str:
@@ -5394,28 +5684,52 @@ def _header_member_name(header: bytes) -> str:
     prefix = _decode_tar_text(header[345:500])
     return f"{prefix}/{name}" if prefix else name
 
+def _header_link_name(header: bytes) -> str:
+    return _decode_tar_text(header[157:257])
 
-def _pax_path(payload: bytes) -> str:
+
+
+def _parse_pax_records(payload: bytes) -> Dict[str, str]:
+    records: Dict[str, str] = {}
     offset = 0
+
     while offset < len(payload):
         space = payload.find(b" ", offset)
         if space < 0:
+            if payload[offset:].strip(b"\0"):
+                raise AegisError("Malformed PAX metadata record length.")
             break
-        try:
-            record_len = int(payload[offset:space])
-        except ValueError:
-            break
+
+        length_field = payload[offset:space]
+        if not length_field.isdigit():
+            raise AegisError("Malformed PAX metadata record length.")
+
+        record_len = int(length_field)
         if record_len <= 0 or offset + record_len > len(payload):
-            break
+            raise AegisError("PAX metadata record extends past its declared payload.")
+
         record = payload[space + 1:offset + record_len]
-        if record.endswith(b"\n"):
-            record = record[:-1]
-        if b"=" in record:
-            key, value = record.split(b"=", 1)
-            if key == b"path":
-                return value.decode("utf-8", errors="surrogateescape")
+        if not record.endswith(b"\n"):
+            raise AegisError("PAX metadata record is missing its newline terminator.")
+        record = record[:-1]
+
+        if b"=" not in record:
+            raise AegisError("PAX metadata record is missing '='.")
+        key, value = record.split(b"=", 1)
+        if not key:
+            raise AegisError("PAX metadata record has an empty key.")
+
+        records[
+            key.decode("utf-8", errors="surrogateescape")
+        ] = value.decode("utf-8", errors="surrogateescape")
         offset += record_len
-    return ""
+
+    return records
+
+
+def _pax_path(payload: bytes) -> str:
+    records = _parse_pax_records(payload)
+    return records.get("GNU.sparse.name") or records.get("path") or ""
 
 
 def _normalized_archive_path(value: str) -> str:
@@ -5449,6 +5763,332 @@ def _archive_path_selected(path: str, includes: List[str], excludes: List[str]) 
             return False
     return True
 
+@dataclass
+class TarFilterStats:
+    kept_entries: int = 0
+    skipped_entries: int = 0
+    portable_safe: bool = True
+    unsafe_hardlinks: List[str] = field(default_factory=list)
+
+
+def _tar_checksum_candidates(header: bytes) -> Tuple[int, int]:
+    if len(header) != 512:
+        raise AegisError("Tar header checksum requires exactly 512 bytes.")
+
+    checksum_header = header[:148] + (b" " * 8) + header[156:]
+    unsigned = sum(checksum_header)
+    signed = sum(byte if byte < 128 else byte - 256 for byte in checksum_header)
+    return unsigned, signed
+
+
+def _validate_tar_header(header: bytes, archive_offset: int) -> None:
+    if len(header) != 512:
+        raise AegisError(
+            f"Tar stream ended inside a header at archive offset {archive_offset}."
+        )
+    if header == b"\0" * 512:
+        return
+
+    try:
+        recorded = _parse_tar_number(header[148:156])
+    except AegisError as exc:
+        raise AegisError(
+            f"Invalid tar checksum field at archive offset {archive_offset}: {exc}"
+        ) from exc
+
+    unsigned, signed = _tar_checksum_candidates(header)
+    if recorded not in {unsigned, signed}:
+        name = _header_member_name(header)
+        raise AegisError(
+            f"Tar header checksum mismatch at archive offset {archive_offset} "
+            f"for {name or '<unnamed>'!r}: recorded {recorded}, "
+            f"calculated {unsigned}."
+        )
+
+
+def _tar_sparse_extension_present(value: bytes) -> bool:
+    return bool(value and value[:1] not in {b"\0", b"0", b" "})
+
+
+class TarStreamValidator:
+    """Feed a tar stream to GNU tar without rereading it from disk."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self.stderr_file = tempfile.TemporaryFile(mode="w+b")
+        self.proc = subprocess.Popen(
+            ["tar", "-tf", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self.stderr_file,
+        )
+        if self.proc.stdin is None:
+            self.stderr_file.close()
+            raise AegisError(f"Could not start tar validation for {label}.")
+        self.finished = False
+
+    def write(self, data: bytes) -> None:
+        if not data:
+            return
+        if self.finished or self.proc.stdin is None:
+            raise AegisError(f"Tar validator for {self.label} is already closed.")
+        try:
+            self.proc.stdin.write(data)
+        except BrokenPipeError as exc:
+            raise AegisError(
+                f"{self.label} stopped being a readable tar stream during processing."
+            ) from exc
+
+    def _stderr_text(self) -> str:
+        self.stderr_file.flush()
+        self.stderr_file.seek(0)
+        return self.stderr_file.read().decode("utf-8", errors="ignore").strip()
+
+    def finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+
+        if self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+
+        returncode = self.proc.wait()
+        detail = self._stderr_text()
+        self.stderr_file.close()
+
+        if returncode != 0:
+            raise AegisError(
+                f"{self.label} is not a readable tar restore stream: "
+                f"{detail or f'tar exited with status {returncode}'}"
+            )
+
+    def abort(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+
+        if self.proc.stdin is not None:
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+        self.stderr_file.close()
+
+
+
+def _stream_filtered_tar(
+    source: StagedArchiveConcatReader,
+    includes: List[str],
+    excludes: List[str],
+    emit,
+) -> TarFilterStats:
+    """
+    Parse one tar stream without materializing file payloads.
+
+    `emit(data, selected)` receives every byte in archive order. Metadata
+    records are emitted with the member they describe so selected and excluded
+    ranges can be tracked precisely.
+    """
+
+    metadata_limit = 64 * 1024 * 1024
+    stats = TarFilterStats()
+    pending_records: List[bytes] = []
+    pending_bytes = 0
+    pending_pax: Dict[str, str] = {}
+    global_pax: Dict[str, str] = {}
+    pending_long_name = ""
+    pending_long_link = ""
+    selected_member_names: Set[str] = set()
+    saw_end = False
+
+    while True:
+        header_offset = source.bytes_read
+        header = read_exact(source, 512)
+
+        if not header:
+            break
+
+        _validate_tar_header(header, header_offset)
+
+        if header == b"\0" * 512:
+            if pending_records:
+                raise AegisError(
+                    "The tar stream ended after metadata that was not attached to a member."
+                )
+
+            emit(header, True)
+            trailing_bytes = 512
+
+            while True:
+                block = source.read(BUFFER_SIZE)
+                if not block:
+                    break
+                if block.count(0) != len(block):
+                    raise AegisError(
+                        "The tar stream contains non-zero data after its end marker."
+                    )
+                emit(block, True)
+                trailing_bytes += len(block)
+
+            if trailing_bytes < 1024 or trailing_bytes % 512 != 0:
+                raise AegisError(
+                    "The tar stream does not contain a complete two-block end marker."
+                )
+
+            saw_end = True
+            break
+
+        try:
+            stored_size = _parse_tar_number(header[124:136])
+        except AegisError as exc:
+            name = _header_member_name(header)
+            raise AegisError(
+                f"Invalid tar size field at archive offset {header_offset} "
+                f"for {name or '<unnamed>'!r}: {exc}"
+            ) from exc
+
+        typeflag = header[156:157] or b"\0"
+        padded_size = ((stored_size + 511) // 512) * 512
+
+        if padded_size > max(0, source.stage.total_bytes - source.bytes_read):
+            raise AegisError(
+                f"Tar member at archive offset {header_offset} declares "
+                f"{human_bytes(padded_size)} beyond the remaining staged stream."
+            )
+
+        if typeflag in {b"x", b"g", b"L", b"K"}:
+            if padded_size > metadata_limit:
+                raise AegisError(
+                    f"Tar metadata record at archive offset {header_offset} is "
+                    f"unreasonably large ({human_bytes(padded_size)})."
+                )
+
+            payload = read_exact(source, padded_size)
+            if len(payload) != padded_size:
+                raise AegisError(
+                    "The tar stream ended inside a metadata record."
+                )
+            record = header + payload
+
+            if typeflag == b"g":
+                emit(record, True)
+                global_pax.update(_parse_pax_records(payload[:stored_size]))
+            else:
+                pending_records.append(record)
+                pending_bytes += len(record)
+                if pending_bytes > metadata_limit:
+                    raise AegisError(
+                        "Attached tar metadata exceeded the safe in-memory limit."
+                    )
+
+                if typeflag == b"x":
+                    pending_pax.update(_parse_pax_records(payload[:stored_size]))
+                elif typeflag == b"L":
+                    pending_long_name = _decode_tar_text(payload[:stored_size])
+                elif typeflag == b"K":
+                    pending_long_link = _decode_tar_text(payload[:stored_size])
+
+            continue
+
+        effective_pax = dict(global_pax)
+        effective_pax.update(pending_pax)
+        member_name = (
+            effective_pax.get("GNU.sparse.name")
+            or effective_pax.get("path")
+            or pending_long_name
+            or _header_member_name(header)
+        )
+        link_name = (
+            effective_pax.get("linkpath")
+            or pending_long_link
+            or _header_link_name(header)
+        )
+        selected = _archive_path_selected(member_name, includes, excludes)
+
+        for record in pending_records:
+            emit(record, selected)
+        pending_records.clear()
+        pending_bytes = 0
+        pending_pax.clear()
+        pending_long_name = ""
+        pending_long_link = ""
+
+        emit(header, selected)
+
+        # Old GNU sparse archives may place one or more 512-byte sparse-map
+        # extension blocks between the member header and its stored payload.
+        if typeflag == b"S" and _tar_sparse_extension_present(header[482:483]):
+            extension_count = 0
+            more_extensions = True
+            while more_extensions:
+                extension = read_exact(source, 512)
+                if len(extension) != 512:
+                    raise AegisError(
+                        "The tar stream ended inside a GNU sparse extension block."
+                    )
+                emit(extension, selected)
+                extension_count += 1
+                if extension_count * 512 > metadata_limit:
+                    raise AegisError(
+                        "GNU sparse extension metadata exceeded the safe limit."
+                    )
+                more_extensions = _tar_sparse_extension_present(extension[504:505])
+
+        remaining = padded_size
+        while remaining > 0:
+            block = read_exact(source, min(BUFFER_SIZE, remaining))
+            if not block:
+                raise AegisError(
+                    f"The tar stream ended inside member {member_name!r}."
+                )
+            emit(block, selected)
+            remaining -= len(block)
+
+        normalized_name = _normalized_archive_path(member_name)
+        if selected and typeflag == b"1":
+            normalized_target = _normalized_archive_path(link_name)
+            target_selected = bool(normalized_target) and _archive_path_selected(
+                normalized_target,
+                includes,
+                excludes,
+            )
+            target_available = normalized_target in selected_member_names
+
+            if not target_selected or not target_available:
+                stats.portable_safe = False
+                if len(stats.unsafe_hardlinks) < 20:
+                    stats.unsafe_hardlinks.append(
+                        f"{normalized_name or member_name} -> "
+                        f"{normalized_target or link_name or '<missing target>'}"
+                    )
+
+        if selected:
+            stats.kept_entries += 1
+            if normalized_name:
+                selected_member_names.add(normalized_name)
+        else:
+            stats.skipped_entries += 1
+
+    if not saw_end:
+        raise AegisError("The tar stream ended without a complete end marker.")
+
+    source.verify_complete()
+    return stats
+
+
+
 
 def derive_staged_backup_archive(
     settings: Settings,
@@ -5459,6 +6099,8 @@ def derive_staged_backup_archive(
     excludes: List[str],
     progress_callback=None,
 ) -> StagedArchive:
+    """Create a filtered staging ZIP from one already-staged Full tar stream."""
+
     repo = Path(settings.repo_path)
     staging_dir = backup_staging_root(repo) / run_id
     staging_dir.mkdir(parents=True, exist_ok=True)
@@ -5470,12 +6112,9 @@ def derive_staged_backup_archive(
     final_path.unlink(missing_ok=True)
     partial_path.unlink(missing_ok=True)
 
-    pending_records: List[bytes] = []
-    pending_pax_path = ""
-    pending_long_name = ""
+    writer: Optional[StagedZipStreamWriter] = None
+    validator: Optional[TarStreamValidator] = None
     last_report_at = 0.0
-    kept_entries = 0
-    skipped_entries = 0
 
     try:
         with StagedArchiveConcatReader(source_stage) as source:
@@ -5486,71 +6125,40 @@ def derive_staged_backup_archive(
                 allowZip64=True,
             ) as output_zip:
                 writer = StagedZipStreamWriter(output_zip)
+                validator = TarStreamValidator(kind_label(kind))
 
-                while True:
-                    header = source.read(512)
-                    if not header:
-                        break
-                    if len(header) != 512:
-                        raise AegisError("The Full Recovery staging stream ended inside a tar header.")
+                try:
+                    def emit(data: bytes, selected: bool) -> None:
+                        nonlocal last_report_at
+                        if selected:
+                            assert writer is not None
+                            assert validator is not None
+                            writer.write(data)
+                            validator.write(data)
 
-                    if header == b"\0" * 512:
-                        writer.write(header)
-                        while True:
-                            block = source.read(BUFFER_SIZE)
-                            if not block:
-                                break
-                            writer.write(block)
-                        break
+                        now = time.monotonic()
+                        if progress_callback and now - last_report_at >= 0.35:
+                            progress_callback(
+                                source.bytes_read,
+                                source_stage.total_bytes,
+                                f"Scanned {human_bytes(source.bytes_read)} from Full Recovery staging; "
+                                f"retained {human_bytes(writer.total_bytes if writer else 0)} "
+                                "after Portable exclusions.",
+                            )
+                            last_report_at = now
 
-                    size = _parse_tar_number(header[124:136])
-                    padded_size = ((size + 511) // 512) * 512
-                    payload = source.read(padded_size)
-                    if len(payload) != padded_size:
-                        raise AegisError("The Full Recovery staging stream ended inside a tar member.")
+                    stats = _stream_filtered_tar(source, includes, excludes, emit)
+                    members, total_bytes, digest = writer.finish()
+                    validator.finish()
+                    validator = None
 
-                    record = header + payload
-                    typeflag = header[156:157] or b"\0"
+                finally:
+                    # zipfile refuses to close while an inner member handle is
+                    # still open. Always close it before leaving this context so
+                    # the original parser/validation error is never masked.
+                    if writer is not None:
+                        writer.close()
 
-                    if typeflag in {b"x", b"L", b"K"}:
-                        pending_records.append(record)
-                        if typeflag == b"x":
-                            pending_pax_path = _pax_path(payload[:size]) or pending_pax_path
-                        elif typeflag == b"L":
-                            pending_long_name = _decode_tar_text(payload[:size])
-                        continue
-
-                    if typeflag == b"g":
-                        writer.write(record)
-                        continue
-
-                    member_name = pending_pax_path or pending_long_name or _header_member_name(header)
-                    if _archive_path_selected(member_name, includes, excludes):
-                        for pending in pending_records:
-                            writer.write(pending)
-                        writer.write(record)
-                        kept_entries += 1
-                    else:
-                        skipped_entries += 1
-
-                    pending_records.clear()
-                    pending_pax_path = ""
-                    pending_long_name = ""
-
-                    now = time.monotonic()
-                    if progress_callback and now - last_report_at >= 0.35:
-                        progress_callback(
-                            source.bytes_read,
-                            source_stage.total_bytes,
-                            f"Scanned {human_bytes(source.bytes_read)} from Full Recovery staging; "
-                            f"retained {human_bytes(writer.total_bytes)} after Portable exclusions.",
-                        )
-                        last_report_at = now
-
-                members, total_bytes, digest = writer.finish()
-
-        if pending_records:
-            raise AegisError("The Full Recovery tar stream ended after an unattached metadata header.")
         if total_bytes <= 10240 or not members:
             raise AegisError("The derived Portable Migration restore stream is empty or incomplete.")
 
@@ -5563,12 +6171,13 @@ def derive_staged_backup_archive(
                 source_stage.total_bytes,
                 source_stage.total_bytes,
                 f"Derived {human_bytes(total_bytes)} from one immutable Full Recovery capture; "
-                f"kept {kept_entries} tar entries and excluded {skipped_entries}.",
+                f"kept {stats.kept_entries} tar entries and excluded {stats.skipped_entries}.",
             )
 
         log_line(
-            f"Portable Migration derivation kept {kept_entries} tar entries, excluded "
-            f"{skipped_entries}, and produced {human_bytes(total_bytes)} without rereading the live source."
+            f"Portable Migration derivation kept {stats.kept_entries} tar entries, excluded "
+            f"{stats.skipped_entries}, and produced {human_bytes(total_bytes)} without "
+            "rereading the live source."
         )
         return StagedArchive(
             path=final_path,
@@ -5578,6 +6187,8 @@ def derive_staged_backup_archive(
         )
 
     except Exception:
+        if validator is not None:
+            validator.abort()
         partial_path.unlink(missing_ok=True)
         final_path.unlink(missing_ok=True)
         raise
@@ -5628,6 +6239,109 @@ class ArchiveChunkSplitter:
         return [piece]
 
 
+class TaggedArchiveChunkSplitter:
+    """
+    Apply the existing Full chunk-boundary algorithm while tracking which byte
+    ranges belong in Portable. Full boundaries remain backward-compatible;
+    only chunks that straddle a Portable exclusion need a small derived object.
+    """
+
+    def __init__(self, chunk_size: int) -> None:
+        self.chunk_size = max(512, (int(chunk_size) // 512) * 512)
+        self.flush_threshold = int(self.chunk_size * 0.8)
+        self.buffer = bytearray()
+        self.tags = deque()  # (byte_count, selected)
+
+    def _append_tag(self, length: int, selected: bool) -> None:
+        if length <= 0:
+            return
+        if self.tags and self.tags[-1][1] == bool(selected):
+            previous_length, previous_selected = self.tags.pop()
+            self.tags.append((previous_length + length, previous_selected))
+        else:
+            self.tags.append((length, bool(selected)))
+
+    def _take(self, length: int) -> Tuple[bytes, Optional[bytes]]:
+        full_piece = bytes(self.buffer[:length])
+        del self.buffer[:length]
+
+        consumed: List[Tuple[int, bool]] = []
+        remaining = length
+        while remaining > 0:
+            if not self.tags:
+                raise AegisError("Portable selection tags ended before the chunk data.")
+            tag_length, selected = self.tags.popleft()
+            take = min(remaining, tag_length)
+            consumed.append((take, selected))
+            remaining -= take
+            if take < tag_length:
+                self.tags.appendleft((tag_length - take, selected))
+
+        selected_total = sum(count for count, selected in consumed if selected)
+        if selected_total == 0:
+            return full_piece, None
+        if selected_total == length:
+            return full_piece, full_piece
+
+        parts: List[bytes] = []
+        offset = 0
+        for count, selected in consumed:
+            if selected:
+                parts.append(full_piece[offset:offset + count])
+            offset += count
+        return full_piece, b"".join(parts)
+
+    def write_tagged(
+        self,
+        parts: List[Tuple[bytes, bool]],
+    ) -> List[Tuple[bytes, Optional[bytes]]]:
+        pieces: List[Tuple[bytes, Optional[bytes]]] = []
+        for data, selected in parts:
+            if not data:
+                continue
+            self.buffer.extend(data)
+            self._append_tag(len(data), selected)
+
+        # This drain logic is intentionally identical to ArchiveChunkSplitter.
+        if len(self.buffer) >= self.flush_threshold:
+            marker_position = ((self.flush_threshold + 511) // 512) * 512 + 257
+            cut_index = -1
+
+            while True:
+                marker_position = self.buffer.find(b"ustar", marker_position)
+                if marker_position < 0:
+                    break
+
+                candidate = marker_position - 257
+                if candidate >= self.flush_threshold and candidate % 512 == 0:
+                    cut_index = candidate
+                    break
+
+                marker_position += 1
+
+            if cut_index != -1:
+                pieces.append(self._take(cut_index))
+
+        while len(self.buffer) >= self.chunk_size:
+            pieces.append(self._take(self.chunk_size))
+
+        return pieces
+
+    def write(self, data: bytes, selected: bool) -> List[Tuple[bytes, Optional[bytes]]]:
+        return self.write_tagged([(data, selected)])
+
+    def finish(self) -> List[Tuple[bytes, Optional[bytes]]]:
+        if not self.buffer:
+            if self.tags:
+                raise AegisError("Portable selection tags remained after chunking.")
+            return []
+
+        piece = self._take(len(self.buffer))
+        if self.tags:
+            raise AegisError("Portable selection tags remained after final chunking.")
+        return [piece]
+
+
 def _available_memory_bytes() -> int:
     try:
         for line in Path("/proc/meminfo").read_text(
@@ -5661,6 +6375,7 @@ def backup_worker_plan(chunk_size: int) -> Tuple[int, int]:
 
 
 
+
 class ParallelRepoObjectWriter:
     def __init__(
         self,
@@ -5669,6 +6384,7 @@ class ParallelRepoObjectWriter:
         machine: str,
         key: Optional[bytes],
         protected_snapshot_ids: Optional[Set[str]] = None,
+        temporary_bytes: int = 0,
     ) -> None:
         self.settings = settings
         self.repo = repo
@@ -5676,8 +6392,20 @@ class ParallelRepoObjectWriter:
         self.key = key
         self.protected_snapshot_ids = set(protected_snapshot_ids or set())
         self.protected_hashes: Set[str] = set()
-        self.repo_size_bytes = get_repo_size_bytes(repo)
+        self.temporary_bytes = max(0, int(temporary_bytes))
         self.state_lock = threading.Lock()
+
+        # A full repository walk is only needed when a configured cap can
+        # actually require pruning. Unlimited repositories use the cached
+        # dashboard value and avoid an expensive startup scan.
+        if self.settings.max_repo_size_gb > 0:
+            self.repo_size_bytes = get_repo_size_bytes(repo)
+        else:
+            self.repo_size_bytes = max(0, int(load_repo_size_cache(repo) or 0))
+
+        self.free_bytes_estimate = int(shutil.disk_usage(str(repo)).free)
+        self.bytes_since_free_refresh = 0
+        self.last_free_refresh = time.monotonic()
 
     def prepare_chunk(self, plaintext: bytes) -> PreparedBackupChunk:
         digest = sha256_hex(plaintext)
@@ -5688,8 +6416,55 @@ class ParallelRepoObjectWriter:
         encoded = None if already_stored else object_encode(plaintext, self.key)
         return PreparedBackupChunk(hash=digest, plain_len=len(plaintext), encoded=encoded)
 
+    def _refresh_free_space_if_needed(self, incoming_bytes: int) -> None:
+        now = time.monotonic()
+        low_watermark = (
+            incoming_bytes
+            + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+            + max(STAGING_MEMBER_BYTES, self.bytes_since_free_refresh)
+        )
+        if (
+            self.bytes_since_free_refresh >= STAGING_MEMBER_BYTES
+            or now - self.last_free_refresh >= 30.0
+            or self.free_bytes_estimate < low_watermark
+        ):
+            self.free_bytes_estimate = int(shutil.disk_usage(str(self.repo)).free)
+            self.bytes_since_free_refresh = 0
+            self.last_free_refresh = now
+
+    def _ensure_capacity(self, incoming_bytes: int) -> None:
+        self._refresh_free_space_if_needed(incoming_bytes)
+        limit_bytes = repo_size_limit_bytes(self.settings)
+        cap_needs_space = (
+            limit_bytes > 0
+            and self.repo_size_bytes + self.temporary_bytes + incoming_bytes > limit_bytes
+        )
+        disk_needs_space = (
+            self.free_bytes_estimate
+            < incoming_bytes + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+        )
+
+        if not cap_needs_space and not disk_needs_space:
+            return
+
+        prune_repo_for_incoming_bytes(
+            self.settings,
+            self.repo,
+            incoming_bytes,
+            protected_snapshot_ids=self.protected_snapshot_ids,
+            protected_hashes=self.protected_hashes,
+            temporary_bytes=self.temporary_bytes,
+        )
+
+        if limit_bytes > 0:
+            self.repo_size_bytes = get_repo_size_bytes(self.repo)
+        self.free_bytes_estimate = int(shutil.disk_usage(str(self.repo)).free)
+        self.bytes_since_free_refresh = 0
+        self.last_free_refresh = time.monotonic()
+
     def commit_chunk(self, prepared: PreparedBackupChunk) -> ChunkRef:
         obj = object_path(self.repo, self.machine, prepared.hash)
+
         with self.state_lock:
             if not obj.exists():
                 encoded = prepared.encoded
@@ -5698,31 +6473,242 @@ class ParallelRepoObjectWriter:
                         f"Backup object {prepared.hash} disappeared while the backup was running."
                     )
 
-                temporary = get_staging_size_bytes(self.repo)
-                limit_bytes = repo_size_limit_bytes(self.settings)
-                free_bytes = int(shutil.disk_usage(str(self.repo)).free)
-                cap_needs_space = (
-                    limit_bytes > 0
-                    and self.repo_size_bytes + temporary + len(encoded) > limit_bytes
-                )
-                disk_needs_space = free_bytes < len(encoded) + BACKUP_PREFLIGHT_MIN_FREE_BYTES
-                if cap_needs_space or disk_needs_space:
+                self._ensure_capacity(len(encoded))
+                obj.parent.mkdir(parents=True, exist_ok=True)
+
+                try:
+                    atomic_write(obj, encoded, mode=0o600)
+                except OSError as exc:
+                    if exc.errno != errno.ENOSPC:
+                        raise
+
+                    # Filesystem free-space state can change outside Aegis.
+                    # Recheck, prune safely, and retry exactly once.
                     prune_repo_for_incoming_bytes(
                         self.settings,
                         self.repo,
                         len(encoded),
                         protected_snapshot_ids=self.protected_snapshot_ids,
                         protected_hashes=self.protected_hashes,
-                        temporary_bytes=temporary,
+                        temporary_bytes=self.temporary_bytes,
                     )
-                    self.repo_size_bytes = get_repo_size_bytes(self.repo)
+                    atomic_write(obj, encoded, mode=0o600)
+                    self.free_bytes_estimate = int(shutil.disk_usage(str(self.repo)).free)
+                    self.bytes_since_free_refresh = 0
+                    self.last_free_refresh = time.monotonic()
 
-                obj.parent.mkdir(parents=True, exist_ok=True)
-                atomic_write(obj, encoded, mode=0o600)
                 self.repo_size_bytes += len(encoded)
+                self.free_bytes_estimate = max(0, self.free_bytes_estimate - len(encoded))
+                self.bytes_since_free_refresh += len(encoded)
 
             self.protected_hashes.add(prepared.hash)
+
         return ChunkRef(hash=prepared.hash, plain_len=prepared.plain_len)
+
+
+
+class DualArchiveChunkProcessor:
+    """
+    Store one Full tar stream and derive Portable with maximum object reuse.
+
+    Full uses the pre-existing chunk-boundary algorithm unchanged. Portable
+    directly references every Full chunk containing only retained bytes.
+    Only a Full chunk that straddles an exclusion boundary produces a small
+    Portable-specific boundary object.
+    """
+
+    PORTABLE_EXCLUDED = 0
+    PORTABLE_SHARED = 1
+    PORTABLE_UNIQUE = 2
+
+    def __init__(
+        self,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        object_writer: ParallelRepoObjectWriter,
+        chunk_size: int,
+        workers: int,
+        max_inflight: int,
+        portable_enabled: bool,
+        progress_callback=None,
+    ) -> None:
+        self.executor = executor
+        self.object_writer = object_writer
+        self.splitter = TaggedArchiveChunkSplitter(chunk_size)
+        self.workers = workers
+        self.max_inflight = max(1, max_inflight)
+        self.portable_enabled = portable_enabled
+        self.progress_callback = progress_callback
+
+        self.full_refs: List[ChunkRef] = []
+        self.portable_refs: List[ChunkRef] = []
+        self.portable_parent_indexes: List[int] = []
+        self.portable_unique_bytes = 0
+        self.pending = deque()
+        self.pending_futures = 0
+
+        # The legacy processor called ArchiveChunkSplitter.write() with 8 MiB
+        # reads. Tar parsing naturally emits smaller records, so coalesce them
+        # back to the same write cadence. With 1 GiB staging members (exactly
+        # divisible by 8 MiB), this preserves existing Full chunk boundaries.
+        self.input_segments = deque()  # (bytes, selected)
+        self.input_bytes = 0
+
+        self.full_hasher = hashlib.sha256()
+        self.portable_hasher = hashlib.sha256()
+        self.full_bytes = 0
+        self.portable_bytes = 0
+        self.committed_bytes = 0
+        self.last_report_at = 0.0
+
+        self.full_validator = TarStreamValidator("Full Recovery processing stream")
+        self.portable_validator = (
+            TarStreamValidator("Portable Migration processing stream")
+            if portable_enabled
+            else None
+        )
+
+    def _commit_oldest(self) -> None:
+        (
+            full_future,
+            portable_mode,
+            portable_future,
+        ) = self.pending.popleft()
+
+        full_prepared = full_future.result()
+        full_ref = self.object_writer.commit_chunk(full_prepared)
+        parent_index = len(self.full_refs)
+        self.full_refs.append(full_ref)
+        self.pending_futures -= 1
+
+        if self.portable_enabled:
+            if portable_mode == self.PORTABLE_SHARED:
+                self.portable_refs.append(full_ref)
+                self.portable_parent_indexes.append(parent_index)
+            elif portable_mode == self.PORTABLE_UNIQUE:
+                if portable_future is None:
+                    raise AegisError("Missing Portable boundary-chunk worker result.")
+                portable_prepared = portable_future.result()
+                portable_ref = self.object_writer.commit_chunk(portable_prepared)
+                self.portable_refs.append(portable_ref)
+                self.portable_parent_indexes.append(-1)
+                self.portable_unique_bytes += portable_ref.plain_len
+                self.pending_futures -= 1
+
+        self.committed_bytes += full_ref.plain_len
+        now = time.monotonic()
+        if self.progress_callback and now - self.last_report_at >= 0.35:
+            self.progress_callback(
+                self.committed_bytes,
+                self.full_bytes,
+                f"Verified and processed {human_bytes(self.committed_bytes)} with "
+                f"{self.workers} worker thread{'s' if self.workers != 1 else ''}.",
+            )
+            self.last_report_at = now
+
+    def _submit_piece(
+        self,
+        full_piece: bytes,
+        portable_piece: Optional[bytes],
+    ) -> None:
+        if not full_piece:
+            return
+
+        full_future = self.executor.submit(
+            self.object_writer.prepare_chunk,
+            full_piece,
+        )
+        self.pending_futures += 1
+
+        portable_mode = self.PORTABLE_EXCLUDED
+        portable_future = None
+
+        if self.portable_enabled and portable_piece is not None:
+            if portable_piece is full_piece:
+                portable_mode = self.PORTABLE_SHARED
+            else:
+                portable_mode = self.PORTABLE_UNIQUE
+                portable_future = self.executor.submit(
+                    self.object_writer.prepare_chunk,
+                    portable_piece,
+                )
+                self.pending_futures += 1
+
+        self.pending.append(
+            (full_future, portable_mode, portable_future)
+        )
+
+        while self.pending and self.pending_futures >= self.max_inflight:
+            self._commit_oldest()
+
+    def _append_input(self, data: bytes, selected: bool) -> None:
+        if not data:
+            return
+        self.input_segments.append((data, bool(selected)))
+        self.input_bytes += len(data)
+
+    def _take_input(self, length: int) -> List[Tuple[bytes, bool]]:
+        parts: List[Tuple[bytes, bool]] = []
+        remaining = length
+
+        while remaining > 0:
+            if not self.input_segments:
+                raise AegisError("Tar input coalescer ended before its byte count.")
+            data, selected = self.input_segments.popleft()
+            take = min(remaining, len(data))
+            parts.append((data[:take], selected))
+            remaining -= take
+            self.input_bytes -= take
+            if take < len(data):
+                self.input_segments.appendleft((data[take:], selected))
+
+        return parts
+
+    def _drain_input(self, length: int) -> None:
+        parts = self._take_input(length)
+        for full_piece, portable_piece in self.splitter.write_tagged(parts):
+            self._submit_piece(full_piece, portable_piece)
+
+    def write(self, data: bytes, selected: bool) -> None:
+        if not data:
+            return
+
+        self.full_hasher.update(data)
+        self.full_bytes += len(data)
+        self.full_validator.write(data)
+
+        effective_selected = bool(selected) if self.portable_enabled else True
+        if self.portable_enabled and effective_selected:
+            self.portable_hasher.update(data)
+            self.portable_bytes += len(data)
+            assert self.portable_validator is not None
+            self.portable_validator.write(data)
+
+        self._append_input(data, effective_selected)
+        while self.input_bytes >= BUFFER_SIZE:
+            self._drain_input(BUFFER_SIZE)
+
+    def finish(self) -> None:
+        if self.input_bytes:
+            self._drain_input(self.input_bytes)
+        if self.input_segments:
+            raise AegisError("Tar input coalescer retained segments after processing.")
+
+        for full_piece, portable_piece in self.splitter.finish():
+            self._submit_piece(full_piece, portable_piece)
+
+        while self.pending:
+            self._commit_oldest()
+
+        self.full_validator.finish()
+        if self.portable_validator is not None:
+            self.portable_validator.finish()
+
+    def abort(self) -> None:
+        self.full_validator.abort()
+        if self.portable_validator is not None:
+            self.portable_validator.abort()
+
+
 
 
 def process_staged_backup_archive(
@@ -5732,87 +6718,136 @@ def process_staged_backup_archive(
     machine_key_value: Optional[bytes],
     protected_snapshot_ids: Optional[Set[str]] = None,
     progress_callback=None,
-) -> Tuple[List[ChunkRef], int, int]:
+    portable_includes: Optional[List[str]] = None,
+    portable_excludes: Optional[List[str]] = None,
+) -> ProcessedBackupStreams:
+    """
+    Reread the staging ZIP once, verify every ZIP/member/archive checksum,
+    validate the Full and Portable tar streams, and prepare repository objects.
+
+    Full keeps the established chunk-boundary algorithm. Portable reuses every
+    Full chunk that contains only retained bytes and stores only the small
+    boundary fragments from chunks that straddle an exclusion.
+    """
+
     workers, max_inflight = backup_worker_plan(chunk_size)
-    splitter = ArchiveChunkSplitter(chunk_size)
+    repo = Path(settings.repo_path)
+    temporary_bytes = get_staging_size_bytes(repo)
     object_writer = ParallelRepoObjectWriter(
         settings,
-        Path(settings.repo_path),
+        repo,
         settings.machine_id,
         machine_key_value,
         protected_snapshot_ids=protected_snapshot_ids,
+        temporary_bytes=temporary_bytes,
     )
-
-    refs: List[ChunkRef] = []
-    pending = deque()
-    committed_bytes = 0
-    last_report_at = 0.0
-
-    def commit_oldest() -> None:
-        nonlocal committed_bytes, last_report_at
-        future = pending.popleft()
-        prepared = future.result()
-        ref = object_writer.commit_chunk(prepared)
-        refs.append(ref)
-        committed_bytes += ref.plain_len
-
-        now = time.monotonic()
-        if progress_callback and now - last_report_at >= 0.35:
-            progress_callback(
-                committed_bytes,
-                stage.total_bytes,
-                f"Processed {human_bytes(committed_bytes)} with {workers} worker thread"
-                f"{'s' if workers != 1 else ''}.",
-            )
-            last_report_at = now
+    portable_enabled = portable_includes is not None
+    processor: Optional[DualArchiveChunkProcessor] = None
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=workers,
         thread_name_prefix="aegis-backup",
     ) as executor:
-        with zipfile.ZipFile(stage.path, mode="r") as archive:
-            for member in stage.members:
-                with archive.open(member.name, mode="r") as source:
-                    remaining = member.size
+        processor = DualArchiveChunkProcessor(
+            executor,
+            object_writer,
+            chunk_size,
+            workers,
+            max_inflight,
+            portable_enabled,
+            progress_callback=progress_callback,
+        )
 
-                    while remaining > 0:
-                        block = read_exact(source, min(BUFFER_SIZE, remaining))
-                        if not block:
-                            raise AegisError(
-                                f"Staging member {member.name} ended early during processing."
-                            )
-                        remaining -= len(block)
-
-                        for piece in splitter.write(block):
-                            pending.append(
-                                executor.submit(object_writer.prepare_chunk, piece)
-                            )
-                            if len(pending) >= max_inflight:
-                                commit_oldest()
-
-            for piece in splitter.finish():
-                pending.append(
-                    executor.submit(object_writer.prepare_chunk, piece)
+        try:
+            with StagedArchiveConcatReader(stage) as source:
+                stats = _stream_filtered_tar(
+                    source,
+                    portable_includes if portable_enabled else ["."],
+                    (portable_excludes or []) if portable_enabled else [],
+                    processor.write,
                 )
 
-            while pending:
-                commit_oldest()
+            processor.finish()
 
-    if committed_bytes != stage.total_bytes:
+        except Exception:
+            processor.abort()
+            raise
+
+    if processor.full_bytes != int(stage.total_bytes):
         raise AegisError(
-            f"Parallel backup processing committed {human_bytes(committed_bytes)}, "
-            f"but the staged restore stream contains {human_bytes(stage.total_bytes)}."
+            f"Backup processing consumed {human_bytes(processor.full_bytes)}, "
+            f"but the staging stream contains {human_bytes(stage.total_bytes)}."
         )
+
+    full_digest = processor.full_hasher.hexdigest()
+    if full_digest != stage.sha256:
+        raise AegisError(
+            "The processed Full Recovery stream does not match the verified staging digest."
+        )
+
+    if portable_enabled:
+        if processor.portable_bytes <= 10240 or not processor.portable_refs:
+            raise AegisError(
+                "The derived Portable Migration restore stream is empty or incomplete."
+            )
+        if len(processor.portable_refs) != len(processor.portable_parent_indexes):
+            raise AegisError(
+                "Portable chunk-source mapping does not match its chunk refs."
+            )
+        if sum(ref.plain_len for ref in processor.portable_refs) != processor.portable_bytes:
+            raise AegisError(
+                "Portable chunk refs do not total the derived Portable stream."
+            )
+
+        unique_bytes = 0
+        for child_ref, parent_index in zip(
+            processor.portable_refs,
+            processor.portable_parent_indexes,
+        ):
+            if parent_index < 0:
+                unique_bytes += child_ref.plain_len
+                continue
+            if parent_index >= len(processor.full_refs):
+                raise AegisError("Portable references an invalid Full chunk index.")
+            parent_ref = processor.full_refs[parent_index]
+            if (
+                parent_ref.hash != child_ref.hash
+                or int(parent_ref.plain_len) != int(child_ref.plain_len)
+            ):
+                raise AegisError(
+                    "Portable shared-chunk mapping does not match the Full manifest."
+                )
+
+        if unique_bytes != processor.portable_unique_bytes:
+            raise AegisError(
+                "Portable boundary-object byte accounting is inconsistent."
+            )
 
     if progress_callback:
         progress_callback(
-            committed_bytes,
-            committed_bytes,
-            f"Finished parallel deduplication and encryption with {workers} worker thread"
+            processor.full_bytes,
+            processor.full_bytes,
+            f"Finished verified parallel processing with {workers} worker thread"
             f"{'s' if workers != 1 else ''}.",
         )
 
-    return refs, committed_bytes, workers
+    return ProcessedBackupStreams(
+        full_refs=processor.full_refs,
+        full_bytes=processor.full_bytes,
+        full_sha256=full_digest,
+        portable_refs=processor.portable_refs,
+        portable_bytes=processor.portable_bytes,
+        portable_sha256=(
+            processor.portable_hasher.hexdigest() if portable_enabled else ""
+        ),
+        portable_parent_indexes=processor.portable_parent_indexes,
+        portable_unique_bytes=processor.portable_unique_bytes,
+        portable_safe=stats.portable_safe,
+        portable_unsafe_reason="; ".join(stats.unsafe_hardlinks),
+        workers=workers,
+        kept_entries=stats.kept_entries,
+        skipped_entries=stats.skipped_entries,
+    )
 
 
 class RepoWriter:
@@ -6031,6 +7066,7 @@ def collect_snapshot_metadata(kind: str) -> SnapshotMetadata:
     )
 
 
+
 def build_tar_backup_command(includes: List[str], excludes: List[str]) -> List[str]:
     cmd = ["tar", "--xattrs", "--acls", "--numeric-owner", "--sparse", "--warning=no-file-changed", "--ignore-failed-read", "-cpf", "-", "-C", "/"]
     for ex in excludes:
@@ -6247,6 +7283,7 @@ def repo_size_limit_bytes(settings: Settings) -> int:
     return max(0, int(settings.max_repo_size_gb)) * 1024 * 1024 * 1024
 
 
+
 def prune_repo_for_incoming_bytes(
     settings: Settings,
     repo: Path,
@@ -6269,15 +7306,25 @@ def prune_repo_for_incoming_bytes(
         )
 
     while True:
-        repo_size = get_repo_size_bytes(repo)
         usage = shutil.disk_usage(str(repo))
-        cap_ok = limit_bytes <= 0 or repo_size + temporary + incoming <= limit_bytes
         free_ok = int(usage.free) >= incoming + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+
+        # Unlimited repositories do not need a full walk of every object merely
+        # to approve the next sequential staging/object write. This fast path is
+        # critical once a repository already contains hundreds of gigabytes.
+        if limit_bytes <= 0 and free_ok:
+            return
+
+        repo_size = get_repo_size_bytes(repo) if limit_bytes > 0 else int(
+            load_repo_size_cache(repo) or 0
+        )
+        cap_ok = limit_bytes <= 0 or repo_size + temporary + incoming <= limit_bytes
         if cap_ok and free_ok:
             return
 
         snapshots = [
-            snap for snap in list_snapshots(settings)
+            snap
+            for snap in list_snapshots(settings, repo)
             if str(snap.get("id") or "") not in protected_snapshot_ids
         ]
         if not snapshots:
@@ -6304,9 +7351,10 @@ def prune_repo_for_incoming_bytes(
 
         update_stage(f"Making room by deleting oldest backup {oldest_id}")
         log_line(
-            f"Capacity planning: deleting {oldest_id}. Persistent data: {human_bytes(repo_size)}; "
-            f"active staging: {human_bytes(temporary)}; next write: {human_bytes(incoming)}; "
-            f"free space: {human_bytes(int(usage.free))}."
+            f"Capacity planning: deleting {oldest_id}. Persistent data: "
+            f"{human_bytes(repo_size)}; active staging: {human_bytes(temporary)}; "
+            f"next write: {human_bytes(incoming)}; free space: "
+            f"{human_bytes(int(usage.free))}."
         )
         _delete_snapshot_from_repo_locked(
             settings,
@@ -6327,9 +7375,10 @@ def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
     limit_bytes = repo_size_limit_bytes(settings)
     usage = shutil.disk_usage(str(repo))
     estimated_full_stage = estimated_backup_stream_bytes(settings, "full_recovery")
-    # Conservative peak before deduplication: Full staging + possible new Full
-    # objects + derived Portable staging. It is informational only; deletion is
-    # driven incrementally by actual bytes so estimates cannot over-prune.
+    # Conservative pathological peak before deduplication: one Full staging
+    # archive + possible new Full objects + Portable exclusion-boundary objects.
+    # Portable has no second staging ZIP. This estimate is informational only;
+    # deletion is driven incrementally by actual bytes so it cannot over-prune.
     estimated_peak_additional = estimated_full_stage * 3
     warnings: List[str] = []
 
@@ -6337,7 +7386,7 @@ def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
     if limit_bytes > 0 and projected_peak > limit_bytes:
         warnings.append(
             f"The conservative pre-deduplication peak is about {human_bytes(projected_peak)} "
-            f"including persistent data and temporary staging, above the "
+            f"including persistent data, one staging archive, and object writes, above the "
             f"{human_bytes(limit_bytes)} cap. Aegis will measure actual writes and remove the "
             "oldest backups only as needed; it will cancel if the protected new restore points cannot fit."
         )
@@ -6446,6 +7495,7 @@ def estimated_backup_stream_bytes(settings: Settings, kind: str) -> int:
     return max(1, int(root_used or 1))
 
 
+
 def capture_backup_kind(
     settings: Settings,
     run_id: str,
@@ -6457,108 +7507,171 @@ def capture_backup_kind(
     protected_snapshot_ids: Optional[Set[str]] = None,
     source_stage: Optional[StagedArchive] = None,
     retain_stage: bool = False,
+    progress_base: Optional[float] = None,
+    progress_span: Optional[float] = None,
 ) -> Tuple[str, Optional[StagedArchive]]:
-    label = kind_label(kind)
-    span = 88.0 / max(1, total_kinds)
-    base = 3.0 + kind_index * span
-    stage_end = base + span * 0.50
-    verify_end = base + span * 0.65
-    process_end = base + span * 0.90
-    final_progress = min(91.0, base + span - 1.0)
+    """Capture one standalone backup kind while preserving the existing format."""
 
-    set_job_progress(base, f"Collecting metadata for {label}",
-                     detail="Reading package lists, OS metadata, disk layout, and restore hints.", phase=kind)
+    label = kind_label(kind)
+    default_span = 88.0 / max(1, total_kinds)
+    span = float(progress_span) if progress_span is not None else default_span
+    base = (
+        float(progress_base)
+        if progress_base is not None
+        else 3.0 + kind_index * default_span
+    )
+    stage_end = base + span * 0.45
+    process_end = base + span * 0.84
+    final_progress = min(
+        99.0 if progress_base is not None else 91.0,
+        base + span - 0.5,
+    )
+
+    set_job_progress(
+        base,
+        f"Collecting metadata for {label}",
+        detail="Reading package lists, OS metadata, disk layout, and restore hints.",
+        phase=kind,
+    )
     log_line(f"{label}: collecting restore metadata.")
     metadata = collect_snapshot_metadata(kind)
     includes = build_include_paths(settings, kind)
     excludes = build_exclude_paths(settings, kind)
-    estimate = source_stage.total_bytes if source_stage else estimated_backup_stream_bytes(settings, kind)
+    estimate = (
+        source_stage.total_bytes
+        if source_stage is not None
+        else estimated_backup_stream_bytes(settings, kind)
+    )
     stage: Optional[StagedArchive] = None
     published = False
 
     def stage_progress(done: int, total: int, detail: str) -> None:
         fraction = min(1.0, done / max(1, total))
-        set_job_progress(base + 1.0 + fraction * max(1.0, stage_end - base - 1.0),
-                         f"Staging {label} - {human_bytes(done)} copied",
-                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
-
-    def verify_progress(done: int, total: int, detail: str) -> None:
-        fraction = min(1.0, done / max(1, total))
-        set_job_progress(stage_end + fraction * max(1.0, verify_end - stage_end),
-                         f"Verifying staged {label} - {human_bytes(done)} checked",
-                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
+        set_job_progress(
+            base + 1.0 + fraction * max(1.0, stage_end - base - 1.0),
+            f"Staging {label} - {human_bytes(done)} copied",
+            bytes_done=done,
+            bytes_total=total,
+            detail=detail,
+            phase=kind,
+        )
 
     def process_progress(done: int, total: int, detail: str) -> None:
         fraction = min(1.0, done / max(1, total))
-        set_job_progress(verify_end + fraction * max(1.0, process_end - verify_end),
-                         f"Processing {label} - {human_bytes(done)} committed",
-                         bytes_done=done, bytes_total=total, detail=detail, phase=kind)
+        set_job_progress(
+            stage_end + fraction * max(1.0, process_end - stage_end),
+            f"Verifying and processing {label} - {human_bytes(done)} committed",
+            bytes_done=done,
+            bytes_total=max(total, estimate),
+            detail=detail,
+            phase=kind,
+        )
 
     try:
         repo = Path(settings.repo_path)
+
         if source_stage is None:
-            log_line(f"{label}: starting the single live source capture; estimated stream {human_bytes(estimate)}.")
+            log_line(
+                f"{label}: starting one live source capture; estimated stream "
+                f"{human_bytes(estimate)}."
+            )
             initial_reservation = min(
                 STAGING_MEMBER_BYTES,
                 max(BUFFER_SIZE, estimate),
             )
             prune_repo_for_incoming_bytes(
-                settings, repo, initial_reservation,
+                settings,
+                repo,
+                initial_reservation,
                 protected_snapshot_ids=protected_snapshot_ids,
                 temporary_bytes=get_staging_size_bytes(repo),
             )
-            set_job_progress(base + 1.0, f"Staging {label}", bytes_done=0, bytes_total=estimate,
-                             detail="Copying the exact tar restore stream to an uncompressed ZIP on the backup drive.",
-                             phase=kind)
+            set_job_progress(
+                base + 1.0,
+                f"Staging {label}",
+                bytes_done=0,
+                bytes_total=estimate,
+                detail=(
+                    "Copying the exact tar restore stream to an uncompressed "
+                    "ZIP on the backup drive."
+                ),
+                phase=kind,
+            )
             stage = create_staged_backup_archive(
-                settings, run_id, kind, includes, excludes, estimate,
+                settings,
+                run_id,
+                kind,
+                includes,
+                excludes,
+                estimate,
                 progress_callback=stage_progress,
                 protected_snapshot_ids=protected_snapshot_ids,
             )
         else:
-            log_line(f"{label}: deriving from the verified Full Recovery staging ZIP; the live source will not be scanned again.")
+            log_line(
+                f"{label}: deriving from the verified Full Recovery staging ZIP; "
+                "the live source will not be scanned again."
+            )
             prune_repo_for_incoming_bytes(
-                settings, repo, source_stage.total_bytes,
+                settings,
+                repo,
+                source_stage.total_bytes,
                 protected_snapshot_ids=protected_snapshot_ids,
                 temporary_bytes=get_staging_size_bytes(repo),
             )
-            set_job_progress(base + 1.0, f"Deriving {label} from Full Recovery staging",
-                             bytes_done=0, bytes_total=source_stage.total_bytes,
-                             detail="Filtering complete tar records with the existing Portable include/exclude rules.",
-                             phase=kind)
             stage = derive_staged_backup_archive(
-                settings, run_id, kind, source_stage, includes, excludes,
+                settings,
+                run_id,
+                kind,
+                source_stage,
+                includes,
+                excludes,
                 progress_callback=stage_progress,
             )
 
-        log_line(f"{label}: staged {human_bytes(stage.total_bytes)} in {len(stage.members)} uncompressed ZIP member(s).")
-        set_job_progress(stage_end, f"Verifying staged {label}", bytes_done=0, bytes_total=stage.total_bytes,
-                         detail="Checking ZIP CRCs, member hashes, full-stream hash, and tar readability.", phase=kind)
-        verify_staged_backup_archive(stage, progress_callback=verify_progress)
-        log_line(f"{label}: staging verification passed for {human_bytes(stage.total_bytes)}.")
-
-        if source_stage is not None:
-            remove_staged_archive(source_stage)
-            log_line("Portable staging is verified; released the Full Recovery staging ZIP before Portable object processing.")
-
+        log_line(
+            f"{label}: staged {human_bytes(stage.total_bytes)} in "
+            f"{len(stage.members)} uncompressed ZIP member(s)."
+        )
         workers, _ = backup_worker_plan(chunk_size)
-        log_line(f"{label}: processing with up to {workers} worker thread(s), {human_bytes(chunk_size)} repository chunks.")
-        set_job_progress(verify_end, f"Parallel processing {label}", bytes_done=0, bytes_total=stage.total_bytes,
-                         detail=f"Hashing, deduplicating, and encrypting with up to {workers} worker thread(s).", phase=kind)
-        refs, total_bytes, actual_workers = process_staged_backup_archive(
-            settings, stage, chunk_size, machine_key_value,
+        set_job_progress(
+            stage_end,
+            f"Verifying and processing {label}",
+            bytes_done=0,
+            bytes_total=stage.total_bytes,
+            detail=(
+                "In one reread: checking ZIP CRCs, member hashes, full-stream "
+                f"hash, tar structure, deduplication, and encryption with up to "
+                f"{workers} worker thread(s)."
+            ),
+            phase=kind,
+        )
+        log_line(
+            f"{label}: one-pass staging verification and object processing started "
+            f"with up to {workers} worker thread(s), {human_bytes(chunk_size)} chunks."
+        )
+
+        processed = process_staged_backup_archive(
+            settings,
+            stage,
+            chunk_size,
+            machine_key_value,
             protected_snapshot_ids=protected_snapshot_ids,
             progress_callback=process_progress,
         )
-        if total_bytes != stage.total_bytes:
-            raise AegisError(
-                f"The processed {label} stream is {human_bytes(total_bytes)}, "
-                f"but the verified staging stream is {human_bytes(stage.total_bytes)}."
-            )
 
+        if source_stage is not None:
+            remove_staged_archive(source_stage)
+            source_stage = None
+
+        refs = processed.full_refs
+        total_bytes = processed.full_bytes
         manifest = SnapshotManifest(
             version=1,
-            id=f"{utc_tag()}-{short_machine(settings.machine_id)}-{'full' if kind == 'full_recovery' else 'portable'}",
+            id=(
+                f"{utc_tag()}-{short_machine(settings.machine_id)}-"
+                f"{'full' if kind == 'full_recovery' else 'portable'}"
+            ),
             run_id=run_id,
             machine_id=settings.machine_id,
             machine_label=settings.machine_label,
@@ -6570,35 +7683,419 @@ def capture_backup_kind(
             chunk_size=chunk_size,
             archive_refs=refs,
             archive_plaintext_bytes=total_bytes,
-            archive_sha256=stage.sha256,
+            archive_sha256=processed.full_sha256,
             metadata=metadata,
             notes=list(metadata.notes),
         )
 
-        log_line(f"{label}: rereading and decrypting every final object before publishing the manifest.")
-        set_job_progress(process_end, f"Verifying final encrypted restore stream for {label}",
-                         bytes_done=0, bytes_total=total_bytes,
-                         detail="Checking every object length and reconstructing the complete archive digest.", phase=kind)
-        verify_manifest_restore_stream(Path(settings.repo_path), manifest, machine_key_value, validate_tar_headers=False)
+        log_line(
+            f"{label}: rereading and decrypting every final object before "
+            "publishing the manifest."
+        )
+        set_job_progress(
+            process_end,
+            f"Verifying final encrypted restore stream for {label}",
+            bytes_done=0,
+            bytes_total=total_bytes,
+            detail=(
+                "Checking every object, reconstructing the complete archive "
+                "digest, and validating the final tar stream."
+            ),
+            phase=kind,
+        )
+        verify_manifest_restore_stream(
+            repo,
+            manifest,
+            machine_key_value,
+            validate_tar_headers=True,
+        )
         log_line(f"{label}: final encrypted restore-stream verification passed.")
 
-        set_job_progress(final_progress, f"Writing manifest for {label}",
-                         bytes_done=total_bytes, bytes_total=total_bytes,
-                         detail=f"Publishing the verified manifest after processing with {actual_workers} worker thread(s).",
-                         phase=kind)
+        set_job_progress(
+            final_progress,
+            f"Writing manifest for {label}",
+            bytes_done=total_bytes,
+            bytes_total=total_bytes,
+            detail=(
+                f"Publishing the verified manifest after processing with "
+                f"{processed.workers} worker thread(s)."
+            ),
+            phase=kind,
+        )
         write_manifest(settings, manifest, protected_snapshot_ids)
-        log_line(f"Created {label}: {manifest.id} ({human_bytes(total_bytes)}, {len(refs)} chunk refs).")
+        log_line(
+            f"Created {label}: {manifest.id} "
+            f"({human_bytes(total_bytes)}, {len(refs)} chunk refs)."
+        )
+
         if settings.notifications_enabled:
             send_desktop_notification(
                 f"{label} complete",
                 f"{human_bytes(total_bytes)} was verified and is ready to restore.",
                 urgency="low",
             )
+
         published = True
         return manifest.id, stage if retain_stage else None
+
     finally:
         if not retain_stage or not published:
             remove_staged_archive(stage)
+
+def capture_full_and_portable(
+    settings: Settings,
+    run_id: str,
+    chunk_size: int,
+    machine_key_value: Optional[bytes],
+    protected_snapshot_ids: Optional[Set[str]] = None,
+) -> List[str]:
+    """
+    Create Full and Portable from one immutable capture and one processing pass.
+
+    Portable directly reuses clean Full chunks and stores only localized
+    exclusion-boundary fragments; it requires no second staging ZIP.
+    """
+
+    protected_snapshot_ids = set(protected_snapshot_ids or set())
+    repo = Path(settings.repo_path)
+    full_kind = "full_recovery"
+    portable_kind = "portable_state"
+    full_label = kind_label(full_kind)
+    portable_label = kind_label(portable_kind)
+
+    set_job_progress(
+        3.0,
+        "Collecting Full and Portable restore metadata",
+        detail="Reading package lists, OS metadata, disk layout, and restore hints once per restore type.",
+        phase="metadata",
+    )
+    log_line(f"{full_label}: collecting restore metadata.")
+    full_metadata = collect_snapshot_metadata(full_kind)
+    log_line(f"{portable_label}: collecting restore metadata.")
+    portable_metadata = collect_snapshot_metadata(portable_kind)
+
+    full_includes = build_include_paths(settings, full_kind)
+    full_excludes = build_exclude_paths(settings, full_kind)
+    portable_includes = build_include_paths(settings, portable_kind)
+    portable_excludes = build_exclude_paths(settings, portable_kind)
+    estimate = estimated_backup_stream_bytes(settings, full_kind)
+    stage: Optional[StagedArchive] = None
+
+    def stage_progress(done: int, total: int, detail: str) -> None:
+        fraction = min(1.0, done / max(1, total))
+        set_job_progress(
+            6.0 + fraction * 30.0,
+            f"Staging {full_label} - {human_bytes(done)} copied",
+            bytes_done=done,
+            bytes_total=total,
+            detail=detail,
+            phase=full_kind,
+        )
+
+    def process_progress(done: int, total: int, detail: str) -> None:
+        fraction = min(1.0, done / max(1, total))
+        set_job_progress(
+            36.0 + fraction * 43.0,
+            f"Verifying and processing Full + Portable - {human_bytes(done)} committed",
+            bytes_done=done,
+            bytes_total=max(total, estimate),
+            detail=detail,
+            phase="full_and_portable",
+        )
+
+    try:
+        initial_reservation = min(
+            STAGING_MEMBER_BYTES,
+            max(BUFFER_SIZE, estimate),
+        )
+        prune_repo_for_incoming_bytes(
+            settings,
+            repo,
+            initial_reservation,
+            protected_snapshot_ids=protected_snapshot_ids,
+            temporary_bytes=get_staging_size_bytes(repo),
+        )
+
+        set_job_progress(
+            6.0,
+            f"Staging {full_label}",
+            bytes_done=0,
+            bytes_total=estimate,
+            detail=(
+                "Performing the only live filesystem capture. The exact tar "
+                "restore stream is being written to an uncompressed ZIP."
+            ),
+            phase=full_kind,
+        )
+        log_line(
+            f"{full_label}: starting the single live source capture; estimated "
+            f"stream {human_bytes(estimate)}."
+        )
+
+        stage = create_staged_backup_archive(
+            settings,
+            run_id,
+            full_kind,
+            full_includes,
+            full_excludes,
+            estimate,
+            progress_callback=stage_progress,
+            protected_snapshot_ids=protected_snapshot_ids,
+        )
+
+        log_line(
+            f"{full_label}: staged {human_bytes(stage.total_bytes)} in "
+            f"{len(stage.members)} uncompressed ZIP member(s)."
+        )
+
+        workers, _ = backup_worker_plan(chunk_size)
+        set_job_progress(
+            36.0,
+            "Verifying staging and building Full + Portable",
+            bytes_done=0,
+            bytes_total=stage.total_bytes,
+            detail=(
+                "One reread is checking ZIP CRCs, member and stream hashes, both "
+                "tar structures, deduplicating, and encrypting. Portable will "
+                "reuse clean Full chunks and localize exclusion-boundary data."
+            ),
+            phase="full_and_portable",
+        )
+        log_line(
+            f"Full + Portable: one-pass staging verification and object processing "
+            f"started with up to {workers} worker thread(s), "
+            f"{human_bytes(chunk_size)} chunks."
+        )
+
+        processed = process_staged_backup_archive(
+            settings,
+            stage,
+            chunk_size,
+            machine_key_value,
+            protected_snapshot_ids=protected_snapshot_ids,
+            progress_callback=process_progress,
+            portable_includes=portable_includes,
+            portable_excludes=portable_excludes,
+        )
+
+        portable_shared_refs = sum(
+            1 for index in processed.portable_parent_indexes if index >= 0
+        )
+        portable_unique_refs = len(processed.portable_refs) - portable_shared_refs
+
+        if processed.portable_safe:
+            log_line(
+                f"{portable_label}: retained {processed.kept_entries} tar entries, "
+                f"excluded {processed.skipped_entries}, reused {portable_shared_refs} "
+                f"Full object refs, and required {portable_unique_refs} localized "
+                f"boundary object(s) totaling "
+                f"{human_bytes(processed.portable_unique_bytes)}."
+            )
+        else:
+            log_line(
+                f"{portable_label}: the one-capture filter found a retained hard "
+                f"link whose data target is excluded ({processed.portable_unsafe_reason}). "
+                "Aegis will preserve the verified Full backup and automatically "
+                "fall back to a direct Portable capture so the Portable restore "
+                "stream remains valid."
+            )
+
+        stamp = utc_tag()
+        machine_short = short_machine(settings.machine_id)
+        full_manifest = SnapshotManifest(
+            version=1,
+            id=f"{stamp}-{machine_short}-full",
+            run_id=run_id,
+            machine_id=settings.machine_id,
+            machine_label=settings.machine_label,
+            hostname=hostname(),
+            created_at=now_rfc3339(),
+            kind=full_kind,
+            source_paths=full_includes,
+            exclude_paths=full_excludes,
+            chunk_size=chunk_size,
+            archive_refs=processed.full_refs,
+            archive_plaintext_bytes=processed.full_bytes,
+            archive_sha256=processed.full_sha256,
+            metadata=full_metadata,
+            notes=list(full_metadata.notes),
+        )
+        portable_manifest = SnapshotManifest(
+            version=1,
+            id=f"{stamp}-{machine_short}-portable",
+            run_id=run_id,
+            machine_id=settings.machine_id,
+            machine_label=settings.machine_label,
+            hostname=hostname(),
+            created_at=now_rfc3339(),
+            kind=portable_kind,
+            source_paths=portable_includes,
+            exclude_paths=portable_excludes,
+            chunk_size=chunk_size,
+            archive_refs=processed.portable_refs,
+            archive_plaintext_bytes=processed.portable_bytes,
+            archive_sha256=processed.portable_sha256,
+            metadata=portable_metadata,
+            notes=list(portable_metadata.notes),
+        )
+
+        if sum(ref.plain_len for ref in portable_manifest.archive_refs) != portable_manifest.archive_plaintext_bytes:
+            raise AegisError(
+                "Portable manifest refs do not total the derived Portable stream size."
+            )
+
+        if not processed.portable_safe:
+            set_job_progress(
+                79.0,
+                f"Verifying final encrypted restore stream for {full_label}",
+                bytes_done=0,
+                bytes_total=full_manifest.archive_plaintext_bytes,
+                detail=(
+                    "Rereading and decrypting every final Full object, rebuilding "
+                    "the archive digest, and validating the final tar stream."
+                ),
+                phase=full_kind,
+            )
+            verify_manifest_restore_stream(
+                repo,
+                full_manifest,
+                machine_key_value,
+                validate_tar_headers=True,
+            )
+            log_line(
+                f"{full_label}: final encrypted restore-stream verification passed."
+            )
+
+            write_manifest(
+                settings,
+                full_manifest,
+                protected_snapshot_ids=protected_snapshot_ids,
+            )
+            fallback_protected = set(protected_snapshot_ids)
+            fallback_protected.add(full_manifest.id)
+
+            log_line(
+                f"Created {full_label}: {full_manifest.id} "
+                f"({human_bytes(full_manifest.archive_plaintext_bytes)}, "
+                f"{len(full_manifest.archive_refs)} chunk refs)."
+            )
+            if settings.notifications_enabled:
+                send_desktop_notification(
+                    f"{full_label} complete",
+                    f"{human_bytes(full_manifest.archive_plaintext_bytes)} was verified and is ready to restore.",
+                    urgency="low",
+                )
+
+            # Free the large Full staging ZIP before the rare direct-Portable
+            # safety fallback. The published Full manifest and objects remain.
+            remove_staged_archive(stage)
+            stage = None
+
+            portable_id, _ = capture_backup_kind(
+                settings,
+                run_id,
+                portable_kind,
+                0,
+                1,
+                chunk_size,
+                machine_key_value,
+                protected_snapshot_ids=fallback_protected,
+                source_stage=None,
+                retain_stage=False,
+                progress_base=92.0,
+                progress_span=7.0,
+            )
+            return [full_manifest.id, portable_id]
+
+        set_job_progress(
+            79.0,
+            f"Verifying final encrypted restore stream for {full_label}",
+            bytes_done=0,
+            bytes_total=full_manifest.archive_plaintext_bytes,
+            detail=(
+                "Rereading and decrypting every final Full object, rebuilding the "
+                "complete archive digest, and validating the final tar stream."
+            ),
+            phase=full_kind,
+        )
+        log_line(
+            f"{full_label}: rereading and decrypting every final object before "
+            "publishing either manifest."
+        )
+        verify_reused_child_restore_streams(
+            repo,
+            full_manifest,
+            portable_manifest,
+            machine_key_value,
+            child_parent_indexes=processed.portable_parent_indexes,
+        )
+        log_line(
+            "Full Recovery and Portable Migration final encrypted restore-stream "
+            "verification passed in one shared object read."
+        )
+
+        # Shared Portable refs were reconstructed from the matching Full
+        # plaintext during final readback. Only localized exclusion-boundary
+        # objects were read separately, avoiding a second full Portable pass.
+        set_job_progress(
+            92.0,
+            "Publishing verified Full and Portable manifests",
+            bytes_done=processed.full_bytes,
+            bytes_total=processed.full_bytes,
+            detail=(
+                "Portable reused authenticated Full objects and verified only "
+                "its localized exclusion-boundary objects separately."
+            ),
+            phase="manifest",
+        )
+
+        write_manifest(
+            settings,
+            full_manifest,
+            protected_snapshot_ids=protected_snapshot_ids,
+        )
+        full_protected = set(protected_snapshot_ids)
+        full_protected.add(full_manifest.id)
+
+        log_line(
+            f"Created {full_label}: {full_manifest.id} "
+            f"({human_bytes(full_manifest.archive_plaintext_bytes)}, "
+            f"{len(full_manifest.archive_refs)} chunk refs)."
+        )
+        if settings.notifications_enabled:
+            send_desktop_notification(
+                f"{full_label} complete",
+                f"{human_bytes(full_manifest.archive_plaintext_bytes)} was verified and is ready to restore.",
+                urgency="low",
+            )
+
+        write_manifest(
+            settings,
+            portable_manifest,
+            protected_snapshot_ids=full_protected,
+        )
+        log_line(
+            f"Created {portable_label}: {portable_manifest.id} "
+            f"({human_bytes(portable_manifest.archive_plaintext_bytes)} logical, "
+            f"{portable_shared_refs} shared Full refs, {portable_unique_refs} "
+            f"boundary refs / {human_bytes(processed.portable_unique_bytes)} "
+            "incremental plaintext before encryption overhead)."
+        )
+        if settings.notifications_enabled:
+            send_desktop_notification(
+                f"{portable_label} complete",
+                (
+                    f"{human_bytes(portable_manifest.archive_plaintext_bytes)} logical "
+                    "restore stream is ready and reuses verified Full backup objects."
+                ),
+                urgency="low",
+            )
+
+        return [full_manifest.id, portable_manifest.id]
+
+    finally:
+        remove_staged_archive(stage)
+
 
 
 
@@ -6613,59 +8110,104 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
 
     created: List[str] = []
     chunk_size = max(1, int(settings.chunk_size_mib)) * 1024 * 1024
-    machine_key_value = read_local_machine_key(settings.machine_id) if settings.encryption_enabled else None
+    machine_key_value = (
+        read_local_machine_key(settings.machine_id)
+        if settings.encryption_enabled
+        else None
+    )
     kinds = backup_kinds_for_profile(profile)
-    full_stage: Optional[StagedArchive] = None
 
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
         repo = Path(settings.repo_path)
         cleanup_backup_staging(repo)
         assert_backup_storage_preflight(settings)
+
         usage = shutil.disk_usage(str(repo))
         workers, inflight = backup_worker_plan(chunk_size)
-        set_job_progress(1.0, "Starting backup", detail="Preparing repository and encryption state.", phase="start")
+        cached_repo_size = load_repo_size_cache(repo)
+        if settings.max_repo_size_gb > 0:
+            persistent_usage = get_repo_size_bytes(repo)
+        else:
+            persistent_usage = max(0, int(cached_repo_size or 0))
+
+        set_job_progress(
+            1.0,
+            "Starting backup",
+            detail="Preparing repository and encryption state.",
+            phase="start",
+        )
+
         estimated_stream = estimated_backup_stream_bytes(settings, "full_recovery")
         log_line(
-            f"Backup {run_id} started. Repository {repo}; persistent usage {human_bytes(get_repo_size_bytes(repo))}; "
-            f"free {human_bytes(int(usage.free))}; cap "
-            f"{human_bytes(repo_size_limit_bytes(settings)) if settings.max_repo_size_gb > 0 else 'unlimited'}; "
-            f"estimated Full stream {human_bytes(estimated_stream)}; conservative temporary/unique-data peak "
-            f"{human_bytes(estimated_stream * 3)} before deduplication; chunk target {human_bytes(chunk_size)}; "
-            f"worker plan {workers}/{inflight}."
+            f"Backup {run_id} started. Repository {repo}; persistent usage "
+            f"{human_bytes(persistent_usage)}; free {human_bytes(int(usage.free))}; "
+            f"cap {human_bytes(repo_size_limit_bytes(settings)) if settings.max_repo_size_gb > 0 else 'unlimited'}; "
+            f"estimated Full stream {human_bytes(estimated_stream)}; conservative "
+            f"worst-case stage/Full/boundary-object peak {human_bytes(estimated_stream * 3)} "
+            "(normally close to two streams before deduplication); Portable uses "
+            "shared Full objects and no second "
+            f"staging ZIP; chunk target {human_bytes(chunk_size)}; worker plan "
+            f"{workers}/{inflight}."
         )
+
         protected: Set[str] = set()
 
         if settings.max_repo_size_gb > 0:
-            set_job_progress(0.5, "Preparing repository size limit",
-                             detail="Pruning older backups if persistent data plus staging would exceed the cap.",
-                             phase="prune")
+            set_job_progress(
+                0.5,
+                "Preparing repository size limit",
+                detail=(
+                    "Pruning older backups if persistent data plus the single "
+                    "staging archive would exceed the cap."
+                ),
+                phase="prune",
+            )
             enforce_repo_size_limit(settings, already_locked=True)
 
         try:
-            for index, kind in enumerate(kinds):
-                if kind == "full_recovery":
-                    snapshot_id, full_stage = capture_backup_kind(
-                        settings, run_id, kind, index, len(kinds), chunk_size, machine_key_value,
-                        protected_snapshot_ids=protected, retain_stage=True,
-                    )
-                else:
+            if kinds == ["full_recovery", "portable_state"]:
+                created = capture_full_and_portable(
+                    settings,
+                    run_id,
+                    chunk_size,
+                    machine_key_value,
+                    protected_snapshot_ids=protected,
+                )
+                protected.update(created)
+            else:
+                for index, kind in enumerate(kinds):
                     snapshot_id, _ = capture_backup_kind(
-                        settings, run_id, kind, index, len(kinds), chunk_size, machine_key_value,
-                        protected_snapshot_ids=protected, source_stage=full_stage,
+                        settings,
+                        run_id,
+                        kind,
+                        index,
+                        len(kinds),
+                        chunk_size,
+                        machine_key_value,
+                        protected_snapshot_ids=protected,
                     )
-                    full_stage = None
-                created.append(snapshot_id)
-                protected.add(snapshot_id)
+                    created.append(snapshot_id)
+                    protected.add(snapshot_id)
 
             if settings.peers_enabled and settings.peers:
-                set_job_progress(93.0, "Syncing Constellation peers",
-                                 detail="Copying encrypted repository namespaces to configured targets.", phase="sync")
-                log_line("Backup snapshots complete; starting Constellation peer synchronization.")
+                set_job_progress(
+                    93.0,
+                    "Syncing Constellation peers",
+                    detail="Copying encrypted repository namespaces to configured targets.",
+                    phase="sync",
+                )
+                log_line(
+                    "Backup snapshots complete; starting Constellation peer synchronization."
+                )
                 sync_peers(settings, raise_on_error=False)
 
-            set_job_progress(96.0, "Checking repository size limits",
-                             detail="Pruning old snapshots if the final cap requires it.", phase="prune")
+            set_job_progress(
+                96.0,
+                "Checking repository size limits",
+                detail="Pruning old snapshots if the final cap requires it.",
+                phase="prune",
+            )
             enforce_repo_size_limit(
                 settings,
                 already_locked=True,
@@ -6677,15 +8219,27 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
             state.last_success_at = now_rfc3339()
             state.last_error = ""
             save_state(state)
-        finally:
-            remove_staged_archive(full_stage)
-            refresh_repo_size_cache(repo)
 
-    set_job_progress(100.0, "Backup complete",
-                     detail="Full Recovery and Portable Migration restore points are ready.", phase="complete")
+        finally:
+            # Repository size is dashboard metadata, not a restore-integrity
+            # requirement. Refresh it asynchronously so a completed backup is
+            # not held open by another full object-tree walk.
+            schedule_repo_size_cache_refresh(repo)
+
+    set_job_progress(
+        100.0,
+        "Backup complete",
+        detail=(
+            f"{len(created)} verified restore point(s) are ready. Full and Portable "
+            "share content-addressed object data."
+        ),
+        phase="complete",
+    )
+    cached_final_size = load_repo_size_cache(Path(settings.repo_path))
     log_line(
         f"Backup {run_id} completed with {len(created)} verified restore point(s). "
-        f"Persistent repository usage is {human_bytes(load_repo_size_cache(Path(settings.repo_path)) or 0)}."
+        f"Persistent repository usage cache is "
+        f"{human_bytes(cached_final_size or 0)} and is refreshing in the background."
     )
     return created
 
