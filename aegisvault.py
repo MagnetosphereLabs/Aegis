@@ -5727,6 +5727,20 @@ def _parse_pax_records(payload: bytes) -> Dict[str, str]:
     return records
 
 
+def _parse_pax_size(value: str, archive_offset: int) -> int:
+    text = str(value or "")
+    if not text or not text.isdigit():
+        raise AegisError(
+            f"Invalid PAX size value at archive offset {archive_offset}: {value!r}"
+        )
+    size = int(text, 10)
+    if size < 0:
+        raise AegisError(
+            f"Negative PAX size value at archive offset {archive_offset}: {value!r}"
+        )
+    return size
+
+
 def _pax_path(payload: bytes) -> str:
     records = _parse_pax_records(payload)
     return records.get("GNU.sparse.name") or records.get("path") or ""
@@ -5960,23 +5974,24 @@ def _stream_filtered_tar(
             ) from exc
 
         typeflag = header[156:157] or b"\0"
-        padded_size = ((stored_size + 511) // 512) * 512
-
-        if padded_size > max(0, source.stage.total_bytes - source.bytes_read):
-            raise AegisError(
-                f"Tar member at archive offset {header_offset} declares "
-                f"{human_bytes(padded_size)} beyond the remaining staged stream."
-            )
+        header_padded_size = ((stored_size + 511) // 512) * 512
 
         if typeflag in {b"x", b"g", b"L", b"K"}:
-            if padded_size > metadata_limit:
+            if header_padded_size > max(
+                0, source.stage.total_bytes - source.bytes_read
+            ):
+                raise AegisError(
+                    f"Tar metadata at archive offset {header_offset} declares "
+                    f"{human_bytes(header_padded_size)} beyond the remaining staged stream."
+                )
+            if header_padded_size > metadata_limit:
                 raise AegisError(
                     f"Tar metadata record at archive offset {header_offset} is "
-                    f"unreasonably large ({human_bytes(padded_size)})."
+                    f"unreasonably large ({human_bytes(header_padded_size)})."
                 )
 
-            payload = read_exact(source, padded_size)
-            if len(payload) != padded_size:
+            payload = read_exact(source, header_padded_size)
+            if len(payload) != header_padded_size:
                 raise AegisError(
                     "The tar stream ended inside a metadata record."
                 )
@@ -6004,6 +6019,26 @@ def _stream_filtered_tar(
 
         effective_pax = dict(global_pax)
         effective_pax.update(pending_pax)
+
+        # In PAX archives, the extended "size" keyword overrides the numeric
+        # size field in the following ustar header. GNU tar writes the raw
+        # header size as zero when a member is larger than the ustar octal
+        # field can represent. Ignoring this keyword makes the next payload
+        # block look like a tar header and desynchronizes the entire stream.
+        payload_size = stored_size
+        if "size" in effective_pax:
+            payload_size = _parse_pax_size(
+                effective_pax["size"],
+                header_offset,
+            )
+        padded_size = ((payload_size + 511) // 512) * 512
+
+        if padded_size > max(0, source.stage.total_bytes - source.bytes_read):
+            raise AegisError(
+                f"Tar member at archive offset {header_offset} declares "
+                f"{human_bytes(padded_size)} beyond the remaining staged stream."
+            )
+
         member_name = (
             effective_pax.get("GNU.sparse.name")
             or effective_pax.get("path")
@@ -7068,7 +7103,24 @@ def collect_snapshot_metadata(kind: str) -> SnapshotMetadata:
 
 
 def build_tar_backup_command(includes: List[str], excludes: List[str]) -> List[str]:
-    cmd = ["tar", "--xattrs", "--acls", "--numeric-owner", "--sparse", "--warning=no-file-changed", "--ignore-failed-read", "-cpf", "-", "-C", "/"]
+    # --xattrs already implies PAX, but state the archive contract explicitly.
+    # PAX sparse 1.0 keeps sparse metadata inside the member data stream and
+    # avoids historical GNU sparse-header variants.
+    cmd = [
+        "tar",
+        "--format=pax",
+        "--sparse",
+        "--sparse-version=1.0",
+        "--xattrs",
+        "--acls",
+        "--numeric-owner",
+        "--warning=no-file-changed",
+        "--ignore-failed-read",
+        "-cpf",
+        "-",
+        "-C",
+        "/",
+    ]
     for ex in excludes:
         cmd.append(f"--exclude={ex}")
     cmd.extend(includes or ["."])
