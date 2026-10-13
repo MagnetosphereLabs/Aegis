@@ -59,7 +59,7 @@ SECURE_TMP_DIR = Path("/dev/shm") if Path("/dev/shm").is_dir() else None
 BUNDLE_MAGIC = b"AGBND1"
 OBJECT_MAGIC = b"AGOBJ1"
 DEFAULT_REPO = "/var/backups/aegisvault"
-DEFAULT_CHUNK_MIB = 4
+DEFAULT_CHUNK_MIB = 16
 BUFFER_SIZE = 8 * 1024 * 1024
 STAGING_MEMBER_BYTES = 1024 * 1024 * 1024
 BACKUP_CPU_FRACTION = 0.75
@@ -3173,7 +3173,8 @@ def settings_from_dict(data: Dict[str, Any]) -> Settings:
             weekday=max(0, min(6, int(schedule_data.get("weekday", 0)))),
             month_day=max(1, min(28, int(schedule_data.get("month_day", 1)))),
         ),
-        chunk_size_mib=max(1, min(DEFAULT_CHUNK_MIB, int(data.get("chunk_size_mib", DEFAULT_CHUNK_MIB)))),
+        chunk_size_mib=(DEFAULT_CHUNK_MIB if int(data.get("chunk_size_mib", DEFAULT_CHUNK_MIB)) == 4
+                        else max(1, min(DEFAULT_CHUNK_MIB, int(data.get("chunk_size_mib", DEFAULT_CHUNK_MIB))))),
         io_yield_ms=0,
         max_repo_size_gb=int(data.get("max_repo_size_gb", 0)),
         apply_packages_on_portable_restore=bool(data.get("apply_packages_on_portable_restore", True)),
@@ -4640,21 +4641,27 @@ def list_snapshots(
         return []
 
     machines_root = repo / "machines"
-    if not machines_root.exists():
-        return []
-
     snapshots: List[Dict[str, Any]] = []
+    live_by_machine: Dict[str, Set[str]] = {}
+    unreadable_manifest = False
 
-    for manifest_file in sorted(machines_root.glob("*/snapshots/*.json")):
+    manifest_files = sorted(machines_root.glob("*/snapshots/*.json"))
+    manifest_stamp = snapshot_files_stamp(manifest_files)
+    for manifest_file in manifest_files:
         try:
             manifest = snapshot_from_dict(load_json(manifest_file))
         except Exception as exc:
             log_line(f"Skipping unreadable snapshot manifest {manifest_file}: {exc}")
+            unreadable_manifest = True
             continue
 
         if not manifest.id:
+            unreadable_manifest = True
             continue
+        if not manifest.archive_refs:
+            unreadable_manifest = True
 
+        live_by_machine.setdefault(manifest.machine_id, set()).update(ref.hash for ref in manifest.archive_refs)
         snapshots.append({
             "id": manifest.id,
             "run_id": manifest.run_id,
@@ -4670,6 +4677,9 @@ def list_snapshots(
             "archive_sha256": manifest.archive_sha256,
             "chunk_count": len(manifest.archive_refs),
         })
+
+    if not unreadable_manifest:
+        snapshots.extend(list_failed_backup_entries(settings, repo, live_by_machine, manifest_stamp))
 
     snapshots.sort(
         key=lambda item: (
@@ -6913,13 +6923,24 @@ class BackupWorkspace:
         self.path = Path(tempfile.mkdtemp(prefix="run-", dir=str(self.root)))
         os.chmod(self.path, 0o700)
         self.names: Set[str] = set()
+        self.run_id = run_id
+        self.repo_path = ""
+        self.machine = ""
+        self.started_at = now_rfc3339()
         self._record()
 
     def _record(self) -> None:
         save_json(self.path / ".aegis-run.json", {
             "magic": STAGING_MAGIC, "directory": self.path.name,
             "files": sorted(self.names),
+            "run_id": self.run_id, "repo_path": self.repo_path,
+            "machine_id": self.machine, "started_at": self.started_at,
         })
+
+    def set_context(self, settings: Settings) -> None:
+        self.repo_path = os.path.abspath(settings.repo_path)
+        self.machine = settings.machine_id
+        self._record()
 
     def file(self, name: str) -> Path:
         if not re.fullmatch(r"(?:raw|objects|compact)-[0-9]{6}\.zip(?:\.partial)?", name):
@@ -7000,7 +7021,8 @@ def _pack_root(repo: Path, machine: str) -> Path:
     return root
 
 
-def _pack_index_from_zip(path: Path, machine: str) -> Dict[str, Any]:
+def _pack_index_from_zip(path: Path, machine: str,
+                         validate_local_headers: bool = True) -> Dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise AegisError("Refusing an unexpected backup pack entry.")
     with zipfile.ZipFile(path) as archive:
@@ -7017,29 +7039,42 @@ def _pack_index_from_zip(path: Path, machine: str) -> Dict[str, Any]:
         if len(infos) != len(records) + 1 or len({item.filename for item in infos}) != len(infos):
             raise AegisError("Backup pack members do not match its index.")
         output = []
+        indexed_members = {"aegis-pack.json"}
         with path.open("rb") as handle:
             for record in records:
                 digest = record.get("hash", "")
                 encoded_sha = record.get("encoded_sha256", "")
                 if not re.fullmatch(r"[a-f0-9]{64}", digest) or not re.fullmatch(r"[a-f0-9]{64}", encoded_sha):
                     raise AegisError("Invalid backup pack object hash.")
+                member_name = f"objects/{digest}.obj"
+                if member_name in indexed_members:
+                    raise AegisError("Duplicate object in backup pack index.")
+                indexed_members.add(member_name)
                 info = archive.getinfo(f"objects/{digest}.obj")
                 if info.compress_type != zipfile.ZIP_STORED or info.flag_bits & 1:
                     raise AegisError("Backup object pack must be uncompressed.")
                 if info.file_size != int(record["encoded_len"]) or int(record["plain_len"]) <= 0:
                     raise AegisError("Invalid backup pack object length.")
-                handle.seek(info.header_offset)
-                header = handle.read(30)
-                if len(header) != 30 or header[:4] != b"PK\x03\x04":
-                    raise AegisError("Invalid backup pack local header.")
-                name_len, extra_len = struct.unpack_from("<HH", header, 26)
-                member_name = handle.read(name_len)
-                if member_name != info.filename.encode("utf-8"):
-                    raise AegisError("Backup pack local and central headers disagree.")
-                offset = info.header_offset + 30 + name_len + extra_len
+                if validate_local_headers:
+                    handle.seek(info.header_offset)
+                    header = handle.read(30)
+                    if len(header) != 30 or header[:4] != b"PK\x03\x04":
+                        raise AegisError("Invalid backup pack local header.")
+                    name_len, extra_len = struct.unpack_from("<HH", header, 26)
+                    member_name = handle.read(name_len)
+                    if member_name != info.filename.encode("utf-8"):
+                        raise AegisError("Backup pack local and central headers disagree.")
+                    offset = info.header_offset + 30 + name_len + extra_len
+                else:
+                    # Inventory-only callers never use these offsets to read
+                    # payloads. Avoid one physical HDD seek per object merely
+                    # to decide whether an abandoned pack is unreferenced.
+                    offset = info.header_offset + 30
                 if offset + info.file_size > archive.start_dir:
                     raise AegisError("Backup object extends outside the pack data.")
                 output.append(dict(record, offset=offset))
+        if indexed_members != {info.filename for info in infos}:
+            raise AegisError("Backup pack contains members missing from its index.")
     return {"magic": PACK_MAGIC, "machine_id": machine, "pack": path.name,
             "objects": output, "pack_size": path.stat().st_size}
 
@@ -7161,22 +7196,70 @@ def report_pack_progress(stage: str, done: int, total: int, started: float) -> N
             RUNTIME.current_job.rate_bps = done / max(.001, time.monotonic() - started)
 
 
-def _sequential_sha256(path: Path, progress_callback=None) -> str:
+BACKUP_READ_RETRY_DELAYS = (1.0, 2.0, 4.0)
+BACKUP_PACK_RETRY_DELAYS = (2.0, 5.0)
+BACKUP_RETRY_ERRNOS = frozenset({errno.EIO, errno.EINTR, errno.EAGAIN,
+                                errno.ETIMEDOUT, errno.ESTALE, errno.EBUSY})
+
+
+class BackupPackVerificationError(AegisError):
+    """A destination copy may be repaired from the verified SSD original."""
+
+
+def _backup_retry_wait(action: str, exc: Exception, retry: int, delay: float) -> None:
+    message = f"{action}; retry {retry} in {delay:g}s: {exc}"
+    log_line(message)
+    update_stage(message)
+    time.sleep(delay)
+
+
+def _sequential_sha256(path: Path, progress_callback=None,
+                       read_retry_delays=(), retry_guard=None) -> str:
     hasher = hashlib.sha256()
-    done, last_report = 0, 0.0
-    total = path.stat().st_size
-    with path.open("rb") as handle:
+    done, last_report, retries = 0, 0.0, 0
+    needs_seek = False
+    # Unbuffered reads make the last successfully hashed offset explicit. A
+    # failed read never advances the digest; seek there before trying again.
+    with path.open("rb", buffering=0) as handle:
+        info = os.fstat(handle.fileno())
+        identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        total = info.st_size
         if hasattr(os, "posix_fadvise"):
             try:
                 os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
             except OSError:
                 pass  # An advisory optimization, not an integrity requirement.
-        for block in iter(lambda: handle.read(BUFFER_SIZE), b""):
+        while True:
+            try:
+                if needs_seek:
+                    if retry_guard is not None:
+                        retry_guard()
+                    info = os.fstat(handle.fileno())
+                    if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
+                        raise BackupPackVerificationError("Destination ZIP changed during verification.")
+                    handle.seek(done)
+                block = handle.read(BUFFER_SIZE)
+                needs_seek = False
+            except OSError as exc:
+                if exc.errno not in BACKUP_RETRY_ERRNOS or retries >= len(read_retry_delays):
+                    raise
+                _backup_retry_wait(f"Resuming ZIP verification at {human_bytes(done)}",
+                                   exc, retries + 1, read_retry_delays[retries])
+                retries += 1
+                needs_seek = True
+                continue
+            if not block:
+                break
             hasher.update(block)
             done += len(block)
             if progress_callback and time.monotonic() - last_report >= .35:
                 progress_callback(done, total)
                 last_report = time.monotonic()
+        if done != total:
+            raise BackupPackVerificationError("Destination ZIP was truncated during verification.")
+        info = os.fstat(handle.fileno())
+        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
+            raise BackupPackVerificationError("Destination ZIP changed during verification.")
     return hasher.hexdigest()
 
 
@@ -7194,63 +7277,115 @@ def publish_verified_pack(settings: Settings, source: Path, machine: str,
     digest = expected_sha256 or _sequential_sha256(source)
     root = _pack_root(repo, machine)
     root.mkdir(parents=True, exist_ok=True)
+    root_info = root.stat()
+    root_identity = (root_info.st_dev, root_info.st_ino)
     destination = root / f"pack-{digest}.zip"
-    fd, tmp_name = tempfile.mkstemp(prefix=".pack-", suffix=".partial", dir=str(root))
-    partial = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as target:
-            if allow_prune:
-                prune_repo_for_incoming_bytes(settings, repo, source.stat().st_size,
-                                             protected_snapshot_ids=protected_snapshot_ids,
-                                             protected_hashes=protected_hashes, temporary_bytes=0)
-            elif shutil.disk_usage(str(repo)).free < source.stat().st_size + BACKUP_PREFLIGHT_MIN_FREE_BYTES:
-                raise AegisError("Insufficient repository space for safe pack compaction.")
-            copied_hash = hashlib.sha256()
-            copied_bytes, last_report = 0, 0.0
-            started = time.monotonic()
-            with source.open("rb") as origin:
-                for block in iter(lambda: origin.read(BUFFER_SIZE), b""):
-                    copied_hash.update(block)
-                    if target.write(block) != len(block):
-                        raise AegisError("Incomplete backup pack write.")
-                    copied_bytes += len(block)
-                    if time.monotonic() - last_report >= .35:
-                        report_pack_progress("Copying finalized backup ZIP", copied_bytes,
-                                             source.stat().st_size, started)
-                        last_report = time.monotonic()
-            target.flush()
-            os.fsync(target.fileno())
-            if copied_hash.hexdigest() != digest:
-                raise AegisError("SSD backup pack changed during transfer.")
-            if hasattr(os, "posix_fadvise"):
-                # Best effort to avoid verifying only the recently written cache.
-                try:
-                    os.posix_fadvise(target.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                except OSError:
-                    pass
-        started = time.monotonic()
-        if repo.stat().st_dev != repo_device:
-            raise AegisError("The backup drive changed during transfer.")
-        if partial.stat().st_size != source.stat().st_size or _sequential_sha256(partial,
-                lambda done, total: report_pack_progress("Verifying destination ZIP", done, total, started)) != digest:
-            raise AegisError("Destination backup ZIP failed its SHA-256 transfer check.")
-        os.chmod(partial, 0o600)
-        os.replace(partial, destination)
-        _fsync_directory(root)
-        output_index = dict(index, pack=destination.name, pack_size=destination.stat().st_size)
-        save_json(destination.with_suffix(".json"), output_index)
-        _fsync_directory(root)
-        repo_pack_store(repo, machine).refresh(force=True)
-        log_line(f"Verified destination ZIP {destination.name}: {human_bytes(destination.stat().st_size)}.")
-        return destination
-    finally:
-        # Never follow a disappeared mount onto a different filesystem to clean
-        # up a path that now belongs to that other filesystem.
+    published_identity = None
+
+    def guard_destination() -> None:
+        ensure_repo_path_ready(settings.repo_path)
+        info = root.lstat()
+        if (repo.stat().st_dev != repo_device or stat.S_ISLNK(info.st_mode)
+                or (info.st_dev, info.st_ino) != root_identity):
+            raise AegisError("The backup drive or pack directory changed during transfer; refusing to retry there.")
+
+    for attempt in range(len(BACKUP_PACK_RETRY_DELAYS) + 1):
+        partial, partial_identity, copy_verified = None, None, False
         try:
-            if root.stat().st_dev == repo_device:
-                partial.unlink(missing_ok=True)
-        except FileNotFoundError:
-            pass
+            guard_destination()
+            if published_identity is None:
+                source_size = source.stat().st_size
+                fd, tmp_name = tempfile.mkstemp(prefix=".pack-", suffix=".partial", dir=str(root))
+                partial = Path(tmp_name)
+                info = os.fstat(fd)
+                partial_identity = (info.st_dev, info.st_ino, source_size)
+                with os.fdopen(fd, "wb") as target:
+                    if allow_prune:
+                        prune_repo_for_incoming_bytes(settings, repo, source.stat().st_size,
+                                                     protected_snapshot_ids=protected_snapshot_ids,
+                                                     protected_hashes=protected_hashes, temporary_bytes=0)
+                    elif shutil.disk_usage(str(repo)).free < source.stat().st_size + BACKUP_PREFLIGHT_MIN_FREE_BYTES:
+                        raise AegisError("Insufficient repository space for safe pack compaction.")
+                    copied_hash = hashlib.sha256()
+                    copied_bytes, last_report = 0, 0.0
+                    started = time.monotonic()
+                    with source.open("rb") as origin:
+                        for block in iter(lambda: origin.read(BUFFER_SIZE), b""):
+                            if target.write(block) != len(block):
+                                raise OSError(errno.EIO, "Incomplete backup pack write")
+                            copied_hash.update(block)
+                            copied_bytes += len(block)
+                            if time.monotonic() - last_report >= .35:
+                                report_pack_progress("Copying finalized backup ZIP", copied_bytes,
+                                                     source.stat().st_size, started)
+                                last_report = time.monotonic()
+                    target.flush()
+                    os.fsync(target.fileno())
+                    if copied_hash.hexdigest() != digest:
+                        raise AegisError("SSD backup pack changed during transfer.")
+                    if hasattr(os, "posix_fadvise"):
+                        # Best effort to avoid verifying only recently written cache.
+                        try:
+                            os.posix_fadvise(target.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                        except OSError:
+                            pass
+                guard_destination()
+                started = time.monotonic()
+                if partial.stat().st_size != source.stat().st_size or _sequential_sha256(partial,
+                        lambda done, total: report_pack_progress("Verifying destination ZIP", done, total, started),
+                        read_retry_delays=BACKUP_READ_RETRY_DELAYS, retry_guard=guard_destination) != digest:
+                    raise BackupPackVerificationError("Destination backup ZIP failed its SHA-256 transfer check.")
+                copy_verified = True
+                guard_destination()
+                os.chmod(partial, 0o600)
+                os.replace(partial, destination)
+                published_identity = partial_identity
+
+            # Metadata retries keep the already verified ZIP in place. Confirm
+            # its identity and repeat durability/index operations, not capture.
+            guard_destination()
+            info = destination.lstat()
+            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size) != published_identity:
+                raise AegisError("The verified destination ZIP changed before publication completed.")
+            _fsync_path(destination)
+            _fsync_directory(root)
+            output_index = dict(index, pack=destination.name, pack_size=info.st_size)
+            save_json(destination.with_suffix(".json"), output_index)
+            _fsync_directory(root)
+            repo_pack_store(repo, machine).refresh(force=True)
+            log_line(f"Verified destination ZIP {destination.name}: {human_bytes(info.st_size)}.")
+            return destination
+        except (OSError, BackupPackVerificationError) as exc:
+            # An interrupted rename can have succeeded. Only the exact inode
+            # whose bytes passed verification may be used to complete it.
+            if copy_verified and published_identity is None and partial_identity is not None:
+                try:
+                    guard_destination()
+                    info = destination.lstat()
+                    if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino, info.st_size) == partial_identity:
+                        published_identity = partial_identity
+                except (OSError, AegisError):
+                    pass
+            retryable = isinstance(exc, BackupPackVerificationError) or exc.errno in BACKUP_RETRY_ERRNOS
+            if not retryable or attempt >= len(BACKUP_PACK_RETRY_DELAYS):
+                log_line(f"Backup ZIP could not be completed: {exc}. Its SSD original and previously verified packs are retained.")
+                raise
+            action = ("Completing verified ZIP publication" if published_identity is not None
+                      else "Retrying this backup ZIP from its verified SSD copy; completed packs are preserved")
+            _backup_retry_wait(action, exc, attempt + 1, BACKUP_PACK_RETRY_DELAYS[attempt])
+        finally:
+            # Remove only the temporary inode created by this attempt, and
+            # never follow a replaced directory or disappeared mount.
+            if partial is not None:
+                try:
+                    guard_destination()
+                    info = partial.lstat()
+                    if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == partial_identity[:2]:
+                        partial.unlink()
+                except FileNotFoundError:
+                    pass
+                except (OSError, AegisError) as exc:
+                    log_line(f"Could not clean this transfer's temporary ZIP safely: {exc}")
 
 
 class HashingZipSink:
@@ -7522,6 +7657,7 @@ def process_rolling_backup_archive(settings: Settings, run_id: str,
                                    portable_includes=None, portable_excludes=None,
                                    capture_progress_callback=None) -> ProcessedBackupStreams:
     workspace = BackupWorkspace(run_id)
+    workspace.set_context(settings)
     processor = writer = source = None
     completed = False
     workers, max_inflight = backup_worker_plan(chunk_size)
@@ -7601,12 +7737,15 @@ def unused_snapshot_id(repo: Path, machine: str, candidate: str) -> str:
 
 
 def prune_packed_objects(settings: Settings, repo: Path, machine: str,
-                         live_hashes: Set[str], candidate_hashes: Set[str]) -> int:
+                         live_hashes: Set[str], candidate_hashes: Set[str],
+                         only_pack_names: Optional[Set[str]] = None) -> int:
     """Reclaim only Aegis pack objects not referenced by retained snapshots."""
     root = _pack_root(repo, machine)
     removed = 0
     for path in list(sorted(root.glob("pack-*.zip"))):
-        index = _pack_index_from_zip(path, machine)
+        if only_pack_names is not None and path.name not in only_pack_names:
+            continue
+        index = _pack_index_from_zip(path, machine, validate_local_headers=only_pack_names is None)
         records = index["objects"]
         # Do not collect unpublished objects belonging to an in-progress backup.
         keep = [record for record in records if record["hash"] in live_hashes
@@ -7647,6 +7786,160 @@ def prune_packed_objects(settings: Settings, repo: Path, machine: str,
         removed += len(records) - len(keep)
         repo_pack_store(repo, machine).refresh(force=True)
     return removed
+
+
+def snapshot_files_stamp(files: List[Path]):
+    try:
+        output = []
+        for path in files:
+            info = path.stat()
+            output.append((str(path), info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+        return tuple(output)
+    except OSError:
+        return None
+
+
+def list_failed_backup_entries(settings: Settings, repo: Path,
+                              live_by_machine: Dict[str, Set[str]], manifest_stamp) -> List[Dict[str, Any]]:
+    """Expose abandoned data without mistaking a live capture for a failure."""
+    import fcntl
+
+    entries = []
+    try:
+        fd = os.open(str(LOCK_PATH), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    except OSError:
+        return entries
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return entries
+        # A backup could have published a manifest after the initial listing.
+        # Defer detection to the next refresh rather than label its data failed.
+        if manifest_stamp is None or manifest_stamp != snapshot_files_stamp(
+                sorted((repo / "machines").glob("*/snapshots/*.json"))):
+            return entries
+        for machine_root in sorted((repo / "objects").glob("*")):
+            machine = machine_root.name
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", machine) or machine_root.is_symlink():
+                continue
+            try:
+                store = repo_pack_store(repo, machine)
+                store.refresh()
+                by_pack: Dict[Path, List[Dict[str, Any]]] = {}
+                for digest, (path, record) in store.locations.items():
+                    if digest not in live_by_machine.get(machine, set()):
+                        by_pack.setdefault(path, []).append(record)
+                for path, records in by_pack.items():
+                    entries.append({
+                        "id": f"failed-pack-{machine}-{path.stem[5:]}",
+                        "run_id": "", "machine_id": machine,
+                        "machine_label": settings.machine_label if machine == settings.machine_id else short_machine(machine),
+                        "hostname": "", "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(path.stat().st_mtime)),
+                        "kind": "failed_backup", "status": "failed", "source_paths": [], "exclude_paths": [],
+                        "archive_bytes": 0, "archive_plaintext_bytes": 0, "archive_sha256": "",
+                        "chunk_count": len(records), "stored_bytes": sum(record["encoded_len"] for record in records),
+                    })
+            except Exception as exc:
+                log_line(f"Could not inspect abandoned backup data for {machine}: {exc}")
+
+        try:
+            root = _private_staging_root(create=False)
+            if root.exists():
+                for directory in sorted(root.glob("run-*")):
+                    info = directory.lstat()
+                    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                            or not re.fullmatch(r"run-[A-Za-z0-9_]+", directory.name)):
+                        continue
+                    marker = directory / ".aegis-run.json"
+                    if marker.is_symlink() or not marker.is_file():
+                        continue
+                    record = load_json(marker)
+                    if (record.get("magic") != STAGING_MAGIC or record.get("directory") != directory.name
+                            or (record.get("repo_path") and record["repo_path"] != os.path.abspath(str(repo)))):
+                        continue
+                    names = record.get("files", [])
+                    if not isinstance(names, list) or not names:
+                        continue
+                    sizes = []
+                    for name in names:
+                        if not isinstance(name, str) or not re.fullmatch(r"(?:raw|objects|compact)-[0-9]{6}\.zip(?:\.partial)?", name):
+                            break
+                        path = directory / name
+                        if path.is_file() and not path.is_symlink():
+                            sizes.append(path.stat().st_size)
+                    else:
+                        if sizes:
+                            entries.append({
+                                "id": f"failed-stage-{directory.name}", "run_id": record.get("run_id", ""),
+                                "machine_id": settings.machine_id, "machine_label": settings.machine_label,
+                                "hostname": "", "created_at": record.get("started_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(info.st_mtime)),
+                                "kind": "failed_backup", "status": "failed", "source_paths": [], "exclude_paths": [],
+                                "archive_bytes": 0, "archive_plaintext_bytes": 0, "archive_sha256": "",
+                                "chunk_count": 0, "stored_bytes": sum(sizes),
+                            })
+        except Exception as exc:
+            log_line(f"Could not inspect failed SSD backup workspace: {exc}")
+        return entries
+    finally:
+        os.close(fd)
+
+
+def delete_failed_backup_entry(settings: Settings, repo: Path,
+                              entry_id: str) -> Tuple[SnapshotManifest, int]:
+    """Called under the backup lock; retain every object any snapshot needs."""
+    match = re.fullmatch(r"failed-pack-([A-Za-z0-9_-]+)-([a-f0-9]{64})", entry_id)
+    removed = 0
+    machine = settings.machine_id
+    if match:
+        machine, digest = match.groups()
+        root = _pack_root(repo, machine)
+        path = root / f"pack-{digest}.zip"
+        if path.is_symlink() or not path.is_file():
+            raise AegisError("Failed backup data was not found.")
+        live = set()
+        for manifest_file in (repo_machine_dir(repo, machine) / "snapshots").glob("*.json"):
+            # Unlike display, deletion must stop on any unreadable manifest.
+            manifest = snapshot_from_dict(load_json(manifest_file))
+            if manifest.machine_id != machine or not manifest.id:
+                raise AegisError("Cannot safely delete failed data because a snapshot manifest is invalid.")
+            verify_processed_manifest(manifest)
+            live.update(ref.hash for ref in manifest.archive_refs)
+        index_path = path.with_suffix(".json")
+        # Use the ZIP's actual embedded inventory and central directory, not a
+        # possibly stale sidecar, when deciding whether data is unreferenced.
+        index = _pack_index_from_zip(path, machine, validate_local_headers=False)
+        candidates = {record["hash"] for record in index["objects"]}
+        if not candidates - live:
+            raise AegisError("This data is now used by completed backups and will be kept.")
+        if not candidates & live:
+            # A wholly unreferenced pack needs no object-by-object HDD reads.
+            path.unlink()
+            index_path.unlink(missing_ok=True)
+            _fsync_directory(root)
+            repo_pack_store(repo, machine).refresh(force=True)
+            removed = len(candidates)
+        else:
+            removed = prune_packed_objects(settings, repo, machine, live, candidates,
+                                           only_pack_names={path.name})
+    else:
+        match = re.fullmatch(r"failed-stage-(run-[A-Za-z0-9_]+)", entry_id)
+        if not match:
+            raise AegisError("Invalid failed backup identifier.")
+        root = _private_staging_root(create=False)
+        directory = root / match.group(1)
+        if not directory.exists() or directory.is_symlink():
+            raise AegisError("Failed backup workspace was not found.")
+        record = load_json(directory / ".aegis-run.json")
+        if record.get("repo_path") and record["repo_path"] != os.path.abspath(str(repo)):
+            raise AegisError("This failed workspace belongs to a different backup location.")
+        BackupWorkspace.cleanup_run(root, directory)
+        if directory.exists():
+            raise AegisError("Unregistered staging entries were kept; only Aegis-owned temporary files may be removed.")
+    failed = SnapshotManifest(1, entry_id, "", machine, settings.machine_label, "", now_rfc3339(),
+                              "failed_backup", [], [], DEFAULT_CHUNK_MIB * 1024 ** 2,
+                              [], 0, "", SnapshotMetadata(), [])
+    return failed, removed
 
 
 class RepoWriter:
@@ -7765,6 +8058,8 @@ class RepoWriter:
         self.protected_hashes.add(digest)
 
 def kind_label(kind: str) -> str:
+    if kind == "failed_backup":
+        return "Failed backup"
     return BACKUP_PROFILE_LABELS.get(kind, kind or BACKUP_PROFILE_LABELS["both"])
 
 
@@ -8009,7 +8304,10 @@ def _delete_snapshot_from_repo_locked(
 def delete_snapshot_from_repo(settings: Settings, snapshot_id: str) -> Tuple[SnapshotManifest, int]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=False))
     with file_lock(LOCK_PATH):
-        result = _delete_snapshot_from_repo_locked(settings, repo, snapshot_id)
+        if snapshot_id.startswith(("failed-pack-", "failed-stage-")):
+            result = delete_failed_backup_entry(settings, repo, snapshot_id)
+        else:
+            result = _delete_snapshot_from_repo_locked(settings, repo, snapshot_id)
         refresh_repo_size_cache(repo)
         return result
 
@@ -14568,7 +14866,8 @@ def gui_main() -> int:
                     self.format_timestamp(snap.get("created_at", "")),
                     snap.get("machine_label", ""),
                     kind_label(snap.get("kind", "")),
-                    human_bytes(int(snap.get("archive_bytes", 0))),
+                    ("Incomplete" if snap.get("kind") == "failed_backup"
+                     else human_bytes(int(snap.get("archive_bytes", 0)))),
                     short_id,
                 )
                 item_id = tree.insert("", "end", iid=raw_id, values=values)
@@ -15784,7 +16083,7 @@ def gui_main() -> int:
             self.fill_text(self.warnings_text, "\n".join(warnings) if warnings else "No warnings.")
             self.fill_text(self.logs_text, "\n".join(logs[-500:]) if logs else "No activity yet.", scroll_to_end=True)
             self.fill_snapshot_tree(self.backup_tree, snapshots)
-            self.fill_snapshot_tree(self.restore_tree, snapshots)
+            self.fill_snapshot_tree(self.restore_tree, [snap for snap in snapshots if snap.get("kind") != "failed_backup"])
             if hasattr(self, "constellation_shell"):
                 self.render_constellation_tab()
                 if hasattr(self, "settings_peers_tree"):
@@ -15996,9 +16295,16 @@ def gui_main() -> int:
             if not self.selected_snapshot_id:
                 self.message_var.set("Select a snapshot first.")
                 return
+            failed = self.selected_snapshot().get("kind") == "failed_backup"
+            confirmation = (
+                "Delete this incomplete backup data? Data needed by completed backups will be kept. "
+                "Only registered Aegis temporary files may be removed from SSD staging."
+                if failed else
+                f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs."
+            )
             if not self.confirm_dangerous_action(
                 "Delete Snapshot",
-                f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs.",
+                confirmation,
             ):
                 return
             try:
