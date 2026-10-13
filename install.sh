@@ -29,13 +29,15 @@ apt_install() {
     curl \
     rsync \
     openssh-client \
+    util-linux \
     tar
 }
 
 install_app() {
   mkdir -p "${APP_DIR}"
   local tmp_file
-  tmp_file="$(mktemp)"
+  # Download onto the destination filesystem so replacement remains atomic.
+  tmp_file="$(mktemp "${APP_DIR}/.aegisvault.py.XXXXXX")"
   
   echo "Downloading update..."
   if ! curl -fsSL "${RAW_BASE}/aegisvault.py" -o "${tmp_file}"; then
@@ -229,21 +231,22 @@ do_install() {
 do_update() {
   require_root
 
-  if [ -r /dev/tty ]; then
+  if (: </dev/tty >/dev/tty) 2>/dev/null; then
     echo "Checking system state..." >/dev/tty
   fi
 
   local lockfile="/var/lib/aegisvault/backup.lock"
-  if [ -f "${lockfile}" ]; then
-    # flock -n attempts an immediate, non-blocking lock. If it fails, Python is using it.
-    if ! flock -n "${lockfile}" -c "true" >/dev/null 2>&1; then
+  install -d -m 0750 /var/lib/aegisvault
+  # Hold the same lock as the engine through replacement and service restart.
+  # A check followed by releasing the lock could race a scheduled backup.
+  exec 9>"${lockfile}"
+  if ! flock -n 9; then
       echo "Error: A backup, restore, or sync job is actively running in the background." >&2
       echo "Wait for the job to finish before updating." >&2
       exit 1
-    fi
   fi
 
-  if [ -r /dev/tty ]; then
+  if (: </dev/tty >/dev/tty) 2>/dev/null; then
     echo >/dev/tty
     echo "Aegis update will restart the background service and any open Aegis desktop window." >/dev/tty
     echo "Do not continue if a backup, restore, export, recovery USB job, or peer sync is currently running." >/dev/tty
@@ -274,6 +277,7 @@ do_update() {
 
   install_app
   systemctl restart aegisvault.service
+  exec 9>&-
 
   if [ "${gui_was_running}" = "yes" ] && [ -n "${SUDO_USER:-}" ] && id "${SUDO_USER}" >/dev/null 2>&1; then
     local runtime_dir=""
