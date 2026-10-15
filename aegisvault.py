@@ -4,7 +4,8 @@ Aegis
 Compact Linux backup app for Debian-based systems.
 Single application file with GUI, CLI, daemon, backup engine, restore engine, and peer sync.
 Optional native BLAKE3 acceleration: install the Python 'blake3' package in the
-interpreter running Aegis. Native SHA-256 is used when it is unavailable.
+interpreter running Aegis or have our install.sh do it for you.
+Native SHA-256 is used when it is unavailable.
 """
  
 from __future__ import annotations
