@@ -3,6 +3,7 @@ set -euo pipefail
 
 APP_NAME="aegisvault"
 APP_DIR="/opt/aegisvault"
+APP_PYTHON="${APP_DIR}/venv/bin/python3"
 BIN_PATH="/usr/local/bin/${APP_NAME}"
 CREDSTORE_DIR="/etc/credstore.encrypted"
 CRED_NAME_PREFIX="aegisvault-machine-key-"
@@ -24,6 +25,7 @@ apt_install() {
   apt-get update
   apt-get install -y \
     python3 \
+    python3-venv \
     python3-tk \
     python3-cryptography \
     curl \
@@ -33,8 +35,33 @@ apt_install() {
     tar
 }
 
+install_blake3() {
+  echo "Preparing Aegis Python environment and BLAKE3..."
+  # Updates of older installations also need venv support. Keep pip packages
+  # inside Aegis instead of modifying the distribution-managed Python.
+  if ! /usr/bin/python3 -c 'import ensurepip, venv' >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y python3-venv
+  fi
+  /usr/bin/python3 -m venv --system-site-packages "${APP_DIR}/venv"
+  if ! "${APP_PYTHON}" -c 'from blake3 import blake3' >/dev/null 2>&1; then
+    "${APP_PYTHON}" -m pip install --disable-pip-version-check --no-input \
+      --only-binary=:all: 'blake3>=1.0,<2'
+  fi
+  # Confirm the same interpreter used by the app can run its native hasher.
+  "${APP_PYTHON}" - <<'PY'
+from blake3 import blake3
+
+expected = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+if blake3(b"", max_threads=1).hexdigest() != expected:
+    raise SystemExit("Error: BLAKE3 self-test failed. Installation aborted.")
+PY
+}
+
 install_app() {
   mkdir -p "${APP_DIR}"
+  install_blake3
   local tmp_file
   # Download onto the destination filesystem so replacement remains atomic.
   tmp_file="$(mktemp "${APP_DIR}/.aegisvault.py.XXXXXX")"
@@ -47,7 +74,7 @@ install_app() {
   fi
 
   # Verify the Python file is fully intact and valid
-  if ! python3 -m py_compile "${tmp_file}" >/dev/null 2>&1; then
+  if ! "${APP_PYTHON}" -m py_compile "${tmp_file}" >/dev/null 2>&1; then
     echo "Error: Downloaded file is corrupted or incomplete. Update aborted." >&2
     rm -f "${tmp_file}"
     exit 1
@@ -59,7 +86,7 @@ install_app() {
 
   cat > "${BIN_PATH}" <<'EOF'
 #!/usr/bin/env bash
-exec python3 /opt/aegisvault/aegisvault.py "$@"
+exec /opt/aegisvault/venv/bin/python3 /opt/aegisvault/aegisvault.py "$@"
 EOF
   chmod 0755 "${BIN_PATH}"
 }
