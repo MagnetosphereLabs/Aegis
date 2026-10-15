@@ -3,6 +3,8 @@
 Aegis
 Compact Linux backup app for Debian-based systems.
 Single application file with GUI, CLI, daemon, backup engine, restore engine, and peer sync.
+Optional native BLAKE3 acceleration: install the Python 'blake3' package in the
+interpreter running Aegis. Native SHA-256 is used when it is unavailable.
 """
  
 from __future__ import annotations
@@ -42,6 +44,12 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 import getpass
 import ipaddress
+import mmap
+
+try:
+    from blake3 import blake3 as _blake3
+except ImportError:
+    _blake3 = None  # Native SHA-256 keeps the single-file app usable without extra dependencies.
 import shlex
 import re
 
@@ -5045,6 +5053,7 @@ class PreparedBackupChunk:
     hash: str
     plain_len: int
     encoded: Optional[bytes]
+    encoded_sha256: str = ""
 
 @dataclass
 class ProcessedBackupStreams:
@@ -6368,20 +6377,9 @@ def _available_memory_bytes() -> int:
 
 
 def backup_worker_plan(chunk_size: int) -> Tuple[int, int]:
-    logical_cpus = max(1, int(os.cpu_count() or 1))
-    cpu_limit = max(1, int(logical_cpus * BACKUP_CPU_FRACTION))
+    plan = _backup_ram_plan(chunk_size)
+    return plan["workers"], plan["inflight"]
 
-    available_memory = _available_memory_bytes()
-    if available_memory > 0:
-        memory_budget = max(chunk_size * 3, available_memory // 4)
-        inflight_limit = max(1, memory_budget // max(1, chunk_size * 3))
-        workers = max(1, min(cpu_limit, inflight_limit))
-        max_inflight = max(workers, min(inflight_limit, workers * 2))
-    else:
-        workers = cpu_limit
-        max_inflight = max(workers, workers * 2)
-
-    return workers, max_inflight
 
 
 
@@ -6863,10 +6861,10 @@ def process_staged_backup_archive(
     )
 
 
-# Automatic OS staging and content-addressed, uncompressed object packs.
+# Sealed RAM capture and content-addressed, uncompressed object packs.
 # The object payload and snapshot manifest formats are unchanged.
-OS_BACKUP_STAGING_ROOT = Path("/.aegisvault-staging")
-OS_BACKUP_FILESYSTEM_ROOT = Path("/")
+# Keep old OS-drive workspaces excluded from future captures.
+LEGACY_OS_BACKUP_STAGING_ROOT = Path("/.aegisvault-staging")
 STAGING_MAGIC = "aegis-owned-staging-v1"
 PACK_MAGIC = "aegis-object-pack-v1"
 STAGING_MIN_START_BYTES = 10 * 1024 ** 3
@@ -6878,21 +6876,138 @@ _PACK_STORES_LOCK = threading.RLock()
 
 def adaptive_backup_piece_bytes(free_bytes: int) -> int:
     if free_bytes < STAGING_MIN_START_BYTES:
-        raise AegisError("Not enough free storage on the OS drive. Free at least 10 GiB before backing up.")
+        raise AegisError("Not enough free storage on the backup drive. Free at least 10 GiB before backing up.")
     gib = 1024 ** 3
     target = next((size * gib for threshold, size in
                    ((500, 100), (200, 50), (100, 25), (50, 10), (25, 5))
                    if free_bytes >= threshold * gib), STAGING_MIN_PIECE_BYTES)
-    # Raw capture + new Full objects + possible Portable boundary objects.
-    safe = ((free_bytes - STAGING_FREE_RESERVE_BYTES - BUFFER_SIZE * 8) // 3
+    # Raw capture + Full/Portable objects + their destination publication copy
+    # now share the backup filesystem instead of using separate drives.
+    safe = ((free_bytes - STAGING_FREE_RESERVE_BYTES - BUFFER_SIZE * 8) // 5
             // BUFFER_SIZE) * BUFFER_SIZE
     if safe < STAGING_MIN_PIECE_BYTES:
-        raise AegisError("Not enough OS-drive workspace for a 1 GiB backup piece and its processed data.")
+        raise AegisError("Not enough backup-drive workspace for a 1 GiB backup piece and its processed data.")
     return min(target, safe)
 
 
-def _private_staging_root(create: bool = True) -> Path:
-    root = OS_BACKUP_STAGING_ROOT
+def _backup_hash_algorithm() -> str:
+    return "blake3" if _blake3 is not None else "sha256"
+
+
+def _new_backup_hasher(algorithm: Optional[str] = None, max_threads: int = 1):
+    algorithm = algorithm or _backup_hash_algorithm()
+    if algorithm == "blake3":
+        if _blake3 is None:
+            raise AegisError("BLAKE3 is unavailable. Install the Python blake3 package.")
+        # Streaming checks use one native worker. A fully populated RAM batch
+        # may use the CPU allowance while object-processing workers are idle.
+        return _blake3(max_threads=max_threads)
+    if algorithm == "sha256":
+        return hashlib.sha256()
+    raise AegisError("Unsupported backup checksum algorithm.")
+
+
+def _backup_memory_info() -> Tuple[int, int]:
+    """Read total RAM and hard container limits; leave cache reclamation to Linux."""
+    total = 8 * 1024 ** 3
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, _, value = line.partition(":")
+            if key == "MemTotal":
+                total = int(value.split()[0]) * 1024
+                break
+    except (OSError, ValueError, IndexError):
+        pass
+    for limit_path in (
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ):
+        try:
+            limit = int(Path(limit_path).read_text().strip())
+            if 0 < limit < total:
+                total = limit
+        except (OSError, ValueError):
+            pass
+    return total, total // 2
+
+
+def _backup_rss_bytes() -> int:
+    try:
+        return int(Path("/proc/self/statm").read_text().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _backup_cpu_count() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def _backup_ram_plan(chunk_size: int) -> Dict[str, int]:
+    total, _ = _backup_memory_info()
+    budget = total // 2
+    scratch = min(512 * 1024 ** 2, max(chunk_size * 12, budget // 8))
+    # The dual-stream processor can enqueue a Full/Portable pair before it
+    # drains its queue; reserve one additional object slot for that pair.
+    inflight = max(1, scratch // max(1, chunk_size * 6) - 1)
+    cpu_limit = max(1, int(_backup_cpu_count() * BACKUP_CPU_FRACTION))
+    workers = min(cpu_limit, inflight)
+    return {
+        "budget": budget, "scratch": scratch,
+        "metadata_reserve": min(512 * 1024 ** 2, max(128 * 1024 ** 2, budget // 8)),
+        # A nominal 16 GiB PC reports slightly less usable physical memory.
+        # Larger machines scale with half of total RAM, retaining 1 GiB of
+        # that allowance for processing and metadata instead of duplicating it.
+        "target": budget - 1024 ** 3 if total >= 14 * 1024 ** 3 else 1024 ** 3,
+        "workers": workers, "inflight": inflight,
+    }
+
+
+def _backup_ram_batch_bytes(plan: Dict[str, int]) -> int:
+    headroom = plan["budget"] - _backup_rss_bytes()
+    size = min(plan["target"], headroom - plan["scratch"] - plan["metadata_reserve"])
+    size = (size // BUFFER_SIZE) * BUFFER_SIZE
+    if size < 64 * 1024 ** 2:
+        raise AegisError("Not enough room within the backup's half-RAM budget for another capture buffer.")
+    return size
+
+
+def _check_backup_ram(plan: Dict[str, int]) -> None:
+    if _backup_rss_bytes() > plan["budget"]:
+        raise AegisError("The backup reached its RAM budget and stopped safely. No incomplete restore point was published.")
+
+
+@contextmanager
+def _backup_cpu_scope():
+    previous = None
+    try:
+        previous = os.sched_getaffinity(0)
+        count = max(1, int(len(previous) * BACKUP_CPU_FRACTION))
+        os.sched_setaffinity(0, set(sorted(previous)[:count]))
+    except (AttributeError, OSError):
+        previous = None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            os.sched_setaffinity(0, previous)
+
+
+def _release_backup_indexes(repo: Path) -> None:
+    repository = os.path.abspath(str(repo))
+    with _PACK_STORES_LOCK:
+        for key in list(_PACK_STORES):
+            if key[0] == repository:
+                del _PACK_STORES[key]
+
+
+
+def _private_staging_root(repo: Path, create: bool = True) -> Path:
+    if create:
+        ensure_repo_path_ready(str(repo))
+    root = backup_staging_root(repo)
     if not root.exists() and not root.is_symlink():
         if not create:
             return root
@@ -6907,8 +7022,8 @@ def _private_staging_root(create: bool = True) -> Path:
     info = root.lstat()
     if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
             or info.st_uid != os.geteuid() or info.st_mode & 0o077
-            or info.st_dev != OS_BACKUP_FILESYSTEM_ROOT.stat().st_dev):
-        raise AegisError("Aegis staging must be a private directory on the OS filesystem.")
+            or info.st_dev != repo.stat().st_dev):
+        raise AegisError("Aegis staging must be a private directory on the backup filesystem.")
     marker = root / ".aegis-owner"
     if marker.is_symlink() or not marker.is_file() or marker.read_text() != STAGING_MAGIC:
         raise AegisError("Refusing to use a staging directory not owned by Aegis.")
@@ -6918,18 +7033,28 @@ def _private_staging_root(create: bool = True) -> Path:
 class BackupWorkspace:
     """Only registered regular files in a privately created run are removed."""
 
-    def __init__(self, run_id: str) -> None:
-        self.root = _private_staging_root()
+    def __init__(self, run_id: str, repo: Path) -> None:
+        self.root = _private_staging_root(repo)
         self.path = Path(tempfile.mkdtemp(prefix="run-", dir=str(self.root)))
         os.chmod(self.path, 0o700)
+        info = self.path.stat()
+        self.identity = (info.st_dev, info.st_ino)
         self.names: Set[str] = set()
         self.run_id = run_id
-        self.repo_path = ""
+        self.repo_path = os.path.abspath(str(repo))
         self.machine = ""
         self.started_at = now_rfc3339()
         self._record()
 
+    def _check_destination(self) -> None:
+        info = self.path.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                or (info.st_dev, info.st_ino) != self.identity
+                or Path(self.repo_path).stat().st_dev != self.identity[0]):
+            raise AegisError("The backup drive or staging directory changed while the backup was running.")
+
     def _record(self) -> None:
+        self._check_destination()
         save_json(self.path / ".aegis-run.json", {
             "magic": STAGING_MAGIC, "directory": self.path.name,
             "files": sorted(self.names),
@@ -6950,8 +7075,9 @@ class BackupWorkspace:
         return self.path / name
 
     def check_space(self, required_bytes: int = 0) -> None:
+        self._check_destination()
         if shutil.disk_usage(str(self.path)).free < STAGING_FREE_RESERVE_BYTES + required_bytes:
-            raise AegisError("OS-drive staging space ran out; the backup was stopped safely.")
+            raise AegisError("Backup-drive staging space ran out; the backup was stopped safely.")
 
     def remove(self, path: Path) -> None:
         if path.parent != self.path or path.name not in self.names:
@@ -7002,8 +7128,8 @@ class BackupWorkspace:
             directory.rmdir()
 
     @classmethod
-    def cleanup_stale(cls) -> None:
-        root = _private_staging_root(create=False)
+    def cleanup_stale(cls, repo: Path) -> None:
+        root = _private_staging_root(repo, create=False)
         if root.exists():
             for directory in root.iterdir():
                 cls.cleanup_run(root, directory)
@@ -7203,7 +7329,7 @@ BACKUP_RETRY_ERRNOS = frozenset({errno.EIO, errno.EINTR, errno.EAGAIN,
 
 
 class BackupPackVerificationError(AegisError):
-    """A destination copy may be repaired from the verified SSD original."""
+    """A final output pack failed its expected checksum or identity check."""
 
 
 def _backup_retry_wait(action: str, exc: Exception, retry: int, delay: float) -> None:
@@ -7214,12 +7340,11 @@ def _backup_retry_wait(action: str, exc: Exception, retry: int, delay: float) ->
 
 
 def _sequential_sha256(path: Path, progress_callback=None,
-                       read_retry_delays=(), retry_guard=None) -> str:
-    hasher = hashlib.sha256()
+                       read_retry_delays=(), retry_guard=None,
+                       hash_algorithm: str = "sha256") -> str:
+    hasher = _new_backup_hasher(hash_algorithm)
     done, last_report, retries = 0, 0.0, 0
     needs_seek = False
-    # Unbuffered reads make the last successfully hashed offset explicit. A
-    # failed read never advances the digest; seek there before trying again.
     with path.open("rb", buffering=0) as handle:
         info = os.fstat(handle.fileno())
         identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
@@ -7228,178 +7353,144 @@ def _sequential_sha256(path: Path, progress_callback=None,
             try:
                 os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
             except OSError:
-                pass  # An advisory optimization, not an integrity requirement.
-        while True:
-            try:
-                if needs_seek:
-                    if retry_guard is not None:
-                        retry_guard()
-                    info = os.fstat(handle.fileno())
-                    if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
-                        raise BackupPackVerificationError("Destination ZIP changed during verification.")
-                    handle.seek(done)
-                block = handle.read(BUFFER_SIZE)
-                needs_seek = False
-            except OSError as exc:
-                if exc.errno not in BACKUP_RETRY_ERRNOS or retries >= len(read_retry_delays):
-                    raise
-                _backup_retry_wait(f"Resuming ZIP verification at {human_bytes(done)}",
-                                   exc, retries + 1, read_retry_delays[retries])
-                retries += 1
-                needs_seek = True
-                continue
-            if not block:
-                break
-            hasher.update(block)
-            done += len(block)
-            if progress_callback and time.monotonic() - last_report >= .35:
-                progress_callback(done, total)
-                last_report = time.monotonic()
-        if done != total:
-            raise BackupPackVerificationError("Destination ZIP was truncated during verification.")
-        info = os.fstat(handle.fileno())
-        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
-            raise BackupPackVerificationError("Destination ZIP changed during verification.")
+                pass
+        buffer = bytearray(BUFFER_SIZE)
+        view = memoryview(buffer)
+        try:
+            while True:
+                try:
+                    if needs_seek:
+                        if retry_guard is not None:
+                            retry_guard()
+                        info = os.fstat(handle.fileno())
+                        if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
+                            raise BackupPackVerificationError("Destination pack changed during verification.")
+                        handle.seek(done)
+                    count = handle.readinto(buffer)
+                    needs_seek = False
+                except OSError as exc:
+                    if exc.errno not in BACKUP_RETRY_ERRNOS or retries >= len(read_retry_delays):
+                        raise
+                    _backup_retry_wait(f"Continuing pack verification at {human_bytes(done)}",
+                                       exc, retries + 1, read_retry_delays[retries])
+                    retries += 1
+                    needs_seek = True
+                    continue
+                if not count:
+                    break
+                hasher.update(view[:count])
+                done += count
+                if progress_callback and time.monotonic() - last_report >= .35:
+                    progress_callback(done, total)
+                    last_report = time.monotonic()
+            if done != total:
+                raise BackupPackVerificationError("Destination pack was truncated during verification.")
+            info = os.fstat(handle.fileno())
+            if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != identity:
+                raise BackupPackVerificationError("Destination pack changed during verification.")
+        finally:
+            view.release()
     return hasher.hexdigest()
+
 
 
 def publish_verified_pack(settings: Settings, source: Path, machine: str,
                           index: Dict[str, Any], protected_hashes: Set[str],
                           protected_snapshot_ids: Set[str], allow_prune: bool = True,
                           expected_sha256: Optional[str] = None,
-                          expected_repo_device: Optional[int] = None) -> Path:
-    """One sequential destination read verifies the entire finalized ZIP."""
+                          expected_repo_device: Optional[int] = None,
+                          hash_algorithm: str = "sha256") -> Path:
+    """Verify the single output file sequentially, then publish that same inode."""
     repo = Path(settings.repo_path)
-    ensure_repo_path_ready(settings.repo_path)
+    ensure_repo_path_ready(str(repo))
     repo_device = repo.stat().st_dev
     if expected_repo_device is not None and repo_device != expected_repo_device:
         raise AegisError("The backup drive changed while the backup was running.")
-    digest = expected_sha256 or _sequential_sha256(source)
     root = _pack_root(repo, machine)
     root.mkdir(parents=True, exist_ok=True)
     root_info = root.stat()
     root_identity = (root_info.st_dev, root_info.st_ino)
-    destination = root / f"pack-{digest}.zip"
-    published_identity = None
+    source_info = source.lstat()
+    if (not stat.S_ISREG(source_info.st_mode) or source_info.st_uid != os.geteuid()
+            or source_info.st_dev != repo_device or root_info.st_dev != repo_device):
+        raise AegisError("The completed pack must be a regular file on the selected backup drive.")
+    identity = (source_info.st_dev, source_info.st_ino, source_info.st_size)
+    content_identity = identity + (source_info.st_mtime_ns, source_info.st_ctime_ns)
 
     def guard_destination() -> None:
-        ensure_repo_path_ready(settings.repo_path)
         info = root.lstat()
-        if (repo.stat().st_dev != repo_device or stat.S_ISLNK(info.st_mode)
+        if (repo.stat().st_dev != repo_device or not stat.S_ISDIR(info.st_mode)
                 or (info.st_dev, info.st_ino) != root_identity):
-            raise AegisError("The backup drive or pack directory changed during transfer; refusing to retry there.")
+            raise AegisError("The backup drive or pack directory changed during publication.")
 
-    for attempt in range(len(BACKUP_PACK_RETRY_DELAYS) + 1):
-        partial, partial_identity, copy_verified = None, None, False
+    guard_destination()
+    if allow_prune:
+        # These bytes already occupy the destination; reserve them for cap
+        # accounting without requiring space for a second copy of the pack.
+        prune_repo_for_incoming_bytes(settings, repo, 0,
+            protected_snapshot_ids=protected_snapshot_ids,
+            protected_hashes=protected_hashes, temporary_bytes=identity[2])
+    _fsync_path(source)
+    with source.open("rb") as handle:
+        if hasattr(os, "posix_fadvise"):
+            try:
+                os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            except OSError:
+                pass
+    started = time.monotonic()
+    actual = _sequential_sha256(source,
+        lambda done, total: report_pack_progress("Verifying destination pack", done, total, started),
+        read_retry_delays=BACKUP_READ_RETRY_DELAYS, retry_guard=guard_destination,
+        hash_algorithm=hash_algorithm)
+    if expected_sha256 is not None and actual != expected_sha256:
+        raise BackupPackVerificationError("Destination pack does not match the data written from RAM.")
+    guard_destination()
+    info = source.lstat()
+    if (not stat.S_ISREG(info.st_mode)
+            or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != content_identity):
+        raise AegisError("The verified output pack changed before publication.")
+    destination = root / f"pack-{actual}.zip"
+    try:
+        os.replace(source, destination)
+    except OSError as exc:
+        # A system call interrupted after a successful rename is still safe
+        # only when the published file is this exact verified inode.
         try:
-            guard_destination()
-            if published_identity is None:
-                source_size = source.stat().st_size
-                fd, tmp_name = tempfile.mkstemp(prefix=".pack-", suffix=".partial", dir=str(root))
-                partial = Path(tmp_name)
-                info = os.fstat(fd)
-                partial_identity = (info.st_dev, info.st_ino, source_size)
-                with os.fdopen(fd, "wb") as target:
-                    if allow_prune:
-                        prune_repo_for_incoming_bytes(settings, repo, source.stat().st_size,
-                                                     protected_snapshot_ids=protected_snapshot_ids,
-                                                     protected_hashes=protected_hashes, temporary_bytes=0)
-                    elif shutil.disk_usage(str(repo)).free < source.stat().st_size + BACKUP_PREFLIGHT_MIN_FREE_BYTES:
-                        raise AegisError("Insufficient repository space for safe pack compaction.")
-                    copied_hash = hashlib.sha256()
-                    copied_bytes, last_report = 0, 0.0
-                    started = time.monotonic()
-                    with source.open("rb") as origin:
-                        for block in iter(lambda: origin.read(BUFFER_SIZE), b""):
-                            if target.write(block) != len(block):
-                                raise OSError(errno.EIO, "Incomplete backup pack write")
-                            copied_hash.update(block)
-                            copied_bytes += len(block)
-                            if time.monotonic() - last_report >= .35:
-                                report_pack_progress("Copying finalized backup ZIP", copied_bytes,
-                                                     source.stat().st_size, started)
-                                last_report = time.monotonic()
-                    target.flush()
-                    os.fsync(target.fileno())
-                    if copied_hash.hexdigest() != digest:
-                        raise AegisError("SSD backup pack changed during transfer.")
-                    if hasattr(os, "posix_fadvise"):
-                        # Best effort to avoid verifying only recently written cache.
-                        try:
-                            os.posix_fadvise(target.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-                        except OSError:
-                            pass
-                guard_destination()
-                started = time.monotonic()
-                if partial.stat().st_size != source.stat().st_size or _sequential_sha256(partial,
-                        lambda done, total: report_pack_progress("Verifying destination ZIP", done, total, started),
-                        read_retry_delays=BACKUP_READ_RETRY_DELAYS, retry_guard=guard_destination) != digest:
-                    raise BackupPackVerificationError("Destination backup ZIP failed its SHA-256 transfer check.")
-                copy_verified = True
-                guard_destination()
-                os.chmod(partial, 0o600)
-                os.replace(partial, destination)
-                published_identity = partial_identity
-
-            # Metadata retries keep the already verified ZIP in place. Confirm
-            # its identity and repeat durability/index operations, not capture.
-            guard_destination()
             info = destination.lstat()
-            if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size) != published_identity:
-                raise AegisError("The verified destination ZIP changed before publication completed.")
-            _fsync_path(destination)
-            _fsync_directory(root)
-            output_index = dict(index, pack=destination.name, pack_size=info.st_size)
-            save_json(destination.with_suffix(".json"), output_index)
-            _fsync_directory(root)
-            repo_pack_store(repo, machine).refresh(force=True)
-            log_line(f"Verified destination ZIP {destination.name}: {human_bytes(info.st_size)}.")
-            return destination
-        except (OSError, BackupPackVerificationError) as exc:
-            # An interrupted rename can have succeeded. Only the exact inode
-            # whose bytes passed verification may be used to complete it.
-            if copy_verified and published_identity is None and partial_identity is not None:
-                try:
-                    guard_destination()
-                    info = destination.lstat()
-                    if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino, info.st_size) == partial_identity:
-                        published_identity = partial_identity
-                except (OSError, AegisError):
-                    pass
-            retryable = isinstance(exc, BackupPackVerificationError) or exc.errno in BACKUP_RETRY_ERRNOS
-            if not retryable or attempt >= len(BACKUP_PACK_RETRY_DELAYS):
-                log_line(f"Backup ZIP could not be completed: {exc}. Its SSD original and previously verified packs are retained.")
-                raise
-            action = ("Completing verified ZIP publication" if published_identity is not None
-                      else "Retrying this backup ZIP from its verified SSD copy; completed packs are preserved")
-            _backup_retry_wait(action, exc, attempt + 1, BACKUP_PACK_RETRY_DELAYS[attempt])
-        finally:
-            # Remove only the temporary inode created by this attempt, and
-            # never follow a replaced directory or disappeared mount.
-            if partial is not None:
-                try:
-                    guard_destination()
-                    info = partial.lstat()
-                    if stat.S_ISREG(info.st_mode) and (info.st_dev, info.st_ino) == partial_identity[:2]:
-                        partial.unlink()
-                except FileNotFoundError:
-                    pass
-                except (OSError, AegisError) as exc:
-                    log_line(f"Could not clean this transfer's temporary ZIP safely: {exc}")
+        except OSError:
+            raise exc
+        if (info.st_dev, info.st_ino, info.st_size) != identity:
+            raise
+    guard_destination()
+    _fsync_directory(root)
+    _fsync_directory(source.parent)
+    output_index = dict(index, pack=destination.name, pack_size=identity[2],
+                        pack_hash_algorithm=hash_algorithm)
+    save_json(destination.with_suffix(".json"), output_index)
+    _fsync_directory(root)
+    store = repo_pack_store(repo, machine)
+    with store.lock:
+        for record in output_index["objects"]:
+            store.locations[record["hash"]] = (destination, record)
+        info = root.stat()
+        store.stamp = (info.st_dev, info.st_ino, info.st_mtime_ns)
+    log_line(f"Verified {hash_algorithm.upper()} destination pack {destination.name}: {human_bytes(identity[2])}.")
+    return destination
+
 
 
 class HashingZipSink:
     """Forward-only ZIP output hashes the exact container bytes as written."""
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, hash_algorithm: str = "sha256") -> None:
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         self.handle = os.fdopen(fd, "wb")
-        self.hasher = hashlib.sha256()
+        self.hasher = _new_backup_hasher(hash_algorithm)
         self.position = 0
 
     def write(self, data: bytes) -> int:
         count = self.handle.write(data)
         if count != len(data):
-            raise AegisError("Incomplete SSD ZIP write.")
+            raise AegisError("Incomplete staging ZIP write.")
         self.hasher.update(data)
         self.position += count
         return count
@@ -7420,90 +7511,110 @@ class HashingZipSink:
 class PackedRepoObjectWriter:
     def __init__(self, settings: Settings, repo: Path, machine: str, key: Optional[bytes],
                  workspace: BackupWorkspace, executor, max_inflight: int,
-                 protected_snapshot_ids: Optional[Set[str]] = None) -> None:
+                 protected_snapshot_ids: Optional[Set[str]] = None,
+                 ram_plan: Optional[Dict[str, int]] = None) -> None:
         self.settings, self.repo, self.machine, self.key = settings, repo, machine, key
         self.repo_device = repo.stat().st_dev
         self.workspace, self.executor, self.max_inflight = workspace, executor, max_inflight
+        self.ram_plan = ram_plan or _backup_ram_plan(settings.chunk_size_mib * 1024 ** 2)
         self.protected_snapshot_ids = set(protected_snapshot_ids or set())
         self.protected_hashes: Set[str] = set()
         self.store = repo_pack_store(repo, machine)
-        self.store.refresh(force=True)
-        self.state_lock = threading.Lock()
+        self.store.refresh()
+        self.known_hashes = set(self.store.locations)
+        self.state_lock = threading.RLock()
         self.batch_number = 0
-        self.archive = None
-        self.sink = None
-        self.path = None
+        self.archive = self.sink = self.path = None
         self.records: List[Dict[str, Any]] = []
         self.pending_hashes: Set[str] = set()
         self.verified_packs = 0
+        self.hash_algorithm = _backup_hash_algorithm()
+        self.pack_limit = self.ram_plan["target"]
+        self.repo_size_bytes = get_repo_size_bytes(repo) if settings.max_repo_size_gb > 0 else 0
 
     def prepare_chunk(self, plaintext: bytes) -> PreparedBackupChunk:
+        # Preserve existing object and restore identities; pack and RAM checks
+        # use BLAKE3 independently of these SHA-256 content addresses.
         digest = sha256_hex(plaintext)
         with self.state_lock:
             self.protected_hashes.add(digest)
-            stored = digest in self.pending_hashes or self.store.contains(digest)
-        return PreparedBackupChunk(digest, len(plaintext), None if stored else object_encode(plaintext, self.key))
+            stored = digest in self.pending_hashes or digest in self.known_hashes
+        encoded = None if stored else object_encode(plaintext, self.key)
+        return PreparedBackupChunk(digest, len(plaintext), encoded,
+                                   sha256_hex(encoded) if encoded is not None else "")
+
+    def _ensure_space(self, incoming: int) -> None:
+        self.workspace._check_destination()
+        _check_backup_ram(self.ram_plan)
+        size = self.sink.position if self.sink is not None else 0
+        limit = repo_size_limit_bytes(self.settings)
+        if (shutil.disk_usage(str(self.repo)).free < incoming + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+                or (limit > 0 and self.repo_size_bytes + size + incoming > limit)):
+            with self.state_lock:
+                prune_repo_for_incoming_bytes(self.settings, self.repo, incoming,
+                    protected_snapshot_ids=self.protected_snapshot_ids,
+                    protected_hashes=set(self.protected_hashes), temporary_bytes=size)
+                self.store = repo_pack_store(self.repo, self.machine)
+                self.store.refresh()
+                self.known_hashes = set(self.store.locations)
+                self.repo_size_bytes = get_repo_size_bytes(self.repo) if limit > 0 else 0
 
     def commit_chunk(self, prepared: PreparedBackupChunk) -> ChunkRef:
-        if prepared.hash in self.pending_hashes or self.store.contains(prepared.hash):
-            return ChunkRef(prepared.hash, prepared.plain_len)
+        with self.state_lock:
+            if prepared.hash in self.pending_hashes or prepared.hash in self.known_hashes:
+                return ChunkRef(prepared.hash, prepared.plain_len)
         if prepared.encoded is None:
+            # A loose object from an older repository is also a valid source.
+            if object_path(self.repo, self.machine, prepared.hash).is_file():
+                return ChunkRef(prepared.hash, prepared.plain_len)
             raise AegisError("A referenced backup object disappeared during capture.")
-        self.workspace.check_space(len(prepared.encoded) + BUFFER_SIZE)
+        if self.sink is not None and self.sink.position + len(prepared.encoded) > self.pack_limit:
+            self.finish_batch()
+        self._ensure_space(len(prepared.encoded) + BUFFER_SIZE)
         if self.archive is None:
             self.path = self.workspace.file(f"objects-{self.batch_number:06d}.zip")
-            self.sink = HashingZipSink(self.path)
+            self.sink = HashingZipSink(self.path, hash_algorithm=self.hash_algorithm)
             self.archive = zipfile.ZipFile(self.sink, "w", compression=zipfile.ZIP_STORED, allowZip64=True)
         info = zipfile.ZipInfo(f"objects/{prepared.hash}.obj")
         info.compress_type = zipfile.ZIP_STORED
         info.external_attr = 0o600 << 16
         with self.archive.open(info, "w", force_zip64=True) as handle:
+            offset = self.sink.position
             handle.write(prepared.encoded)
         self.records.append({"hash": prepared.hash, "plain_len": prepared.plain_len,
-                             "encoded_len": len(prepared.encoded),
-                             "encoded_sha256": sha256_hex(prepared.encoded)})
+            "encoded_len": len(prepared.encoded), "offset": offset,
+            "encoded_sha256": prepared.encoded_sha256 or sha256_hex(prepared.encoded)})
         with self.state_lock:
             self.pending_hashes.add(prepared.hash)
         return ChunkRef(prepared.hash, prepared.plain_len)
 
-    def _verify_encoded(self, payload: bytes, record: Dict[str, Any]) -> None:
-        if len(payload) != record["encoded_len"] or sha256_hex(payload) != record["encoded_sha256"]:
-            raise AegisError("SSD encoded backup object failed its checksum.")
-        plaintext = object_decode(payload, self.key)
-        if len(plaintext) != record["plain_len"] or sha256_hex(plaintext) != record["hash"]:
-            raise AegisError("SSD backup object did not reconstruct its original chunk.")
-
     def finish_batch(self) -> None:
         if self.archive is None:
             return
-        assert self.path is not None
         path = self.path
         metadata = {"magic": PACK_MAGIC, "machine_id": self.machine, "objects": self.records}
-        self.archive.writestr("aegis-pack.json", json.dumps(metadata, separators=(",", ":")))
+        payload = json.dumps(metadata, separators=(",", ":")).encode("utf-8")
+        self._ensure_space(len(payload) + BUFFER_SIZE)
+        self.archive.writestr("aegis-pack.json", payload)
         self.archive.close()
         self.archive = None
         self.sink.flush()
-        os.fsync(self.sink.handle.fileno())
-        expected_sha = self.sink.hasher.hexdigest()
+        expected = self.sink.hasher.hexdigest()
         self.sink.close()
         self.sink = None
-        pending = deque()
-        with zipfile.ZipFile(path) as archive:
-            for record in self.records:
-                payload = archive.read(f"objects/{record['hash']}.obj")
-                pending.append(self.executor.submit(self._verify_encoded, payload, record))
-                if len(pending) >= self.max_inflight:
-                    pending.popleft().result()
-            while pending:
-                pending.popleft().result()
-        index = _pack_index_from_zip(path, self.machine)
-        publish_verified_pack(self.settings, path, self.machine, index,
-                              self.protected_hashes, self.protected_snapshot_ids,
-                              expected_sha256=expected_sha, expected_repo_device=self.repo_device)
+        index = dict(metadata, pack=path.name, pack_size=path.stat().st_size)
+        with self.state_lock:
+            publish_verified_pack(self.settings, path, self.machine, index,
+                set(self.protected_hashes), self.protected_snapshot_ids,
+                expected_sha256=expected, expected_repo_device=self.repo_device,
+                hash_algorithm=self.hash_algorithm)
+            self.pending_hashes.clear()
+            self.store = repo_pack_store(self.repo, self.machine)
+            self.known_hashes = set(self.store.locations)
         self.verified_packs += 1
         self.workspace.remove(path)
-        with self.state_lock:
-            self.pending_hashes.clear()
+        if self.settings.max_repo_size_gb > 0:
+            self.repo_size_bytes = get_repo_size_bytes(self.repo)
         self.records, self.path = [], None
         self.batch_number += 1
 
@@ -7516,96 +7627,96 @@ class PackedRepoObjectWriter:
             if self.sink is not None:
                 self.sink.close()
                 self.sink = None
+            self.pending_hashes.clear()
+            self.known_hashes.clear()
+            self.records.clear()
+
 
 
 class RollingBackupSource:
-    """A single tar producer, one bounded raw ZIP at a time, continuous reads."""
+    """One tar producer feeding sealed, bounded anonymous RAM batches."""
     def __init__(self, settings: Settings, includes: List[str], excludes: List[str],
-                 workspace: BackupWorkspace, on_piece_done, progress_callback=None) -> None:
+                 workspace: BackupWorkspace, on_piece_done, progress_callback=None,
+                 ram_plan: Optional[Dict[str, int]] = None) -> None:
         self.settings, self.workspace, self.on_piece_done = settings, workspace, on_piece_done
         self.progress_callback = progress_callback
-        self.stderr = tempfile.TemporaryFile(mode="w+b")
+        self.ram_plan = ram_plan or _backup_ram_plan(settings.chunk_size_mib * 1024 ** 2)
+        self.stderr = tempfile.TemporaryFile(mode="w+b", dir=str(workspace.path))
         self.proc = subprocess.Popen(build_tar_backup_command(includes, excludes),
-                                     stdout=subprocess.PIPE, stderr=self.stderr)
-        self.current = None
+                                     stdout=subprocess.PIPE, stderr=self.stderr, bufsize=BUFFER_SIZE)
+        self.mapping = self.current = None
+        self.position = 0
         self.piece_number = 0
-        self.capture_hasher = hashlib.sha256()
-        self.read_hasher = hashlib.sha256()
-        self.bytes_read = 0
-        self.total_bytes = 0
-        self.eof = False
-        self.verified = False
+        self.bytes_read = self.total_bytes = 0
+        self.eof = self.verified = False
         self.last_report = 0.0
-        # Existing parser size guards only apply to an already complete archive.
         self.stage = self
         self.unbounded_stream = True
+        self.batch_digest = b""
+        self.batch_read_hasher = None
 
     def _stage_next(self) -> bool:
         if self.eof:
             return False
         self.on_piece_done()
-        limit = adaptive_backup_piece_bytes(shutil.disk_usage(str(self.workspace.path)).free)
-        # Sidecar indexes stay bounded even for legacy custom 1–2 MiB settings.
-        # Two object records per Full chunk is the conservative Portable case.
-        index_limit = ((100000 - 4) * min(DEFAULT_CHUNK_MIB, self.settings.chunk_size_mib)
-                       * 1024 ** 2 * 4 // 5 // 2 // BUFFER_SIZE) * BUFFER_SIZE
-        limit = min(limit, max(STAGING_MIN_PIECE_BYTES, index_limit))
-        path = self.workspace.file(f"raw-{self.piece_number:06d}.zip")
-        members = []
-        piece_hasher = hashlib.sha256()
+        limit = _backup_ram_batch_bytes(self.ram_plan)
+        self.mapping = mmap.mmap(-1, limit)
         count = 0
-        with zipfile.ZipFile(path, "x", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        try:
             while count < limit:
-                member_count = 0
-                member_hasher = hashlib.sha256()
-                name = f"archive/part-{len(members):06d}.tar"
-                info = zipfile.ZipInfo(name)
-                info.external_attr = 0o600 << 16
-                with archive.open(info, "w", force_zip64=True) as target:
-                    while member_count < STAGING_MEMBER_BYTES and count < limit:
-                        take = min(BUFFER_SIZE, STAGING_MEMBER_BYTES - member_count, limit - count)
-                        if take <= 0:
-                            break
-                        self.workspace.check_space(take)
-                        block = read_exact(self.proc.stdout, take)
-                        if not block:
-                            self.eof = True
-                            break
-                        target.write(block)
-                        piece_hasher.update(block)
-                        member_hasher.update(block)
-                        self.capture_hasher.update(block)
-                        count += len(block)
-                        member_count += len(block)
-                        self.total_bytes += len(block)
-                        if self.progress_callback and time.monotonic() - self.last_report >= .35:
-                            self.progress_callback(self.total_bytes, limit, "Capturing an uncompressed ZIP piece on the OS drive.")
-                            self.last_report = time.monotonic()
-                members.append(StagedArchiveMember(name, member_count, member_hasher.hexdigest()))
-                if self.eof:
+                take = min(BUFFER_SIZE, limit - count)
+                view = memoryview(self.mapping)[count:count + take]
+                try:
+                    got = self.proc.stdout.readinto(view)
+                finally:
+                    view.release()
+                if not got:
+                    self.eof = True
                     break
-        if self.eof:
-            returncode = self.proc.wait()
-            self.stderr.seek(0)
-            error = self.stderr.read().decode("utf-8", errors="replace")
-            if returncode not in (0, 1):
-                raise AegisError(f"tar backup failed: {error.strip() or returncode}")
-        if count == 0:
-            self.workspace.remove(path)
-            return False
-        _fsync_path(path)
-        self.current = StagedArchiveConcatReader(StagedArchive(path, members, count, piece_hasher.hexdigest()))
-        self.piece_number += 1
-        return True
+                count += got
+                self.total_bytes += got
+                if self.progress_callback and time.monotonic() - self.last_report >= .35:
+                    self.progress_callback(self.total_bytes, limit,
+                        f"Capturing source data into a sealed RAM batch of up to {human_bytes(limit)}.")
+                    self.last_report = time.monotonic()
+                if count % (128 * 1024 ** 2) < got:
+                    _check_backup_ram(self.ram_plan)
+            if self.eof:
+                returncode = self.proc.wait()
+                self.stderr.seek(0)
+                detail = self.stderr.read().decode("utf-8", errors="replace")
+                if returncode not in (0, 1):
+                    raise AegisError(f"tar backup failed: {detail.strip() or returncode}")
+            if not count:
+                self.mapping.close()
+                self.mapping = None
+                return False
+            self.current = memoryview(self.mapping)[:count].toreadonly()
+            self.position = 0
+            capture = _new_backup_hasher(max_threads=self.ram_plan["workers"])
+            capture.update(self.current)
+            self.batch_digest = capture.digest()
+            self.batch_read_hasher = _new_backup_hasher()
+            self.piece_number += 1
+            return True
+        except BaseException:
+            if self.mapping is not None:
+                self.mapping.close()
+                self.mapping = None
+            raise
 
     def _finish_piece(self) -> None:
-        if self.current is not None:
-            self.current.verify_complete()
-            path = self.current.stage.path
-            self.current.close()
-            self.current = None
-            self.on_piece_done()
-            self.workspace.remove(path)
+        if self.current is None:
+            return
+        if self.position != len(self.current) or self.batch_read_hasher.digest() != self.batch_digest:
+            raise AegisError("The RAM batch no longer matches the captured source data.")
+        # Drain all object work and verify final output before releasing input.
+        self.on_piece_done()
+        self.current.release()
+        self.current = None
+        self.mapping.close()
+        self.mapping = None
+        self.batch_read_hasher = None
 
     def read(self, size: int = -1) -> bytes:
         if size < 0:
@@ -7615,14 +7726,16 @@ class RollingBackupSource:
         while remaining > 0:
             if self.current is None and not self._stage_next():
                 break
-            block = self.current.read(remaining)
-            if not block:
+            take = min(remaining, len(self.current) - self.position)
+            if not take:
                 self._finish_piece()
                 continue
+            block = bytes(self.current[self.position:self.position + take])
+            self.batch_read_hasher.update(block)
+            self.position += take
+            self.bytes_read += take
             blocks.append(block)
-            self.read_hasher.update(block)
-            self.bytes_read += len(block)
-            remaining -= len(block)
+            remaining -= take
         return b"".join(blocks)
 
     def verify_complete(self) -> None:
@@ -7631,13 +7744,15 @@ class RollingBackupSource:
         if not self.eof or self.bytes_read != self.total_bytes:
             raise AegisError("The captured backup stream was not consumed completely.")
         self._finish_piece()
-        if self.read_hasher.digest() != self.capture_hasher.digest():
-            raise AegisError("SSD staging did not reproduce the original captured stream.")
         self.verified = True
 
     def close(self) -> None:
         if self.current is not None:
-            self.current.close()
+            self.current.release()
+            self.current = None
+        if self.mapping is not None:
+            self.mapping.close()
+            self.mapping = None
         if self.proc.stdout is not None:
             self.proc.stdout.close()
         if self.proc.poll() is None:
@@ -7650,49 +7765,48 @@ class RollingBackupSource:
         self.stderr.close()
 
 
+
 def process_rolling_backup_archive(settings: Settings, run_id: str,
                                    includes: List[str], excludes: List[str],
                                    chunk_size: int, machine_key_value: Optional[bytes],
                                    protected_snapshot_ids=None, progress_callback=None,
                                    portable_includes=None, portable_excludes=None,
                                    capture_progress_callback=None) -> ProcessedBackupStreams:
-    workspace = BackupWorkspace(run_id)
-    workspace.set_context(settings)
+    workspace = BackupWorkspace(run_id, Path(settings.repo_path))
     processor = writer = source = None
-    completed = False
-    workers, max_inflight = backup_worker_plan(chunk_size)
+    plan = _backup_ram_plan(chunk_size)
+    workers, max_inflight = plan["workers"], plan["inflight"]
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers,
+        workspace.set_context(settings)
+        with _backup_cpu_scope(), concurrent.futures.ThreadPoolExecutor(max_workers=workers,
                 thread_name_prefix="aegis-backup") as executor:
             writer = PackedRepoObjectWriter(settings, Path(settings.repo_path), settings.machine_id,
-                     machine_key_value, workspace, executor, max_inflight, protected_snapshot_ids)
+                machine_key_value, workspace, executor, max_inflight, protected_snapshot_ids, plan)
             processor = DualArchiveChunkProcessor(executor, writer, chunk_size, workers,
-                         max_inflight, portable_includes is not None, progress_callback)
+                max_inflight, portable_includes is not None, progress_callback)
 
             def finish_piece() -> None:
                 while processor.pending:
                     processor._commit_oldest()
                 writer.finish_batch()
 
-            source = RollingBackupSource(settings, includes, excludes, workspace, finish_piece,
-                                         capture_progress_callback)
             try:
+                source = RollingBackupSource(settings, includes, excludes, workspace, finish_piece,
+                    capture_progress_callback, plan)
                 stats = _stream_filtered_tar(source, portable_includes or ["."],
-                            portable_excludes or [], processor.write)
+                    portable_excludes or [], processor.write)
                 source.verify_complete()
                 processor.finish()
                 writer.finish_batch()
-                if (processor.full_bytes != source.total_bytes
-                        or processor.full_hasher.digest() != source.capture_hasher.digest()):
-                    raise AegisError("Processed backup did not match the captured source stream.")
+                if processor.full_bytes != source.total_bytes:
+                    raise AegisError("Processed backup did not match the captured source length.")
                 if writer.pending_hashes:
                     raise AegisError("Backup finished with uncommitted objects.")
                 if sum(ref.plain_len for ref in processor.full_refs) != processor.full_bytes:
                     raise AegisError("Full backup reference lengths are inconsistent.")
                 if sum(ref.plain_len for ref in processor.portable_refs) != processor.portable_bytes:
                     raise AegisError("Portable backup reference lengths are inconsistent.")
-                log_line(f"SSD verification and {writer.verified_packs} destination ZIP checks passed.")
-                completed = True
+                log_line(f"RAM batch checks and {writer.verified_packs} sequential destination pack checks passed.")
                 return ProcessedBackupStreams(processor.full_refs, processor.full_bytes,
                     processor.full_hasher.hexdigest(), processor.portable_refs, processor.portable_bytes,
                     processor.portable_hasher.hexdigest() if portable_includes is not None else "",
@@ -7700,23 +7814,24 @@ def process_rolling_backup_archive(settings: Settings, run_id: str,
                     stats.portable_safe, "; ".join(stats.unsafe_hardlinks), workers,
                     stats.kept_entries, stats.skipped_entries)
             finally:
-                if source is not None:
-                    source.close()
-                if processor is not None:
-                    processor.abort()
-                if writer is not None:
-                    writer.abort()
+                try:
+                    if source is not None:
+                        source.close()
+                finally:
+                    try:
+                        if processor is not None:
+                            processor.abort()
+                    finally:
+                        writer.abort()
     finally:
-        if completed:
-            workspace.close()
-        else:
-            # Keep the failed batch's only prepared copy until the next locked
-            # run performs registered-file cleanup. Never report it as complete.
-            log_line("Backup failed; its owned temporary workspace was retained.")
+        # Failed attempts cannot resume their old source position. Only encoded
+        # packs that already passed verification remain as reusable objects.
+        workspace.close()
+
 
 
 def verify_processed_manifest(manifest: SnapshotManifest) -> None:
-    """Byte verification was already done on SSD and per destination ZIP."""
+    """Byte verification was already done in staging and per destination ZIP."""
     if not manifest.archive_refs or manifest.archive_plaintext_bytes <= 10240:
         raise AegisError("The backup restore stream is empty or incomplete.")
     if sum(ref.plain_len for ref in manifest.archive_refs) != manifest.archive_plaintext_bytes:
@@ -7753,29 +7868,36 @@ def prune_packed_objects(settings: Settings, repo: Path, machine: str,
         if len(keep) == len(records):
             continue
         if keep:
-            workspace = BackupWorkspace("compaction")
+            workspace = BackupWorkspace("compaction", repo)
             try:
                 compact = workspace.file("compact-000000.zip")
-                workspace.check_space(sum(record["encoded_len"] for record in keep) + BUFFER_SIZE)
-                store = repo_pack_store(repo, machine)
-                with zipfile.ZipFile(compact, "x", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
-                    clean_records = []
-                    for record in keep:
-                        payload = store.read(record["hash"])
-                        clean_records.append({key: record[key] for key in
-                            ("hash", "plain_len", "encoded_len", "encoded_sha256")})
-                        archive.writestr(f"objects/{record['hash']}.obj", payload)
-                    archive.writestr("aegis-pack.json", json.dumps({"magic": PACK_MAGIC,
-                        "machine_id": machine, "objects": clean_records}, separators=(",", ":")))
-                _fsync_path(compact)
-                compact_index = _pack_index_from_zip(compact, machine)
-                # Compaction needs temporary headroom; do not recursively prune
-                # while another prune is already removing this same snapshot.
-                no_cap = dataclasses.replace(settings, max_repo_size_gb=0)
-                required = compact.stat().st_size + BACKUP_PREFLIGHT_MIN_FREE_BYTES
+                required = (sum(record["encoded_len"] for record in keep) + BUFFER_SIZE
+                            + len(keep) * 512 + BACKUP_PREFLIGHT_MIN_FREE_BYTES)
                 if shutil.disk_usage(str(repo)).free < required:
-                    raise AegisError("Not enough temporary repository space to compact a shared backup pack safely.")
-                publish_verified_pack(no_cap, compact, machine, compact_index, live_hashes, set(), allow_prune=False)
+                    raise AegisError("Not enough repository space to compact a shared backup pack safely.")
+                store = repo_pack_store(repo, machine)
+                hash_algorithm = _backup_hash_algorithm()
+                sink = HashingZipSink(compact, hash_algorithm=hash_algorithm)
+                try:
+                    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+                        clean_records = []
+                        for record in keep:
+                            payload = store.read(record["hash"])
+                            clean_records.append({key: record[key] for key in
+                                ("hash", "plain_len", "encoded_len", "encoded_sha256")})
+                            archive.writestr(f"objects/{record['hash']}.obj", payload)
+                        archive.writestr("aegis-pack.json", json.dumps({"magic": PACK_MAGIC,
+                            "machine_id": machine, "objects": clean_records}, separators=(",", ":")))
+                    sink.flush()
+                    expected = sink.hasher.hexdigest()
+                finally:
+                    sink.close()
+                compact_index = _pack_index_from_zip(compact, machine)
+                # The replacement itself is the final output: verify and rename
+                # it without another copy or a recursive retention operation.
+                no_cap = dataclasses.replace(settings, max_repo_size_gb=0)
+                publish_verified_pack(no_cap, compact, machine, compact_index, live_hashes, set(),
+                                      allow_prune=False, expected_sha256=expected, hash_algorithm=hash_algorithm)
                 workspace.remove(compact)
             finally:
                 workspace.close()
@@ -7844,7 +7966,7 @@ def list_failed_backup_entries(settings: Settings, repo: Path,
                 log_line(f"Could not inspect abandoned backup data for {machine}: {exc}")
 
         try:
-            root = _private_staging_root(create=False)
+            root = _private_staging_root(repo, create=False)
             if root.exists():
                 for directory in sorted(root.glob("run-*")):
                     info = directory.lstat()
@@ -7879,7 +8001,7 @@ def list_failed_backup_entries(settings: Settings, repo: Path,
                                 "chunk_count": 0, "stored_bytes": sum(sizes),
                             })
         except Exception as exc:
-            log_line(f"Could not inspect failed SSD backup workspace: {exc}")
+            log_line(f"Could not inspect failed destination backup workspace: {exc}")
         return entries
     finally:
         os.close(fd)
@@ -7926,7 +8048,7 @@ def delete_failed_backup_entry(settings: Settings, repo: Path,
         match = re.fullmatch(r"failed-stage-(run-[A-Za-z0-9_]+)", entry_id)
         if not match:
             raise AegisError("Invalid failed backup identifier.")
-        root = _private_staging_root(create=False)
+        root = _private_staging_root(repo, create=False)
         directory = root / match.group(1)
         if not directory.exists() or directory.is_symlink():
             raise AegisError("Failed backup workspace was not found.")
@@ -8080,7 +8202,7 @@ def build_include_paths(settings: Settings, kind: str) -> List[str]:
 
 def build_exclude_paths(settings: Settings, kind: str) -> List[str]:
     repo_rel = repo_relative_pattern(settings.repo_path)
-    stage_rel = repo_relative_pattern(str(OS_BACKUP_STAGING_ROOT))
+    stage_rel = repo_relative_pattern(str(LEGACY_OS_BACKUP_STAGING_ROOT))
     staging_excludes = [stage_rel, f"{stage_rel}/*"]
     if kind == "full_recovery":
         base = list(settings.full_excludes) + staging_excludes
@@ -8495,27 +8617,28 @@ def backup_preflight_info(settings: Settings) -> Dict[str, Any]:
     repo = Path(resolve_settings_repo_path(settings, create_if_missing=True))
     cached_size = load_repo_size_cache(repo)
     repo_size = cached_size if cached_size is not None else get_repo_size_bytes(repo)
-    root = _private_staging_root()
-    staging_free = int(shutil.disk_usage(str(root)).free)
+    plan = _backup_ram_plan(max(1, settings.chunk_size_mib) * 1024 ** 2)
+    batch = _backup_ram_batch_bytes(plan)
     usage = shutil.disk_usage(str(repo))
-    piece = adaptive_backup_piece_bytes(staging_free)
     estimate = estimated_backup_stream_bytes(settings, "full_recovery")
     warnings = []
     limit = repo_size_limit_bytes(settings)
     if limit > 0 and repo_size + estimate * 2 > limit:
         warnings.append("The conservative pre-deduplication estimate exceeds the repository cap. "
-                        "Aegis will prune older backups only as needed for finalized ZIP transfers.")
-    if usage.free < min(estimate * 2, piece * 2) + BACKUP_PREFLIGHT_MIN_FREE_BYTES:
-        warnings.append("The backup drive may need more free space for the next finalized ZIP. "
-                        "Aegis will measure actual deduplicated writes and stop safely if it cannot make room.")
+                        "Aegis will prune older backups only as needed for new unique objects.")
+    if usage.free < min(estimate * 2, batch * 2) + BACKUP_PREFLIGHT_MIN_FREE_BYTES:
+        warnings.append("The backup drive may need more free space for the next output pack. "
+                        "Aegis measures actual unique writes and stops safely if it cannot make room.")
     return {
         "repo_path": str(repo), "repo_size_bytes": repo_size,
-        "staging_size_bytes": 0, "estimated_full_stage_bytes": estimated_backup_stream_bytes(settings, "full_recovery"),
-        "estimated_peak_additional_bytes": piece * 2,
-        "limit_bytes": repo_size_limit_bytes(settings), "free_bytes": int(usage.free),
-        "staging_free_bytes": staging_free, "staging_piece_bytes": piece,
-        "warnings": warnings,
+        "staging_size_bytes": get_staging_size_bytes(repo), "estimated_full_stage_bytes": 0,
+        "estimated_peak_additional_bytes": min(estimate * 2, batch * 2),
+        "limit_bytes": limit, "free_bytes": int(usage.free),
+        "staging_free_bytes": int(usage.free), "staging_piece_bytes": batch,
+        "ram_budget_bytes": plan["budget"], "ram_batch_bytes": batch,
+        "pack_hash_algorithm": _backup_hash_algorithm(), "warnings": warnings,
     }
+
 
 
 def assert_backup_storage_preflight(settings: Settings) -> None:
@@ -8698,7 +8821,7 @@ def capture_backup_kind(
         )
 
         log_line(
-            f"{label}: checking the verified SSD stream and destination ZIPs before "
+            f"{label}: checking the verified RAM stream and destination ZIPs before "
             "publishing the manifest."
         )
         set_job_progress(
@@ -8707,7 +8830,7 @@ def capture_backup_kind(
             bytes_done=0,
             bytes_total=total_bytes,
             detail=(
-                "Confirming SSD stream validation and destination ZIP transfer checks."
+                "Confirming RAM stream validation and destination ZIP transfer checks."
             ),
             phase=kind,
         )
@@ -8895,7 +9018,7 @@ def capture_full_and_portable(
                 bytes_done=0,
                 bytes_total=full_manifest.archive_plaintext_bytes,
                 detail=(
-                    "Confirming verified SSD chunks and destination ZIP transfers."
+                    "Confirming verified RAM chunks and destination ZIP transfers."
                 ),
                 phase=full_kind,
             )
@@ -8952,23 +9075,23 @@ def capture_full_and_portable(
             bytes_done=0,
             bytes_total=full_manifest.archive_plaintext_bytes,
             detail=(
-                "Confirming verified SSD chunks and destination ZIP transfers."
+                "Confirming verified RAM chunks and destination ZIP transfers."
             ),
             phase=full_kind,
         )
         log_line(
-            f"{full_label}: confirming SSD verification and destination ZIP hashes before "
+            f"{full_label}: confirming RAM verification and destination ZIP hashes before "
             "publishing either manifest."
         )
         verify_processed_manifest(full_manifest)
         verify_processed_manifest(portable_manifest)
         log_line(
             "Full Recovery and Portable Migration final encrypted restore-stream "
-            "verification passed on SSD and with destination ZIP hashes."
+            "verification passed in RAM and with destination ZIP hashes."
         )
 
         # Shared Portable refs reuse verified Full objects. Boundary objects
-        # were verified on SSD, and each finalized destination ZIP was hashed
+        # were verified in RAM, and each finalized destination ZIP was hashed
         # before publication; no second full Portable readback is needed.
         set_job_progress(
             92.0,
@@ -9058,7 +9181,7 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
     with file_lock(LOCK_PATH):
         run_id = f"{utc_tag()}-{random_suffix(3)}"
         repo = Path(settings.repo_path)
-        BackupWorkspace.cleanup_stale()
+        BackupWorkspace.cleanup_stale(repo)
         assert_backup_storage_preflight(settings)
 
         usage = shutil.disk_usage(str(repo))
@@ -9081,10 +9204,11 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
             f"Backup {run_id} started. Repository {repo}; persistent usage "
             f"{human_bytes(persistent_usage)}; free {human_bytes(int(usage.free))}; "
             f"cap {human_bytes(repo_size_limit_bytes(settings)) if settings.max_repo_size_gb > 0 else 'unlimited'}; "
-            f"estimated Full stream {human_bytes(estimated_stream)}; OS staging "
-            "uses adaptive 1–100 GiB ZIP pieces; Portable uses "
-            "shared Full objects and no second "
-            f"capture; finalized ZIP packs are SHA-256 verified on destination; chunk target {human_bytes(chunk_size)}; worker plan "
+            f"estimated Full stream {human_bytes(estimated_stream)}; sealed RAM batches "
+            f"up to {human_bytes(_backup_ram_plan(chunk_size)['target'])}; "
+            f"RAM budget {human_bytes(_backup_ram_plan(chunk_size)['budget'])}; "
+            "Portable shares Full objects; final uncompressed packs are written once and "
+            f"{_backup_hash_algorithm().upper()} verified sequentially; chunk target {human_bytes(chunk_size)}; worker plan "
             f"{workers}/{inflight}."
         )
 
@@ -9160,6 +9284,7 @@ def perform_backup(settings: Settings, profile: str, recovery_password: Optional
             # Repository size is dashboard metadata, not a restore-integrity
             # requirement. Refresh it asynchronously so a completed backup is
             # not held open by another full object-tree walk.
+            _release_backup_indexes(repo)
             schedule_repo_size_cache_refresh(repo)
 
     set_job_progress(
@@ -14715,7 +14840,7 @@ def gui_main() -> int:
             ttk.Entry(schedule, textvariable=self.max_repo_size_var, width=12).grid(row=6, column=1, sticky="w", pady=(10, 0))
             ttk.Label(
                 schedule,
-                text="0 means unlimited. Active staging ZIPs count toward capacity planning; older backups are pruned before writes when needed.",
+                text="0 means unlimited. Backup data is processed in RAM; older backups are pruned before new unique data is stored when needed.",
                 wraplength=520,
                 style="Muted.TLabel",
             ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
@@ -16298,7 +16423,7 @@ def gui_main() -> int:
             failed = self.selected_snapshot().get("kind") == "failed_backup"
             confirmation = (
                 "Delete this incomplete backup data? Data needed by completed backups will be kept. "
-                "Only registered Aegis temporary files may be removed from SSD staging."
+                "Only registered Aegis temporary files may be removed from destination staging."
                 if failed else
                 f"Delete snapshot {self.selected_snapshot_id}? This removes its manifest and any data chunks no other snapshot still needs."
             )
